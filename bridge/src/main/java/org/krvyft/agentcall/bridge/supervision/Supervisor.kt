@@ -193,7 +193,8 @@ class Supervisor(
 
     /** 自动接听就绪：双端心跳、校准授权、独立终止能力、未被阻止。 */
     fun isReady(atMs: Long = clock.nowMs()): Boolean =
-        peerAlive(PeerRole.APP, atMs) &&
+        synchronized(lock) { started } &&
+            peerAlive(PeerRole.APP, atMs) &&
             peerAlive(PeerRole.HOOK, atMs) &&
             authorization.isAuthorized() &&
             !emergency.blocksAutoAnswer() &&
@@ -204,6 +205,14 @@ class Supervisor(
      * 任一步失败都不会自动接听，也不会留下有效租约。
      */
     suspend fun prepareAnswer(id: SessionId): CommandResult {
+        // 上一通话仍在 ARMED/ANSWER_PENDING/ACTIVE/HANDOFF_PENDING/TERMINATING 时，
+        // 绝不能让新通话覆盖 ownedSession：旧通话的断开确认会因此丢失，麦克风可能
+        // 永久保持隔离。只有彻底空闲（IDLE/ENDED）才允许准备下一次接听。
+        val reusable = synchronized(lock) {
+            ownedSession == null &&
+                (phase == SupervisorPhase.IDLE || phase == SupervisorPhase.ENDED)
+        }
+        if (!reusable) return CommandResult.Rejected(RejectReason.NOT_OWNED)
         if (!isReady()) return CommandResult.Rejected(RejectReason.UNSUPPORTED)
         leases.acquire(id) ?: return CommandResult.Rejected(RejectReason.NOT_OWNED)
 

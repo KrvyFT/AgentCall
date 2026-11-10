@@ -121,6 +121,41 @@ class SupervisorTest {
     }
 
     @Test
+    fun terminatingCallCannotBeReplacedByAnotherAnswer() = runBlocking {
+        val f = Fixture()
+        f.heartbeat()
+        assertEquals(CommandResult.Accepted, f.supervisor.prepareAnswer(session))
+
+        f.clock.advance(SessionLimits.HEARTBEAT_TIMEOUT_MS + 1)
+        f.supervisor.poll()
+        assertEquals(SupervisorPhase.TERMINATING, f.supervisor.snapshot().phase)
+
+        // 上一通话尚未确认断开：新通话不得覆盖所有权，也不得产生 Answer。
+        val replacement = f.supervisor.prepareAnswer(other)
+        assertEquals(CommandResult.Rejected(RejectReason.NOT_OWNED), replacement)
+        assertFalse(f.calls.commands.any { it.first == other })
+        assertEquals(session, f.supervisor.snapshot().ownedSession)
+        assertTrue(f.worker.microphoneIsolated)
+
+        // 旧通话确认断开后，麦克风恢复且所有权清空。
+        val disconnected = f.supervisor.onCallDisconnected(session)
+        assertTrue(disconnected.any { it is SupervisorAction.RestoreMicrophone })
+        assertFalse(f.worker.microphoneIsolated)
+    }
+
+    @Test
+    fun closedSupervisorIsNotReady() = runBlocking {
+        val f = Fixture()
+        f.heartbeat()
+        assertEquals(CommandResult.Accepted, f.supervisor.prepareAnswer(session))
+
+        f.supervisor.close()
+
+        assertFalse(f.supervisor.isReady())
+        assertEquals(CommandResult.Rejected(RejectReason.UNSUPPORTED), f.supervisor.prepareAnswer(other))
+    }
+
+    @Test
     fun revokedLeaseCannotDisconnect() = runBlocking {
         val f = Fixture()
         f.heartbeat()
