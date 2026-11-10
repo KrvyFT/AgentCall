@@ -19,6 +19,13 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // 控制器裁定：Xposed API 只从官方仓库解析，且 content filter 限定该 group，
+        // 其他依赖不可能从此仓库取得。保留 FAIL_ON_PROJECT_REPOS。
+        maven("https://api.xposed.info/") {
+            content {
+                includeGroup("de.robv.android.xposed")
+            }
+        }
     }
 }
 

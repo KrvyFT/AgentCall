@@ -10,6 +10,7 @@ coroutines = "1.9.0"
 gson = "2.11.0"
 libphonenumber = "9.0.43"
 okhttp = "4.12.0"
+xposed = "82"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -24,6 +25,8 @@ gson = { group = "com.google.code.gson", name = "gson", version.ref = "gson" }
 libphonenumber = { group = "com.googlecode.libphonenumber", name = "libphonenumber", version.ref = "libphonenumber" }
 okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
 okhttp-mockwebserver = { group = "com.squareup.okhttp3", name = "mockwebserver", version.ref = "okhttp" }
+# 传统 Xposed API 82：仅编译期使用，运行时由用户安装的 LSPosed/Vector 提供，绝不打包。
+xposed-api = { group = "de.robv.android.xposed", name = "api", version.ref = "xposed" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
