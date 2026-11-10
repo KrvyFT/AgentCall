@@ -180,6 +180,11 @@ object AgentCallRuntime {
  * - [BridgeClient]、[SessionCoordinator] 与 [SessionEventPoller] 懒创建、在 [onDestroy] 关闭
  *   （先停轮询再关协调器，停止后不再有任何事件/接听输入）；没有 GlobalScope；
  * - 进程被杀后系统按 START_STICKY 重启：重新创建一切并重新做就绪握手（不会继承旧 READY）；
+ * - **手动/自动启动**：服务 exported=false，正常路径是用户点“启动/重试”或通知；
+ *   [BootReceiver] 只在用户上次显式启动且没有停止（[AutoStartPreference]）时，于
+ *   BOOT_COMPLETED / MY_PACKAGE_REPLACED 后请求启动。开机启动**不跳过**就绪握手，
+ *   也不代表总开关打开：桥接 AgentConfig.enabled 关闭时服务照常运行但不自动接听；
+ *   用户点“停止”即撤销自动启动意图。
  * - 通知与协调器 observer 只传机器码/会话身份，不传号码/密钥。
  */
 class AgentCallService : Service() {

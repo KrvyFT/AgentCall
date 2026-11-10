@@ -85,6 +85,8 @@ class ServiceWiringTest {
             Manifest.permission.POST_NOTIFICATIONS,
             Manifest.permission.FOREGROUND_SERVICE,
             Manifest.permission.FOREGROUND_SERVICE_SPECIAL_USE,
+            // I4：开机/升级后恢复服务；只接收系统受保护的 BOOT_COMPLETED/MY_PACKAGE_REPLACED。
+            Manifest.permission.RECEIVE_BOOT_COMPLETED,
         )
         assertTrue("missing: " + (required - requested), requested.containsAll(required))
         val forbidden = setOf(
@@ -92,7 +94,6 @@ class ServiceWiringTest {
             Manifest.permission.READ_PHONE_STATE,
             Manifest.permission.CALL_PHONE,
             Manifest.permission.READ_CALL_LOG,
-            Manifest.permission.RECEIVE_BOOT_COMPLETED,
             Manifest.permission.SYSTEM_ALERT_WINDOW,
             Manifest.permission.WAKE_LOCK,
             "android.permission.MANAGE_OWN_CALLS",

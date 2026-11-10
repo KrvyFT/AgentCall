@@ -32,6 +32,7 @@ import org.krvyft.agentcall.ipc.LocalSocketPcmLaneTransport
 import org.krvyft.agentcall.service.AgentCallRuntime
 import org.krvyft.agentcall.service.AgentCallService
 import org.krvyft.agentcall.service.AgentCallStatus
+import org.krvyft.agentcall.service.AutoStartPreference
 import org.krvyft.agentcall.service.BridgeDiagnostics
 import org.krvyft.agentcall.service.BridgeStatus
 import org.krvyft.agentcall.service.BridgeStatusResult
@@ -150,14 +151,19 @@ class MainActivity : AppCompatActivity() {
 
     private fun wireButtons() {
         findViewById<Button>(R.id.button_start).setOnClickListener {
+            // I4：记录用户的显式启动意图，BOOT_COMPLETED 只在这种情况下恢复服务。
+            AutoStartPreference.setEnabled(this, true)
             ContextCompat.startForegroundService(this, AgentCallService.startIntent(this))
             Toast.makeText(this, R.string.main_toast_service_started, Toast.LENGTH_SHORT).show()
         }
         findViewById<Button>(R.id.button_stop).setOnClickListener {
+            // 用户主动停止 = 明确撤销自动启动意图，开机后不再拉起。
+            AutoStartPreference.setEnabled(this, false)
             // 停止一个未运行的服务不该先把它创建出来；stopService 对未运行的服务是无操作。
             stopService(Intent(this, AgentCallService::class.java))
         }
         findViewById<Button>(R.id.button_retry).setOnClickListener {
+            AutoStartPreference.setEnabled(this, true)
             ContextCompat.startForegroundService(this, AgentCallService.startIntent(this, retry = true))
             refreshFacts()
         }

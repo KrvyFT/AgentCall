@@ -14,6 +14,11 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!--
+      I4：开机/升级后由本包的 BootReceiver 按用户本机启动偏好恢复服务。只接收系统受保护的
+      BOOT_COMPLETED / MY_PACKAGE_REPLACED，不接收任意第三方广播。
+    -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
         android:allowBackup="false"
@@ -48,6 +53,20 @@
             android:exported="false"
             android:label="@string/takeover_title"
             android:parentActivityName=".ui.MainActivity" />
+
+        <!--
+          开机/升级广播接收器（I4）：exported=false，只接收系统受保护的 BOOT_COMPLETED 与
+          MY_PACKAGE_REPLACED；只在用户本机“自动启动”偏好为 true 时请求启动服务。服务本身
+          仍不导出，并会重新做完整的就绪/总开关握手。
+        -->
+        <receiver
+            android:name=".service.BootReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
 
         <!--
           specialUse 前台服务：manifest 必须同时声明类型、权限与 subtype property。
