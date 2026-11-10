@@ -5,6 +5,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Test
 import org.krvyft.agentcall.core.model.SessionId
+import org.krvyft.agentcall.core.model.SessionState
 
 /**
  * 人工交还结果的会话绑定（Task 7B2 FIX ROUND 1，spec §8）。
@@ -90,16 +91,86 @@ class HandbackJournalTest {
     }
 
     @Test
-    fun anErrorIsOnlyShownWhenNoHandbackBelongsToThisSession() {
+    fun anErrorIsOnlyShownForTheSessionItBelongsTo() {
         val report = HandbackJournal.record(sessionA, RevokeOutcome.CONFIRMED)
-        val failed = HandbackJournal.outcomeFor(
-            AgentCallStatus(activeSession = sessionB, lastHandback = report, lastError = "takeover_stale_session"),
-            sessionB,
+        // 上一通电话的撤销失败/音频失败：错误属于 A，B 的接管页绝不能显示。
+        val previousError = AgentCallStatus(
+            activeSession = sessionB,
+            lastHandback = report,
+            lastError = "handback_revoke_failed",
+            lastErrorSession = sessionA,
         )
-        assertEquals(HandbackOutcome.Failed("takeover_stale_session"), failed)
+        assertEquals(HandbackOutcome.Pending, HandbackJournal.outcomeFor(previousError, sessionB))
+        // 服务级错误没有会话归属：不能被当作某通电话的“接管失败”。
+        assertEquals(
+            HandbackOutcome.Pending,
+            HandbackJournal.outcomeFor(
+                AgentCallStatus(activeSession = sessionB, lastError = "bootstrap_failed"),
+                sessionB,
+            ),
+        )
+        // 本会话的错误仍然显示（撤销失败的报告本身走 Unconfirmed 分支，不会落到这里）。
+        assertEquals(
+            HandbackOutcome.Failed("takeover_stale_session"),
+            HandbackJournal.outcomeFor(
+                AgentCallStatus(
+                    activeSession = sessionB,
+                    lastError = "takeover_stale_session",
+                    lastErrorSession = sessionB,
+                ),
+                sessionB,
+            ),
+        )
         assertEquals(
             HandbackOutcome.Pending,
             HandbackJournal.outcomeFor(AgentCallStatus(activeSession = sessionB), sessionB),
         )
+    }
+
+    @Test
+    fun aNewCallClearsThePreviousCallsReportAndError() {
+        val previous = AgentCallStatus(
+            activeSession = sessionA,
+            lastHandback = HandbackJournal.record(sessionA, RevokeOutcome.CONFIRMED),
+            lastError = "handback_revoke_failed",
+            lastErrorSession = sessionA,
+        )
+
+        val residue = HandbackJournal.residueOnStateChanged(previous, sessionB, SessionState.ELIGIBLE)
+
+        assertNull(residue.report)
+        assertNull(residue.error)
+        assertNull(residue.errorSession)
+    }
+
+    @Test
+    fun theSameCallsFinalOutcomeSurvivesItsOwnEndedState() {
+        val report = HandbackJournal.record(sessionA, RevokeOutcome.REVOKE_FAILED)
+        val status = AgentCallStatus(
+            activeSession = sessionA,
+            lastHandback = report,
+            lastError = "handback_revoke_failed",
+            lastErrorSession = sessionA,
+        )
+
+        val residue = HandbackJournal.residueOnStateChanged(status, sessionA, SessionState.ENDED)
+
+        assertSame(report, residue.report)
+        assertEquals("handback_revoke_failed", residue.error)
+        assertEquals(sessionA, residue.errorSession)
+    }
+
+    @Test
+    fun anotherSessionsErrorIsDroppedEvenMidCall() {
+        val status = AgentCallStatus(
+            activeSession = sessionB,
+            lastError = "handback_revoke_failed",
+            lastErrorSession = sessionA,
+        )
+
+        val residue = HandbackJournal.residueOnStateChanged(status, sessionB, SessionState.ACTIVE_AI)
+
+        assertNull(residue.error)
+        assertNull(residue.errorSession)
     }
 }

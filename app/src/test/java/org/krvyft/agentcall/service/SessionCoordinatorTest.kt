@@ -311,11 +311,14 @@ class SessionCoordinatorTest {
             advance(SessionCoordinator.COMMAND_SETTLE_TIMEOUT_MS + 200)
             assertEquals(SessionState.HANDOFF, coordinator.state)
             assertTrue("the revoke must never race the in-flight authorization", revoker.revoked.isEmpty())
-            assertTrue("no handback may be reported", observer.handedBack.isEmpty())
+            // 撤销没能发起 = 未确认：必须以独立的交还结果到达 UI，绝不能消失或显示成功。
+            assertEquals(listOf(sessionA), observer.handedBack)
+            assertEquals(listOf(RevokeOutcome.UNAVAILABLE), observer.outcomes)
             assertTrue(
                 "no local audio may be stopped without a confirmed revoke",
                 events.none { it.startsWith("audio.") || it.startsWith("restored") || it.startsWith("conversation.") },
             )
+            assertEquals("unconfirmed:call-a", events.last())
             assertTrue(
                 "the unsettled command must be diagnosed, got " + observer.diagnostics,
                 "handback_command_unsettled" in observer.diagnostics,
@@ -524,17 +527,67 @@ class SessionCoordinatorTest {
                     "conversation.started:call-a",
                     "conversation.cancelled:call-a",
                     "revoked:call-a",
+                    "unconfirmed:call-a",
                 ),
                 events,
             )
             assertEquals("the call stays handed off", SessionState.HANDOFF, coordinator.state)
-            assertTrue("no handback may be reported", observer.handedBack.isEmpty())
-            assertTrue("no handback outcome may be published", observer.outcomes.isEmpty())
+            // 撤销未确认现在走交还结果：UI 能显示独立的“交还未确认”，而不是“尚未提交接管”。
+            assertEquals(listOf(sessionA), observer.handedBack)
+            assertEquals(listOf(outcome), observer.outcomes)
+            assertTrue(
+                "a revoke failure may never be reported as success",
+                observer.outcomes.none { it == RevokeOutcome.CONFIRMED || it == RevokeOutcome.NOT_OWNED },
+            )
+            val report = HandbackJournal.record(sessionA, outcome)
+            assertEquals(
+                HandbackOutcome.Unconfirmed(report),
+                HandbackJournal.outcomeFor(AgentCallStatus(activeSession = sessionA, lastHandback = report), sessionA),
+            )
             assertTrue(
                 "the blocked restore must be diagnosed, got " + observer.diagnostics,
                 "handback_restore_blocked" in observer.diagnostics,
             )
             assertTrue("manual takeover must never hang up", calls.sent.none { it.command == CallCommand.Hangup })
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    // ------------------------------------------------------------------ 冻结的倒计时（item 1）
+
+    /**
+     * 接听前复检必须用本会话在创建 reducer 时冻结的倒计时，而不是最新配置 revision：
+     * 铃响期间配置把 3 s 改成 10 s，当前会话仍按 3 s 到期。
+     */
+    @Test
+    fun theActiveSessionKeepsItsFrozenAnswerDelayAcrossConfigUpdates() = runTest {
+        val events = mutableListOf<String>()
+        val coordinator = coordinator(
+            FakeCallControl(),
+            FakeAudioBridge(events),
+            FakeConversation(events),
+            FakeRevoker(events),
+            RecordingObserver(events),
+        )
+        coordinator.start()
+        try {
+            coordinator.onEvent(SessionEvent.StateChanged(ringing(sessionA)))
+            advance(100)
+            assertEquals(3_000L, coordinator.currentAnswerDelayMs)
+
+            coordinator.onConfigChanged(config.copy(answerDelayMs = 10_000))
+            advance(100)
+            assertEquals(
+                "the countdown frozen for this session must win",
+                3_000L,
+                coordinator.currentAnswerDelayMs,
+            )
+
+            coordinator.onEvent(SessionEvent.ReadyChanged(true))
+            advance(100)
+            assertEquals(SessionState.PREPARING, coordinator.state)
+            assertEquals(3_000L, coordinator.currentAnswerDelayMs)
         } finally {
             coordinator.close()
         }
@@ -645,7 +698,12 @@ class SessionCoordinatorTest {
         override fun onHandedBack(id: SessionId, outcome: RevokeOutcome) {
             handedBack += id
             outcomes += outcome
-            events += "restored:" + id.callId
+            // 只有已确认的撤销才代表“恢复人工声音”；未确认是独立状态，绝不能混成 restored。
+            events += if (outcome == RevokeOutcome.CONFIRMED || outcome == RevokeOutcome.NOT_OWNED) {
+                "restored:" + id.callId
+            } else {
+                "unconfirmed:" + id.callId
+            }
         }
 
         override fun onDiagnostic(code: String, id: SessionId?) {

@@ -65,6 +65,13 @@ data class AgentCallStatus(
     val statusAvailable: Boolean = false,
     /** 最近一次影响安全的错误机器码（触发/音频/撤销失败等）。 */
     val lastError: String? = null,
+    /**
+     * [lastError] 归属的会话；null 表示服务级/未知会话（例如 bootstrap/轮询失败）。
+     *
+     * 错误与交还结果一样必须绑定会话：上一通的 handback_revoke_failed/audio_failed 绝不能
+     * 显示成下一通的“接管失败”（Task 7B2 FIX ROUND 2）。
+     */
+    val lastErrorSession: SessionId? = null,
     /** 当前协调器跟踪的会话；无会话为 null。 */
     val activeSession: SessionId? = null,
     val sessionState: SessionState? = null,
@@ -303,7 +310,8 @@ class AgentCallService : Service() {
             dispatcher = Dispatchers.Default,
             onError = { code ->
                 // 只把固定机器码写进服务状态；轮询失败绝不静默、绝不伪造事件。
-                AgentCallRuntime.update { it.copy(lastError = code) }
+                // 这是服务级错误（没有会话归属），不会被当成某通电话的接管失败。
+                AgentCallRuntime.update { it.copy(lastError = code, lastErrorSession = null) }
             },
             logger = ::log,
         )
@@ -328,7 +336,9 @@ class AgentCallService : Service() {
                 throw cancelled
             } catch (failure: Throwable) {
                 log("bootstrap_failed " + failure.javaClass.simpleName)
-                AgentCallRuntime.update { it.copy(ready = false, lastError = "bootstrap_failed") }
+                AgentCallRuntime.update {
+                    it.copy(ready = false, lastError = "bootstrap_failed", lastErrorSession = null)
+                }
                 coordinator?.onEvent(SessionEvent.ReadyChanged(false))
             }
             withTimeoutOrNull(READY_RECHECK_INTERVAL_MS) { bootstrapWakeups.receive() }
@@ -388,12 +398,15 @@ class AgentCallService : Service() {
         when (decision) {
             TakeoverDecision.Accepted -> {
                 log("takeover_accepted")
-                AgentCallRuntime.update { it.copy(lastError = null, lastHandback = null) }
+                AgentCallRuntime.update {
+                    it.copy(lastError = null, lastErrorSession = null, lastHandback = null)
+                }
                 sessionCoordinator?.onEvent(SessionEvent.Takeover(TakeoverReason.USER_REQUESTED))
             }
             is TakeoverDecision.Rejected -> {
                 log("takeover_rejected code=" + decision.code)
-                AgentCallRuntime.update { it.copy(lastError = decision.code) }
+                // 拒绝绑定到**被请求的**会话：其他会话的页面不会把这次拒绝显示成自己的失败。
+                AgentCallRuntime.update { it.copy(lastError = decision.code, lastErrorSession = target) }
             }
         }
         // handleTakeover 在主线程上执行：通知刷新放到服务 scope，避免阻塞。
@@ -427,16 +440,20 @@ class AgentCallService : Service() {
     private val serviceObserver: SessionObserver = object : SessionObserver() {
         override fun onStateChanged(id: SessionId, state: SessionState) {
             AgentCallRuntime.update {
-                // 新会话的第一个状态就清掉上一通电话的交还结果；同一会话保留到 ENDED。
-                val handback = HandbackJournal.onStateChanged(it.lastHandback, id)
-                if (state == SessionState.ENDED) {
-                    it.copy(activeSession = null, sessionState = state, lastHandback = handback)
-                } else {
-                    it.copy(activeSession = id, sessionState = state, lastHandback = handback)
-                }
+                // 新会话的第一个状态就清掉上一通电话的交还结果与错误；同一会话保留到 ENDED。
+                val residue = HandbackJournal.residueOnStateChanged(it, id, state)
+                it.copy(
+                    activeSession = if (state == SessionState.ENDED) null else id,
+                    sessionState = state,
+                    lastHandback = residue.report,
+                    lastError = residue.error,
+                    lastErrorSession = residue.errorSession,
+                )
             }
-            // 接听前的最终复检窗口随状态变化重排；非 PREPARING 会立即取消旧复检。
-            preAnswerRecheck?.onStateChanged(id, state, answerDelayMs)
+            // 接听前的最终复检只在本会话首次进入 PREPARING 时安排一次；1 Hz Tick 不得重排。
+            // 用本会话冻结的倒计时（与 reducer 同一份 config），而不是最新配置 revision。
+            val frozenAnswerDelayMs = coordinator?.currentAnswerDelayMs ?: answerDelayMs
+            preAnswerRecheck?.onStateChanged(id, state, frozenAnswerDelayMs)
             scope.launch { updateNotification() }
         }
 
@@ -454,14 +471,14 @@ class AgentCallService : Service() {
         }
 
         override fun onNotify(id: SessionId, reason: String) {
-            AgentCallRuntime.update { it.copy(lastError = reason) }
+            AgentCallRuntime.update { it.copy(lastError = reason, lastErrorSession = id) }
             scope.launch { updateNotification() }
         }
 
         override fun onDiagnostic(code: String, id: SessionId?) {
             // 只把安全相关失败暴露给 UI；普通生命周期诊断不覆盖 lastError。
             if (code.startsWith("audio_") || code.startsWith("handback_")) {
-                AgentCallRuntime.update { it.copy(lastError = code) }
+                AgentCallRuntime.update { it.copy(lastError = code, lastErrorSession = id) }
             }
         }
     }

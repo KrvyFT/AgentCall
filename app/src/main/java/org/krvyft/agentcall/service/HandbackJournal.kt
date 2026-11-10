@@ -1,6 +1,7 @@
 package org.krvyft.agentcall.service
 
 import org.krvyft.agentcall.core.model.SessionId
+import org.krvyft.agentcall.core.model.SessionState
 
 /**
  * 一次人工交还的结果，**绑定产生它的 [SessionId]**（Task 7B2 FIX ROUND 1）。
@@ -15,6 +16,17 @@ data class HandbackReport(
 )
 
 /**
+ * 一次状态变化后保留的会话残留（Task 7B2 FIX ROUND 2）。
+ *
+ * 报告与错误都只属于会话；新会话的第一个状态会把上一通的残留清掉。
+ */
+data class HandbackResidue(
+    val report: HandbackReport?,
+    val error: String?,
+    val errorSession: SessionId?,
+)
+
+/**
  * 接管页/主页的展示裁决。只由报告所属会话 + 该会话的机器码错误派生。
  *
  * [Unconfirmed] 与 [HandedBack] 是不同的类型：撤销未确认在类型上就不可能被当成“交还成功”。
@@ -26,7 +38,7 @@ sealed interface HandbackOutcome {
     /** 撤销未确认：必须显示为失败，绝不能显示成功或“尚未提交接管”。 */
     data class Unconfirmed(val report: HandbackReport) : HandbackOutcome
 
-    /** 该会话没有交还报告，但有机器码错误。 */
+    /** 属于该会话的机器码错误（不是上一通电话的残留）。 */
     data class Failed(val code: String) : HandbackOutcome
 
     /** 该会话还没有任何交还结果。 */
@@ -36,10 +48,14 @@ sealed interface HandbackOutcome {
 /**
  * 人工交还结果的会话绑定规则（纯逻辑，JVM 可测）。
  *
- * 与 [AgentCallStatus.lastHandback] 配合使用：
+ * 与 [AgentCallStatus.lastHandback]/[AgentCallStatus.lastError] 配合使用：
  * - [record] 在 [SessionObserver.onHandedBack] 里写入 (SessionId, code)；
- * - [onStateChanged] 在每次状态变化时丢弃属于别的会话的残留；
- * - [outcomeFor] 是 UI 的唯一裁决入口，绝不读取“当前会话之外”的报告。
+ * - [residueOnStateChanged] 在每次状态变化时丢弃属于别的会话的残留；
+ * - [outcomeFor] 是 UI 的唯一裁决入口，绝不读取“当前会话之外”的报告或错误。
+ *
+ * FIX ROUND 2：错误（撤销失败、音频失败、接管被拒）此前只按全局 lastError 回落，于是
+ * 上一通的 handback_revoke_failed/audio_failed 会显示成下一通的“接管失败”。
+ * 现在错误也带会话归属，且新会话的第一个状态即清掉残留。
  */
 object HandbackJournal {
 
@@ -59,13 +75,45 @@ object HandbackJournal {
         HandbackReport(session = session, code = codeFor(outcome))
 
     /**
-     * 状态变化时清理残留：报告只属于它记录的会话。
+     * 状态变化时清理报告残留：报告只属于它记录的会话。
      *
      * 新会话（哪怕是 IDLE/ELIGIBLE/RINGING）的第一个状态就会清掉上一通电话的结果；
      * 同一会话后续的 HANDOFF/ENDING/ENDED 仍保留报告，供接管页显示最终结论。
      */
     fun onStateChanged(current: HandbackReport?, session: SessionId): HandbackReport? =
         current?.takeIf { it.session == session }
+
+    /**
+     * 状态变化时的**全部**会话残留裁决（报告 + 错误）。
+     *
+     * 规则：
+     * - 报告：只保留属于 [session] 的；
+     * - 错误：只保留属于 [session] 的；服务级错误（无会话归属）保留到下一次状态变化；
+     * - 新会话的第一个非 ENDED 状态（[AgentCallStatus.activeSession] != [session]）清掉
+     *   上一通电话/服务级的错误残留；同一会话的 ENDED 仍保留自己的最终结论。
+     */
+    fun residueOnStateChanged(
+        status: AgentCallStatus,
+        session: SessionId,
+        state: SessionState,
+    ): HandbackResidue {
+        val report = onStateChanged(status.lastHandback, session)
+        val error = status.lastError
+        val errorSession = status.lastErrorSession
+        val startsNewCall = state != SessionState.ENDED && status.activeSession != session
+        val keepError = when {
+            error == null -> false
+            errorSession == session -> true
+            errorSession == null -> !startsNewCall
+            // 属于别的会话的错误：任何状态都不得保留。
+            else -> false
+        }
+        return HandbackResidue(
+            report = report,
+            error = if (keepError) error else null,
+            errorSession = if (keepError) errorSession else null,
+        )
+    }
 
     /** 只返回属于 [session] 的报告；别的会话/缺少目标一律 null。 */
     fun forSession(report: HandbackReport?, session: SessionId?): HandbackReport? {
@@ -74,7 +122,10 @@ object HandbackJournal {
     }
 
     /**
-     * UI 展示裁决：报告只对它自己的会话生效；没有报告时才回落到该会话的机器码错误。
+     * UI 展示裁决：报告只对它自己的会话生效；没有报告时才回落到**属于该会话**的机器码错误。
+     *
+     * 上一通电话的错误（错误归属另一个会话）与服务级错误都不显示在这里——它们不是
+     * “这通电话的接管失败”。
      */
     fun outcomeFor(status: AgentCallStatus, session: SessionId?): HandbackOutcome {
         if (session == null) return HandbackOutcome.Pending
@@ -86,6 +137,7 @@ object HandbackJournal {
             }
         }
         val error = status.lastError ?: return HandbackOutcome.Pending
+        if (status.lastErrorSession != session) return HandbackOutcome.Pending
         return HandbackOutcome.Failed(error)
     }
 }

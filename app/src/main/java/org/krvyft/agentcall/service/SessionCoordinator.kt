@@ -185,6 +185,15 @@ class SessionCoordinator(
         get() = current?.session
 
     /**
+     * 当前会话在创建 reducer 时**冻结**的接听倒计时（毫秒）；没有会话时为 null。
+     *
+     * 接听前复检必须用它（而不是最新配置 revision），否则铃响期间的配置变化会把复检窗口
+     * 推到真实到期之后（Task 7B2 FIX ROUND 2）。
+     */
+    val currentAnswerDelayMs: Long?
+        get() = current?.answerDelayMs
+
+    /**
      * 因有界队列饱和被丢弃的输入数（诊断用；不是协议错误）。
      *
      * 只有周期性的 Tick 会被丢弃（下一个 1 s 内还会再来一条）；快照/接管/READY/命令结果/
@@ -397,6 +406,8 @@ class SessionCoordinator(
             reducer = SessionReducer(snapshot.id, config),
             generation = generationCounter.incrementAndGet(),
             callJob = Job(parent),
+            // reducer 冻结同一份 config：本会话的倒计时从这里起算，之后的 revision 只影响下一通。
+            answerDelayMs = config.answerDelayMs.toLong(),
         )
         current = runtime
         runtime.tickerJob = scope.launch(runtime.callJob) {
@@ -477,6 +488,8 @@ class SessionCoordinator(
             if (settled == null && inFlight.isActive) {
                 runtime.revokeOutcome = RevokeOutcome.UNAVAILABLE
                 observer.onDiagnostic("handback_command_unsettled", id)
+                // 撤销没能发起 = 未确认：必须以独立的交还结果到达 UI，绝不能消失或显示成功。
+                observer.onHandedBack(id, RevokeOutcome.UNAVAILABLE)
                 return
             }
         }
@@ -497,8 +510,10 @@ class SessionCoordinator(
         if (outcome == RevokeOutcome.CONFIRMED || outcome == RevokeOutcome.NOT_OWNED) {
             leases.revoke(id)
         } else {
-            // 撤销未确认：不得恢复声音，也不得显示交还成功。
+            // 撤销未确认：不得恢复声音，也不得显示交还成功。但必须以**交还结果**的形式到达 UI，
+            // 让接管页显示独立的“交还未确认”（只发诊断会让 Unconfirmed 在生产上不可达）。
             observer.onDiagnostic("handback_revoke_failed", id)
+            observer.onHandedBack(id, outcome)
         }
     }
 
@@ -674,6 +689,8 @@ class SessionCoordinator(
         val reducer: SessionReducer,
         val generation: Long,
         val callJob: Job,
+        /** 本会话 reducer 冻结的接听倒计时（与 SessionReducer 使用同一份 config）。 */
+        val answerDelayMs: Long,
     ) {
         @Volatile
         var active: Boolean = true

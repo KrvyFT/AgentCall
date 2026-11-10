@@ -680,4 +680,74 @@ class SessionReducerTest {
         assertTrue(effects.isEmpty())
         assertEquals(SessionState.HANDOFF, reducer.state)
     }
+
+    // ---- 7D 复审补充：接听之后的 READY 丢失是 no-op（不得撤销/恢复，180 s 上限照常生效） ----
+
+    @Test
+    fun readyLossAfterTheAnswerIsANoOpAndTheCapStillHangsUp() {
+        val reducer = startedReducer()
+        // 3 s 倒计时到期：唯一的接听命令下发，进入 ANSWER_PENDING。
+        assertEquals(
+            listOf(SessionEffect.SendCommand(CallCommand.Answer)),
+            reducer.reduce(SessionEvent.Tick, 3_000),
+        )
+        assertEquals(SessionState.ANSWER_PENDING, reducer.state)
+
+        // 接听之后 READY 丢失：状态不变、没有任何资源副作用（租约/隔离是接听的前置条件，
+        // 此时归 AI 的通话已建立，不能因为 READY 抖动就撤销）。
+        val loss = reducer.reduce(SessionEvent.ReadyChanged(ready = false), 3_500)
+        assertTrue("READY loss after the answer must be a no-op, got " + loss, loss.isEmpty())
+        assertEquals(SessionState.ANSWER_PENDING, reducer.state)
+
+        // 已下发的接听不受影响：ACTIVE 快照照常打开会话；180 s 上限从观察到 ACTIVE 起算。
+        val active = reducer.reduce(SessionEvent.StateChanged(Fixtures.answered()), 3_600)
+        assertTrue(active.contains(SessionEffect.StartConversation))
+        assertEquals(SessionState.ACTIVE_AI, reducer.state)
+
+        assertTrue(reducer.reduce(SessionEvent.Tick, 3_600 + 179_999).none { it is SessionEffect.SendCommand })
+        val cap = reducer.reduce(SessionEvent.Tick, 3_600 + 180_000)
+        assertTrue("the 180 s cap must still hang up a ready-lost active call", cap.hasHangup())
+        assertTrue(cap.contains(SessionEffect.RevokeLease(id)))
+        assertEquals(SessionState.ENDING, reducer.state)
+    }
+
+    @Test
+    fun readyLossInActiveAiKeepsTheCallAndTheTimeout() {
+        val reducer = activeReducer(activeAt = 3_000)
+
+        val loss = reducer.reduce(SessionEvent.ReadyChanged(ready = false), 3_500)
+
+        assertTrue("READY loss in ACTIVE_AI must be a no-op, got " + loss, loss.isEmpty())
+        assertEquals(SessionState.ACTIVE_AI, reducer.state)
+        assertTrue(loss.none { it is SessionEffect.RevokeLease })
+        assertTrue(loss.none { it is SessionEffect.RestoreMicrophone })
+
+        // 180 s 上限仍然生效：到点挂断并撤销租约，麦克风一直隔离到断开确认。
+        assertTrue(reducer.reduce(SessionEvent.Tick, 182_999).none { it is SessionEffect.SendCommand })
+        val cap = reducer.reduce(SessionEvent.Tick, 183_000)
+        assertTrue(cap.hasHangup())
+        assertTrue(cap.contains(SessionEffect.RevokeLease(id)))
+        assertTrue(cap.none { it is SessionEffect.RestoreMicrophone })
+        assertEquals(SessionState.ENDING, reducer.state)
+    }
+
+    @Test
+    fun readyLossInHandoffAndEndedIsANoOp() {
+        val handedBack = activeReducer(activeAt = 3_000)
+        val takeover = handedBack.reduce(SessionEvent.Takeover(TakeoverReason.USER_REQUESTED), 3_500)
+        assertEquals(SessionState.HANDOFF, handedBack.state)
+        assertTrue(takeover.contains(SessionEffect.RevokeLease(id)))
+        assertTrue(takeover.contains(SessionEffect.RestoreMicrophone(id)))
+
+        val afterHandoff = handedBack.reduce(SessionEvent.ReadyChanged(ready = false), 4_000)
+        assertTrue("READY loss in HANDOFF must not revoke/restore twice, got " + afterHandoff, afterHandoff.isEmpty())
+        assertEquals(SessionState.HANDOFF, handedBack.state)
+
+        val ended = activeReducer(activeAt = 3_000)
+        ended.reduce(SessionEvent.StateChanged(Fixtures.disconnected()), 4_000)
+        assertEquals(SessionState.ENDED, ended.state)
+        val afterEnded = ended.reduce(SessionEvent.ReadyChanged(ready = false), 4_500)
+        assertTrue("READY loss after ENDED must be a no-op, got " + afterEnded, afterEnded.isEmpty())
+        assertEquals(SessionState.ENDED, ended.state)
+    }
 }
