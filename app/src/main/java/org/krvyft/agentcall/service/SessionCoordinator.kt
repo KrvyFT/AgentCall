@@ -1,6 +1,7 @@
 package org.krvyft.agentcall.service
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -644,6 +645,9 @@ class SessionCoordinator(
             }
         }
         runtime.commandJob = null
+        // M1：排在在途命令后面的是挂断这类必须发出的命令。此时租约仍然有效，必须在
+        // revoke 之前补发，否则撤销后它只会被 command_dropped_not_owned 丢掉。
+        dispatchQueuedCommand(runtime)
 
         val outcome = if (handbackViaServer) {
             try {
@@ -689,9 +693,17 @@ class SessionCoordinator(
     }
 
     /**
-     * 下发一条受限命令。命令在子 Job 上执行（结果经 generation 校验投递），因此消费者
-     * 不会被最长 4000 ms 的 session.request/handover 阻塞：新的来电、断开通话与人工接管
-     * 仍能及时生效，旧结果也不会作用到新会话。
+     * 下发一条受限命令。命令本身在子 Job 上执行（结果经 generation 校验投递），所以
+     * **单个** session.request 不会阻塞消费者：新的来电、断开通话与人工接管仍能及时生效。
+     *
+     * 但这不等于消费者永不被阻塞：当 reducer 在同一个效果列表里先发命令、再要求撤销
+     * 所有权时，[revokeOwnership] 会在串行消费者上等待在途命令结束（最多
+     * [COMMAND_SETTLE_TIMEOUT_MS]），随后才发 handover；handover 自身最长还有 9 s 的
+     * 监督端预算。也就是说，“命令在子 Job 上”只保证等待有界，不保证消费者立即空闲。
+     *
+     * 已经有命令在途时，新命令进入**有界**的单槽队列（M1）：reducer 已经进入 ENDING 并
+     * 撤销租约的场景里，直接丢弃挂断会让 AI 通话无法终止。命令落地后（或撤销所有权等待
+     * 结束时）再按租约有效性补发；最终发不出去时写机器码诊断，不静默丢失。
      */
     private fun sendCommand(runtime: CallRuntime, command: CallCommand) {
         if (!isCurrent(runtime)) return
@@ -702,9 +714,20 @@ class SessionCoordinator(
         }
         val previous = runtime.commandJob
         if (previous != null && previous.isActive) {
-            observer.onDiagnostic("command_already_in_flight", runtime.session)
+            if (runtime.pendingCommand != null) {
+                // 有界：只排一条；第二条明确记为丢弃，绝不无限堆积。
+                observer.onDiagnostic("command_dropped_queue_full", runtime.session)
+                return
+            }
+            runtime.pendingCommand = command
+            observer.onDiagnostic("command_queued", runtime.session)
             return
         }
+        launchCommand(runtime, command)
+    }
+
+    /** 在子 Job 上真正下发一条命令；调用方负责确认没有在途命令。 */
+    private fun launchCommand(runtime: CallRuntime, command: CallCommand) {
         val session = runtime.session
         val generation = runtime.generation
         runtime.commandJob = scope.launch {
@@ -716,6 +739,44 @@ class SessionCoordinator(
                 CommandResult.Failed("command_failed", failure.javaClass.simpleName)
             }
             addInput(Input.CommandFinished(session, generation, command, result))
+        }
+    }
+
+    /**
+     * 补发单槽队列里的命令（M1），并等待它有界地落地。
+     *
+     * 只在“前一条命令已经结束”后调用；租约已失效、会话已结束或目标已换时明确记诊断后
+     * 丢弃。等待超时则取消子 Job 并记 queued_command_unsettled，绝不无界阻塞消费者。
+     */
+    private suspend fun dispatchQueuedCommand(runtime: CallRuntime) {
+        val queued = runtime.pendingCommand ?: return
+        runtime.pendingCommand = null
+        if (!isCurrent(runtime) ||
+            runtime.reducer.state == SessionState.ENDED ||
+            !leases.isLive(runtime.session)
+        ) {
+            observer.onDiagnostic("command_dropped_after_settle", runtime.session)
+            return
+        }
+        val session = runtime.session
+        val generation = runtime.generation
+        val done = CompletableDeferred<Unit>()
+        runtime.commandJob = scope.launch {
+            val result = try {
+                calls.send(session, queued)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Throwable) {
+                CommandResult.Failed("command_failed", failure.javaClass.simpleName)
+            }
+            addInput(Input.CommandFinished(session, generation, queued, result))
+            done.complete(Unit)
+        }
+        val settled = withTimeoutOrNull(commandSettleTimeoutMs) { done.await() }
+        if (settled == null) {
+            runtime.commandJob?.cancel()
+            runtime.commandJob = null
+            observer.onDiagnostic("queued_command_unsettled", session)
         }
     }
 
@@ -752,6 +813,10 @@ class SessionCoordinator(
                     observer.onNotify(runtime.session, "hangup_failed")
                 }
             }
+        }
+        // 前一条命令已经落地：补发单槽队列（如果有），否则它要等到撤销路径才被发出。
+        if (isCurrent(runtime) && runtime.commandJob?.isActive != true) {
+            dispatchQueuedCommand(runtime)
         }
     }
 
@@ -849,6 +914,8 @@ class SessionCoordinator(
         var heartbeatJob: Job? = null
         var conversationJob: Job? = null
         var commandJob: Job? = null
+        /** 单槽、有界：已有命令在途时最多排一条后续命令（M1）。 */
+        var pendingCommand: CallCommand? = null
         var audioSession: AudioSession? = null
         var revokeOutcome: RevokeOutcome? = null
     }

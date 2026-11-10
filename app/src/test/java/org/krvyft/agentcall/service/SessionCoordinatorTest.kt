@@ -125,6 +125,52 @@ class SessionCoordinatorTest {
     }
 
     @Test
+    fun hangupQueuedBehindAnInFlightAnswerIsSentBeforeTheLeaseIsRevoked() = runTest {
+        val events = mutableListOf<String>()
+        val lateAnswer = CompletableDeferred<CommandResult>()
+        val calls = FakeCallControl(lateAnswer = lateAnswer)
+        val observer = RecordingObserver(events)
+        val coordinator = coordinator(
+            calls,
+            FakeAudioBridge(events),
+            FakeConversation(events),
+            FakeRevoker(events),
+            observer,
+        )
+        coordinator.start()
+        try {
+            coordinator.onEvent(SessionEvent.StateChanged(ringing(sessionA)))
+            coordinator.onEvent(SessionEvent.ReadyChanged(true))
+            advance(3_100)
+            assertEquals(listOf(SentCommand(sessionA, CallCommand.Answer)), calls.sent)
+
+            // 接听结果还没回来时关闭总开关：reducer 已进入 ENDING 并产生 Hangup + RevokeLease。
+            coordinator.onConfigChanged(config.copy(enabled = false))
+            advance(100)
+            assertEquals(SessionState.ENDING, coordinator.state)
+            assertEquals(
+                "a hangup must be queued behind the in-flight answer, not dropped",
+                listOf(SentCommand(sessionA, CallCommand.Answer)),
+                calls.sent,
+            )
+            assertTrue(
+                "queueing must be observable, got " + observer.diagnostics,
+                "command_queued" in observer.diagnostics,
+            )
+
+            // 在途接听落地后，排队的挂断必须先于撤销租约发出（否则挂断会因租约失效被丢弃）。
+            lateAnswer.complete(CommandResult.Accepted)
+            advance(200)
+            assertEquals(
+                listOf(SentCommand(sessionA, CallCommand.Answer), SentCommand(sessionA, CallCommand.Hangup)),
+                calls.sent,
+            )
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    @Test
     fun takeoverRevokesBeforeRestore() = runTest {
         val events = mutableListOf<String>()
         val calls = FakeCallControl()
