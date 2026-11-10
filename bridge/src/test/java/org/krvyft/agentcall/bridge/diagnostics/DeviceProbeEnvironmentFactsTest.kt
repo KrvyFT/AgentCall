@@ -86,4 +86,75 @@ class DeviceProbeEnvironmentFactsTest {
         // JVM 单元测试没有运行中的 Android 框架：真实实现必须返回显式 UNKNOWN 而不是抛错。
         assertEquals(PlatformFacts.UNKNOWN, AndroidPlatformFacts().simCarrier())
     }
+
+    // ------------------------------------------------- Task 11H1：真实框架/运营商来源
+
+    @Test
+    fun frameworkVersionIsObservedFromRootSystemPropertiesBeforeTheDirectClassSignal() {
+        val facts = AndroidPlatformFacts(
+            properties = SystemPropertySource { name ->
+                when (name) {
+                    "ro.lsposed.version" -> "1.9.2"
+                    "gsm.sim.operator.alpha" -> "Property Carrier"
+                    else -> null
+                }
+            },
+            telephonyCarrier = { null },
+            xposedBridgeVersion = { "82" },
+        )
+
+        assertEquals("root 属性是目标栈上的真实事实，优先于直接类检查", "1.9.2", facts.frameworkVersion())
+        assertEquals("SIM 运营商可从根进程系统属性观测", "Property Carrier", facts.simCarrier())
+    }
+
+    @Test
+    fun frameworkVersionFallsBackToTheDirectClassCheckAndThenUnknown() {
+        assertEquals(
+            "直接类检查仍是一个信号",
+            "82",
+            AndroidPlatformFacts(
+                properties = SystemPropertySource.NONE,
+                telephonyCarrier = { null },
+                xposedBridgeVersion = { "82" },
+            ).frameworkVersion(),
+        )
+        assertEquals(
+            "两个来源都没有时必须是显式 UNKNOWN",
+            PlatformFacts.UNKNOWN,
+            AndroidPlatformFacts(
+                properties = SystemPropertySource.NONE,
+                telephonyCarrier = { null },
+                xposedBridgeVersion = { null },
+            ).frameworkVersion(),
+        )
+    }
+
+    @Test
+    fun blankOversizedControlCharacterOrUnknownPropertyValuesAreNotFacts() {
+        for (value in listOf("", "   ", "1.9\n2", "x".repeat(129), PlatformFacts.UNKNOWN)) {
+            val facts = AndroidPlatformFacts(
+                properties = SystemPropertySource { if (it == "ro.vector.version") value else null },
+                telephonyCarrier = { null },
+                xposedBridgeVersion = { null },
+            )
+            assertEquals(
+                "无效属性值必须保持 UNKNOWN：" + value,
+                PlatformFacts.UNKNOWN,
+                facts.frameworkVersion(),
+            )
+        }
+    }
+
+    @Test
+    fun simCarrierFallsBackToTheSimOperatorPropertyWhenTelephonyIsUnavailable() {
+        val facts = AndroidPlatformFacts(
+            properties = SystemPropertySource { name ->
+                if (name == "gsm.sim.operator.alpha") "SIM Carrier" else null
+            },
+            telephonyCarrier = { null },
+            xposedBridgeVersion = { null },
+        )
+
+        assertEquals("SIM Carrier", facts.simCarrier())
+    }
 }

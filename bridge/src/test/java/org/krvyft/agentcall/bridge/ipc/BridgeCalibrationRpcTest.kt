@@ -22,9 +22,12 @@ import org.krvyft.agentcall.bridge.ControlDispatcher
 import org.krvyft.agentcall.bridge.isCalibrationAuthorizedFor
 import org.krvyft.agentcall.bridge.config.CalibrationStore
 import org.krvyft.agentcall.bridge.config.ConfigStore
+import org.krvyft.agentcall.bridge.diagnostics.AndroidPlatformFacts
 import org.krvyft.agentcall.bridge.diagnostics.AudioApiProbe
 import org.krvyft.agentcall.bridge.diagnostics.DeviceProbe
 import org.krvyft.agentcall.bridge.diagnostics.PlatformFacts
+import org.krvyft.agentcall.bridge.diagnostics.SystemPropertySource
+import org.krvyft.agentcall.core.model.CalibrationEvidence
 import org.krvyft.agentcall.core.model.ConfigPatch
 import org.krvyft.agentcall.core.model.EndpointKind
 import org.krvyft.agentcall.core.model.EnvironmentKey
@@ -86,12 +89,13 @@ class BridgeCalibrationRpcTest {
         carrier: String = "Test Carrier",
         transport: String = "VoLTE",
         route: String = "SWB",
+        frameworkVersion: String = "xposed-82",
     ): EnvironmentKey = EnvironmentKey(
         apiLevel = 37,
         romFingerprint = "rom-fingerprint",
         kernelVersion = "6.1.0",
         dialerPackageVersion = "1.0",
-        frameworkVersion = "xposed-82",
+        frameworkVersion = frameworkVersion,
         bridgeVersion = "1.0",
         audioPolicyDigest = "digest",
         simCarrier = carrier,
@@ -103,16 +107,19 @@ class BridgeCalibrationRpcTest {
         carrier: String = "Test Carrier",
         transport: String = "VoLTE",
         route: String = "SWB",
+        frameworkVersion: String = "xposed-82",
+        /** 生产探针测试注入的完整平台；null 时用本类的固定假平台。 */
+        platformOverride: PlatformFacts? = null,
     ): ControlDispatcher = ControlDispatcher(
         store = store,
         packages = packages,
         probe = DeviceProbe(
             packages = packages,
-            platform = object : PlatformFacts {
+            platform = platformOverride ?: object : PlatformFacts {
                 override fun apiLevel(): Int = 37
                 override fun romFingerprint(): String = "rom-fingerprint"
                 override fun kernelVersion(): String = "6.1.0"
-                override fun frameworkVersion(): String = "xposed-82"
+                override fun frameworkVersion(): String = frameworkVersion
                 override fun audioPolicyDigest(): String = "digest"
                 override fun simCarrier(): String = carrier
                 override fun transport(): String = transport
@@ -163,10 +170,14 @@ class BridgeCalibrationRpcTest {
         transport: String = "CELLULAR",
         route: String = "EARPIECE",
         manualTestCompleted: Boolean = true,
+        frameworkVersion: String? = null,
+        simCarrier: String? = null,
     ): JsonObject = JsonObject().apply {
         addProperty("transport", transport)
         addProperty("route", route)
         addProperty("manualTestCompleted", manualTestCompleted)
+        if (frameworkVersion != null) addProperty("frameworkVersion", frameworkVersion)
+        if (simCarrier != null) addProperty("simCarrier", simCarrier)
     }
 
     private fun recordPayloadWithAttestation(
@@ -188,8 +199,14 @@ class BridgeCalibrationRpcTest {
         transport: String = "VoLTE",
         route: String = "SWB",
         carrier: String = "Test Carrier",
+        frameworkVersion: String = "xposed-82",
     ): JsonObject {
-        val response = dispatcher(carrier = carrier, transport = transport, route = route)
+        val response = dispatcher(
+            carrier = carrier,
+            transport = transport,
+            route = route,
+            frameworkVersion = frameworkVersion,
+        )
             .handle(peer, request(RolePolicy.METHOD_CALIBRATION_READ))
         assertNull("unexpected error: " + response.error, response.error)
         return JsonParser.parseString(response.payload).asJsonObject
@@ -418,6 +435,8 @@ class BridgeCalibrationRpcTest {
         assertFalse(view.getAsJsonObject("operatorAttestation").get("operatorAttested").asBoolean)
         assertTrue(view.getAsJsonObject("operatorAttestation").get("transport").isJsonNull)
         assertTrue(view.getAsJsonObject("operatorAttestation").get("route").isJsonNull)
+        assertTrue(view.getAsJsonObject("operatorAttestation").get("frameworkVersion").isJsonNull)
+        assertTrue(view.getAsJsonObject("operatorAttestation").get("simCarrier").isJsonNull)
         assertFalse("观测环境缺字段时 environmentComplete 必须为 false", view.get("environmentComplete").asBoolean)
         assertFalse(view.get("verified").asBoolean)
     }
@@ -517,6 +536,307 @@ class BridgeCalibrationRpcTest {
         )
     }
 
+    // ----------------------------------- 框架版本/SIM 运营商背书（Task 11H1）
+
+    /**
+     * 11H1：框架版本与 SIM 运营商在目标栈上可能观测不到（bridge app_process 不加载
+     * Xposed；TelephonyManager 也可能不可用）。同一个 CLI_ROOT 背书（同样要求
+     * manualTestCompleted=true）可以补齐这两项；观测不到时才生效，观测到的已知值永远优先。
+     */
+    @Test
+    fun rootAttestationCoversFrameworkVersionAndSimCarrierWhenTheBridgeCannotObserveThem() {
+        val observed = environment(
+            carrier = PlatformFacts.UNKNOWN,
+            transport = PlatformFacts.UNKNOWN,
+            route = PlatformFacts.UNKNOWN,
+            frameworkVersion = PlatformFacts.UNKNOWN,
+        )
+        val response = dispatcher(
+            carrier = PlatformFacts.UNKNOWN,
+            transport = PlatformFacts.UNKNOWN,
+            route = PlatformFacts.UNKNOWN,
+            frameworkVersion = PlatformFacts.UNKNOWN,
+        ).handle(
+            cliPeer,
+            request(
+                RolePolicy.METHOD_CALIBRATION_RECORD,
+                recordPayloadWithAttestation(
+                    attestation = attestationPayload(
+                        frameworkVersion = "LSPosed 1.9.2",
+                        simCarrier = "Attested Carrier",
+                    ),
+                ),
+            ),
+        )
+
+        assertNull("unexpected error: " + response.error, response.error)
+        val json = JsonParser.parseString(response.payload).asJsonObject
+        assertTrue(json.get("recorded").asBoolean)
+        assertTrue("四项背书后的环境必须完整并授权自动接听", json.get("verified").asBoolean)
+        val attestation = json.getAsJsonObject("operatorAttestation")
+        assertTrue(attestation.get("operatorAttested").asBoolean)
+        assertEquals("CELLULAR", attestation.get("transport").asString)
+        assertEquals("EARPIECE", attestation.get("route").asString)
+        assertEquals("LSPosed 1.9.2", attestation.get("frameworkVersion").asString)
+        assertEquals("Attested Carrier", attestation.get("simCarrier").asString)
+
+        val stored = calibration.load()
+        assertNotNull(stored)
+        assertEquals(
+            observed.copy(
+                transport = "CELLULAR",
+                route = "EARPIECE",
+                frameworkVersion = "LSPosed 1.9.2",
+                simCarrier = "Attested Carrier",
+            ),
+            stored!!.environment,
+        )
+        assertEquals("时间戳仍由服务端生成", 12_345L, stored.calibratedAtMs)
+        assertTrue(CalibrationPolicy.canAutoAnswer(stored.environment, stored))
+        assertFalse(
+            "CalibrationPolicy 本身不变：原始 UNKNOWN 环境仍不能自动接听",
+            CalibrationPolicy.canAutoAnswer(observed, stored),
+        )
+    }
+
+    @Test
+    fun calibrationReadMarksAttestedFrameworkVersionAndSimCarrier() {
+        dispatcher(
+            carrier = PlatformFacts.UNKNOWN,
+            transport = PlatformFacts.UNKNOWN,
+            route = PlatformFacts.UNKNOWN,
+            frameworkVersion = PlatformFacts.UNKNOWN,
+        ).handle(
+            cliPeer,
+            request(
+                RolePolicy.METHOD_CALIBRATION_RECORD,
+                recordPayloadWithAttestation(
+                    attestation = attestationPayload(
+                        frameworkVersion = "LSPosed 1.9.2",
+                        simCarrier = "Attested Carrier",
+                    ),
+                ),
+            ),
+        )
+
+        val view = readView(
+            appPeer,
+            transport = PlatformFacts.UNKNOWN,
+            route = PlatformFacts.UNKNOWN,
+            carrier = PlatformFacts.UNKNOWN,
+            frameworkVersion = PlatformFacts.UNKNOWN,
+        )
+
+        assertTrue(view.get("verified").asBoolean)
+        assertTrue(view.get("environmentMatchesEvidence").asBoolean)
+        assertEquals(
+            "environment 只报告桥接实测",
+            PlatformFacts.UNKNOWN,
+            view.getAsJsonObject("environment").get("frameworkVersion").asString,
+        )
+        assertEquals(
+            PlatformFacts.UNKNOWN,
+            view.getAsJsonObject("environment").get("simCarrier").asString,
+        )
+        assertEquals(
+            "effectiveEnvironment 才是判定用的环境（含背书）",
+            "LSPosed 1.9.2",
+            view.getAsJsonObject("effectiveEnvironment").get("frameworkVersion").asString,
+        )
+        assertEquals(
+            "Attested Carrier",
+            view.getAsJsonObject("effectiveEnvironment").get("simCarrier").asString,
+        )
+        val attestation = view.getAsJsonObject("operatorAttestation")
+        assertEquals("LSPosed 1.9.2", attestation.get("frameworkVersion").asString)
+        assertEquals("Attested Carrier", attestation.get("simCarrier").asString)
+        assertTrue(attestation.get("operatorAttested").asBoolean)
+
+        // status/diagnose 必须携带同一份视图（同样的背书字段标记）。
+        val status = runsOnAttestedDispatcher()
+            .handle(appPeer, request(RolePolicy.METHOD_STATUS))
+        val diagnose = runsOnAttestedDispatcher()
+            .handle(appPeer, request(RolePolicy.METHOD_DIAGNOSE))
+        assertNull(status.error)
+        assertNull(diagnose.error)
+        assertEquals(
+            view,
+            JsonParser.parseString(status.payload).asJsonObject.getAsJsonObject("calibration"),
+        )
+        assertEquals(
+            view,
+            JsonParser.parseString(diagnose.payload).asJsonObject.getAsJsonObject("calibration"),
+        )
+    }
+
+    private fun runsOnAttestedDispatcher(): ControlDispatcher = dispatcher(
+        carrier = PlatformFacts.UNKNOWN,
+        transport = PlatformFacts.UNKNOWN,
+        route = PlatformFacts.UNKNOWN,
+        frameworkVersion = PlatformFacts.UNKNOWN,
+    )
+
+    @Test
+    fun observedKnownValuesAlwaysWinOverTheAttestation() {
+        val observed = environment()
+        val response = dispatcher().handle(
+            cliPeer,
+            request(
+                RolePolicy.METHOD_CALIBRATION_RECORD,
+                recordPayloadWithAttestation(
+                    attestation = attestationPayload(
+                        transport = "VOWIFI",
+                        route = "SPEAKER",
+                        frameworkVersion = "attested-fw",
+                        simCarrier = "Attested Carrier",
+                    ),
+                    expected = observed,
+                ),
+            ),
+        )
+
+        assertNull("unexpected error: " + response.error, response.error)
+        val json = JsonParser.parseString(response.payload).asJsonObject
+        assertTrue(json.get("verified").asBoolean)
+        val attestation = json.getAsJsonObject("operatorAttestation")
+        assertFalse("全部字段都是观测事实时不得标记 operator_attested", attestation.get("operatorAttested").asBoolean)
+        assertTrue(attestation.get("transport").isJsonNull)
+        assertTrue(attestation.get("route").isJsonNull)
+        assertTrue(attestation.get("frameworkVersion").isJsonNull)
+        assertTrue(attestation.get("simCarrier").isJsonNull)
+        assertEquals("背书绝不能覆盖观测到的已知值", observed, calibration.load()!!.environment)
+    }
+
+    @Test
+    fun attestedFrameworkVersionAndSimCarrierRejectInvalidStringFormats() {
+        val invalid = listOf(
+            attestationPayload(frameworkVersion = ""),
+            attestationPayload(frameworkVersion = "1.9\n2"),
+            attestationPayload(frameworkVersion = "x".repeat(129)),
+            attestationPayload(frameworkVersion = PlatformFacts.UNKNOWN),
+            attestationPayload(simCarrier = " "),
+            JsonObject().apply {
+                addProperty("transport", "CELLULAR")
+                addProperty("route", "EARPIECE")
+                addProperty("manualTestCompleted", true)
+                addProperty("frameworkVersion", 82)
+            },
+        )
+        for (attestation in invalid) {
+            val response = dispatcher(
+                carrier = PlatformFacts.UNKNOWN,
+                transport = PlatformFacts.UNKNOWN,
+                route = PlatformFacts.UNKNOWN,
+                frameworkVersion = PlatformFacts.UNKNOWN,
+            ).handle(
+                cliPeer,
+                request(RolePolicy.METHOD_CALIBRATION_RECORD, recordPayloadWithAttestation(attestation = attestation)),
+            )
+            assertEquals("payload_invalid", response.error?.code)
+            assertNull("被拒绝的背书绝不能落盘", calibration.load())
+        }
+    }
+
+    /**
+     * 11H1 production probe：观测路径（假的 root 系统属性来源，等价于真机
+     * SystemProperties/manager metadata）与背书路径都必须让每个必填 EnvironmentKey 字段
+     * 非 UNKNOWN，从而让五项步骤的 calibration.record 成功落盘并通过 CalibrationPolicy。
+     */
+    @Test
+    fun everyRequiredEnvironmentFieldBecomesCompleteByObservationOrAttestation() {
+        // 观测路径：框架版本与 SIM 运营商来自 root 进程的系统属性（配置项见
+        // AndroidPlatformFacts）；其余字段仍来自平台。
+        val androidFacts = AndroidPlatformFacts(
+            properties = SystemPropertySource { name ->
+                when (name) {
+                    "ro.lsposed.version" -> "1.9.2"
+                    "gsm.sim.operator.alpha" -> "Observed Carrier"
+                    else -> null
+                }
+            },
+            telephonyCarrier = { null },
+            xposedBridgeVersion = { null },
+        )
+        val observedPlatform = object : PlatformFacts {
+            override fun apiLevel(): Int = 37
+            override fun romFingerprint(): String = "rom-fingerprint"
+            override fun kernelVersion(): String = "6.1.0"
+            override fun frameworkVersion(): String = androidFacts.frameworkVersion()
+            override fun audioPolicyDigest(): String = "digest"
+            override fun simCarrier(): String = androidFacts.simCarrier()
+            override fun transport(): String = "VoLTE"
+            override fun route(): String = "SWB"
+        }
+        val observedProbe = DeviceProbe(
+            packages = packages,
+            platform = observedPlatform,
+            audioApiProbe = object : AudioApiProbe {
+                override fun visibleMethods(): Set<String> = emptySet()
+            },
+            clockMs = { 0L },
+            bridgeVersion = "1.0",
+        )
+        val observed = observedProbe.inspect().environment
+        assertEquals("1.9.2", observed.frameworkVersion)
+        assertEquals("Observed Carrier", observed.simCarrier)
+        assertFalse(
+            "观测路径必须让每个必填字段完整：" + observed,
+            CalibrationBlocker.ENVIRONMENT_INCOMPLETE in CalibrationPolicy.blockers(
+                observed,
+                CalibrationEvidence(environment = observed),
+            ),
+        )
+        val observedResponse = dispatcher(platformOverride = observedPlatform)
+            .handle(cliPeer, request(RolePolicy.METHOD_CALIBRATION_RECORD, recordPayload(expected = observed)))
+        assertNull("unexpected error: " + observedResponse.error, observedResponse.error)
+        val observedJson = JsonParser.parseString(observedResponse.payload).asJsonObject
+        assertTrue(observedJson.get("recorded").asBoolean)
+        assertTrue("观测路径的五项步骤必须写入并授权", observedJson.get("verified").asBoolean)
+        assertEquals(observed, calibration.load()!!.environment)
+        calibration.clear()
+
+        // 背书路径：同样的字段观测不到时，CLI_ROOT 用同一 manualTestCompleted 门禁补齐。
+        val observedUnknown = environment(
+            carrier = PlatformFacts.UNKNOWN,
+            transport = PlatformFacts.UNKNOWN,
+            route = PlatformFacts.UNKNOWN,
+            frameworkVersion = PlatformFacts.UNKNOWN,
+        )
+        val effective = observedUnknown.copy(
+            transport = "CELLULAR",
+            route = "EARPIECE",
+            frameworkVersion = "LSPosed 1.9.2",
+            simCarrier = "Attested Carrier",
+        )
+        val attestedResponse = dispatcher(
+            carrier = PlatformFacts.UNKNOWN,
+            transport = PlatformFacts.UNKNOWN,
+            route = PlatformFacts.UNKNOWN,
+            frameworkVersion = PlatformFacts.UNKNOWN,
+        ).handle(
+            cliPeer,
+            request(
+                RolePolicy.METHOD_CALIBRATION_RECORD,
+                recordPayloadWithAttestation(
+                    attestation = attestationPayload(
+                        frameworkVersion = "LSPosed 1.9.2",
+                        simCarrier = "Attested Carrier",
+                    ),
+                    expected = effective,
+                ),
+            ),
+        )
+        assertNull("unexpected error: " + attestedResponse.error, attestedResponse.error)
+        val attestedJson = JsonParser.parseString(attestedResponse.payload).asJsonObject
+        assertTrue(attestedJson.get("recorded").asBoolean)
+        assertTrue("背书路径的五项步骤必须写入并授权", attestedJson.get("verified").asBoolean)
+        assertEquals(effective, calibration.load()!!.environment)
+        assertFalse(
+            "观测环境本身仍不完整（CalibrationPolicy 不变）",
+            CalibrationPolicy.canAutoAnswer(observedUnknown, calibration.load()!!),
+        )
+    }
+
     // ------------------------------------------------------------------ read
 
     @Test
@@ -547,7 +867,7 @@ class BridgeCalibrationRpcTest {
         )
         assertTrue(view.get("available").asBoolean)
         assertEquals(
-            setOf("operatorAttested", "transport", "route"),
+            setOf("operatorAttested", "transport", "route", "frameworkVersion", "simCarrier"),
             view.getAsJsonObject("operatorAttestation").keySet(),
         )
         assertEquals(37, view.get("supportedApiLevel").asInt)

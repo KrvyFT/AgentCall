@@ -27,6 +27,9 @@
 # - 等待预算与 11E 对齐：CLI shutdown 结果最多 25 s，桥接退出最多 10 s；桥接仍未退出时
 #   再做一次有界 status 探测。麦克风隔离是独立读回事实：仍为 true 时打印
 #   `! microphone_still_isolated ...` 与 `bridge_stop_unclean`，绝不宣称干净停止（I2）。
+# - 退出码 0 不是干净关闭的证据（11H1）：桥接退出后读回 supervisor-state.json（schema 3）
+#   的 shutdownCode/microphoneIsolated；不干净时打印 `! microphone_still_isolated` /
+#   `! shutdown_unresolved` 与 `bridge_stop_unclean`，绝不记录 `bridge_exit_clean`。
 # - 跨脚本停止锁（I4）：停止序列先取 /data/adb/agentcall/stop.lock（flock，最多等 40 s），
 #   与 uninstall.sh 串行化；拿不到锁只记录 stop_lock_timeout 并跳过重复的优雅关闭请求。
 # - 顺序不能颠倒：先杀音频工作进程会让桥接的恢复请求不可达，麦克风会保持全局静音。
@@ -57,7 +60,8 @@ CLI_MAIN_CLASS=org.krvyft.agentcall.bridge.AgentCallCli
 # 再等桥接进程退出。三个上限都独立有界，避免停止路径被不响应的进程拖住。
 GRACEFUL_SHUTDOWN_WAIT_SECONDS=25
 BRIDGE_EXIT_WAIT_SECONDS=10
-# 桥接在退出等待后仍存活时，做一次最终 status 探测读回隔离状态（有界，不阻塞回收）。
+# 桥接在退出等待后仍存活时，做一次最终 status 探测读回隔离状态（有界，不阻塞回收）；
+# 已退出时改为读回持久监督状态（supervisor-state.json，schema 3）。
 STATUS_PROBE_WAIT_SECONDS=5
 # 跨脚本停止锁：uninstall.sh 与 service.sh 的优雅关闭序列必须串行化，否则第二个
 # CLI shutdown 会在第一个的恢复窗口内杀音频工作进程。等待上限覆盖对端完整停止预算。
@@ -81,6 +85,9 @@ case "${AGENTCALL_STOP_LOCK_WAIT_SECONDS:-}" in
 esac
 SHUTDOWN_RESULT_FILE=$DATA_ROOT/shutdown.result
 STATUS_RESULT_FILE=$DATA_ROOT/status.result
+# 监督端持久状态（schema 3，见 SupervisionStateStore）：桥接退出后关闭响应与 status 都
+# 不可达，这个文件是桥接自己写下的最终关闭裁决（shutdownCode / microphoneIsolated）。
+SUPERVISION_STATE_FILE=$DATA_ROOT/supervisor-state.json
 # 本脚本自己的 PID（agentcallctl restart 据此确认“重启请求有接收者”）；请求标记里保存
 # 同一个 PID，跨实例/跨开机的过期标记不会被新实例消费。
 SERVICE_PID_FILE=$DATA_ROOT/service.pid
@@ -149,6 +156,9 @@ audio_manager_pid=
 stopping=0
 # 0 = 未持有；1 = flock 文件描述符；2 = mkdir 回退目录。
 stop_lock_held=0
+# 上一次已记录的持久裁决：同一次退出里 bridge_container_supervisor 与 shutdown_children
+# 会各读一次，值相同时不重复写日志。
+PERSISTED_VERDICT_LOGGED=
 
 # 进程存在且不是僵尸（已退出但未被回收的进程不能再被“停止”）。
 pid_alive() {
@@ -298,6 +308,71 @@ json_text() {
     printf '%s' "$1" | sed 's/^"//; s/"$//'
 }
 
+# 读回桥接持久关闭裁决（Task 11H1）：schema 3 的 supervisor-state.json 是桥接进程自己
+# 原子写下的最终结论。只读固定标量（不是通用 JSON 解析器）。成功时设置
+# PERSISTED_SCHEMA / PERSISTED_CODE（空 = null）/ PERSISTED_ISOLATED（true|false）；
+# 文件缺失、损坏、非 schema 3+ 或字段非法都返回失败，绝不猜测干净。
+read_persisted_shutdown_verdict() {
+    PERSISTED_SCHEMA=
+    PERSISTED_CODE=
+    PERSISTED_ISOLATED=
+    [ -f "$SUPERVISION_STATE_FILE" ] || return 1
+    persisted=$(head -c 65536 "$SUPERVISION_STATE_FILE" 2>/dev/null) || return 1
+    [ -n "$persisted" ] || return 1
+    schema=$(json_scalar "$persisted" schema)
+    case "$schema" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    # schema 3 才保证 shutdownCode 字段存在；更旧的 schema 不能据此断言干净。
+    [ "$schema" -ge 3 ] || return 1
+    isolated=$(json_scalar "$persisted" microphoneIsolated)
+    case "$isolated" in
+        true|false) ;;
+        *) return 1 ;;
+    esac
+    code=$(json_text "$(json_scalar "$persisted" shutdownCode)")
+    case "$code" in
+        ''|null) PERSISTED_CODE= ;;
+        *) PERSISTED_CODE=$code ;;
+    esac
+    PERSISTED_SCHEMA=$schema
+    PERSISTED_ISOLATED=$isolated
+    verdict="schema=$schema shutdownCode=${PERSISTED_CODE:-null} microphoneIsolated=$PERSISTED_ISOLATED"
+    if [ "$PERSISTED_VERDICT_LOGGED" != "$verdict" ]; then
+        PERSISTED_VERDICT_LOGGED=$verdict
+        log_line "bridge_persisted_verdict $verdict"
+    fi
+    return 0
+}
+
+# 退出码 0 只说明进程正常结束，不证明关闭裁决干净（Task 11H1）：持久状态里
+# shutdownCode 非 null 或隔离仍为 true 时返回失败，调用方绝不能记录 bridge_exit_clean。
+bridge_exit_clean_verdict() {
+    read_persisted_shutdown_verdict || return 0
+    if [ -n "$PERSISTED_CODE" ] || [ "$PERSISTED_ISOLATED" = "true" ]; then
+        return 1
+    fi
+    return 0
+}
+
+# 关闭响应/status 都不可用时用持久裁决给出显式告警：桥接已退出时这是唯一可读的
+# 关闭结论。返回 0 = 已读且干净，1 = 已读且不干净，2 = 没有可读裁决。
+report_persisted_shutdown_verdict() {
+    read_persisted_shutdown_verdict || return 2
+    if [ "$PERSISTED_ISOLATED" = "true" ]; then
+        log_line "! microphone_still_isolated source=persisted shutdownCode=${PERSISTED_CODE:-null}"
+        log_line "bridge_stop_unclean reason=microphone_isolated source=persisted"
+        return 1
+    fi
+    if [ -n "$PERSISTED_CODE" ]; then
+        log_line "! shutdown_unresolved source=persisted shutdownCode=$PERSISTED_CODE"
+        log_line "bridge_stop_unclean reason=shutdown_unresolved source=persisted"
+        return 1
+    fi
+    log_line "bridge_stop_clean clean=true shutdownCode=null microphoneIsolated=false source=persisted"
+    return 0
+}
+
 # 跨脚本停止锁（I4）：uninstall.sh 与 service.sh 都可能发起优雅关闭，两个独立 CLI
 # shutdown 会在对方的恢复窗口内互相踩踏。锁文件是 root 私有固定路径；等待有界，
 # 超时只记录机器可读原因（绝不无限阻塞停止路径）。优先 flock；没有 flock 时退回
@@ -401,10 +476,13 @@ probe_bridge_status() {
 request_bridge_graceful_shutdown() {
     if [ -z "$bridge_pid" ] || ! pid_alive "$bridge_pid"; then
         log_line "bridge_shutdown_skipped reason=not_running"
+        # 桥接已被外部关闭/自己退出：没有响应可读时，持久裁决是唯一剩下的证据。
+        report_persisted_shutdown_verdict || true
         return 0
     fi
     if ! is_bridge_pid "$bridge_pid"; then
         log_line "bridge_shutdown_skipped reason=identity_mismatch pid=$bridge_pid"
+        report_persisted_shutdown_verdict || true
         return 1
     fi
     shutdown_clean=
@@ -452,15 +530,15 @@ request_bridge_graceful_shutdown() {
         waited=$((waited + 1))
     done
     if pid_alive "$bridge_pid"; then
-        log_line "bridge_shutdown_unconfirmed pid=$bridge_pid waited=${waited}s"
+        log_line "bridge_shutdown_unconfirmed pid=$bridge_pid waited=${waited}s limit=${BRIDGE_EXIT_WAIT_SECONDS}s"
         probe_bridge_status || true
     else
         bridge_gone=1
-        log_line "bridge_shutdown_confirmed pid=$bridge_pid waited=${waited}s"
+        log_line "bridge_shutdown_confirmed pid=$bridge_pid waited=${waited}s limit=${BRIDGE_EXIT_WAIT_SECONDS}s"
     fi
     # I2：麦克风隔离是独立事实，不能只看 clean/shutdownCode。桥接仍存活时以最终
-    # status 读回为准；已退出时以关闭响应为准。仍为 true 时显式打印机器可读警告，
-    # 绝不把“进程已退出”或 clean=true 当成干净停止。
+    # status 读回为准；已退出时以关闭响应为准。Task 11H1：持久状态（schema 3）是
+    # 桥接自己写下的最终裁决，响应/status 缺失时用它补证，冲突时取更严重的一项。
     isolated=$shutdown_isolated
     isolated_source=shutdown
     if [ "$bridge_gone" -eq 0 ]; then
@@ -471,15 +549,39 @@ request_bridge_graceful_shutdown() {
                 ;;
         esac
     fi
+    persisted_verdict=2
+    read_persisted_shutdown_verdict && persisted_verdict=0
+    persisted_unclean=0
+    if [ "$persisted_verdict" -eq 0 ]; then
+        if [ "$PERSISTED_ISOLATED" = "true" ]; then
+            if [ "$isolated" != "true" ]; then
+                isolated=$PERSISTED_ISOLATED
+                isolated_source=persisted
+            fi
+        elif [ -n "$PERSISTED_CODE" ]; then
+            persisted_unclean=1
+        elif [ "$bridge_gone" -eq 1 ] && [ "$isolated" != "true" ]; then
+            # 持久裁决干净且桥接已退出：补足缺失/不可信的关闭响应证据。
+            isolated=false
+            isolated_source=persisted
+        fi
+    fi
     if [ "$isolated" = "true" ]; then
-        log_line "! microphone_still_isolated source=$isolated_source clean=${shutdown_clean:-unknown} shutdownCode=${shutdown_code:-unknown}"
+        log_line "! microphone_still_isolated source=$isolated_source clean=${shutdown_clean:-unknown} shutdownCode=${shutdown_code:-unknown} persistedCode=${PERSISTED_CODE:-unknown}"
         log_line "bridge_stop_unclean reason=microphone_isolated source=$isolated_source bridgeGone=$bridge_gone"
+        return 1
+    fi
+    if [ "$persisted_unclean" -eq 1 ]; then
+        log_line "! shutdown_unresolved source=persisted shutdownCode=$PERSISTED_CODE"
+        log_line "bridge_stop_unclean reason=shutdown_unresolved source=persisted bridgeGone=$bridge_gone"
         return 1
     fi
     if [ "$isolated" != "false" ]; then
         log_line "bridge_stop_unclean reason=microphone_isolation_unconfirmed source=$isolated_source bridgeGone=$bridge_gone"
     elif [ "$shutdown_clean" = "true" ] && [ "$shutdown_code" = "null" ] && [ "$bridge_gone" -eq 1 ]; then
         log_line "bridge_stop_clean clean=true shutdownCode=null microphoneIsolated=false"
+    elif [ "$persisted_verdict" -eq 0 ] && [ "$bridge_gone" -eq 1 ]; then
+        log_line "bridge_stop_clean clean=true shutdownCode=null microphoneIsolated=false source=persisted"
     fi
     if [ "$cli_timed_out" -eq 1 ]; then
         return 1
@@ -496,6 +598,8 @@ shutdown_children() {
         request_bridge_graceful_shutdown
     else
         log_line "bridge_shutdown_skipped reason=stop_lock_timeout"
+        # 拿不到锁时仍读回持久裁决：桥接可能已经退出，警告不能因此丢失。
+        report_persisted_shutdown_verdict || true
     fi
     stop_audio_worker_supervisor
     stop_audio_worker
@@ -722,6 +826,17 @@ bridge_container_supervisor() {
             return 0
         fi
         if [ "$exit_code" -eq 0 ]; then
+            # 11H1：退出码 0 不是干净关闭的证据。桥接退出后先读回它写下的持久裁决；
+            # shutdownCode 非 null 或隔离仍为 true 时打印告警、不记录 bridge_exit_clean，
+            # 也绝不按“干净退出”重启。
+            if ! bridge_exit_clean_verdict; then
+                if restart_requested; then
+                    clear_restart_request
+                    log_line "bridge_restart_skipped reason=shutdown_unclean"
+                fi
+                log_line "bridge_exit_unclean code=0 shutdownCode=${PERSISTED_CODE:-null} microphoneIsolated=${PERSISTED_ISOLATED:-unknown}"
+                return 1
+            fi
             if restart_requested; then
                 if module_marked_stopped; then
                     clear_restart_request

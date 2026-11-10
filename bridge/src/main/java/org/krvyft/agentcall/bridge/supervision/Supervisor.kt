@@ -993,8 +993,10 @@ class Supervisor(
      * 优雅关闭（挂起）：先终止/交还拥有的通话，只有确认断开（或租约已撤销、AI 不再拥有）
      * 才恢复麦克风，然后收束内存状态。
      *
-     * 期限 [deadlineMs]（默认 [SHUTDOWN_TERMINATION_DEADLINE_MS]）覆盖“终止命令 + 等待
-     * 断开事实”。期限内无法确认时保持隔离、以 [SHUTDOWN_CALL_UNRESOLVED] 失败关闭；
+     * 期限 [deadlineMs]（默认 [SHUTDOWN_TERMINATION_DEADLINE_MS]）**只覆盖终止命令下发
+     * 之后等待断开事实的时间**：终止命令（[terminateOwnedLocked]）在期限之外先执行，
+     * 其自身的角色通道等待另有预算，所以本期限不是“终止 + 确认”的总时长。
+     * 期限内无法确认时保持隔离、以 [SHUTDOWN_CALL_UNRESOLVED] 失败关闭；
      * 恢复失败时进入 BLOCKED 并上报 [SHUTDOWN_RESTORE_FAILED]。
      *
      * Task 11E 补充：
@@ -1300,7 +1302,11 @@ class Supervisor(
         const val BLOCKER_TERMINATION_UNCONFIRMED: String = "termination_unconfirmed"
         const val BLOCKER_STATE_WRITE_FAILED: String = "supervision_state_write_failed"
 
-        /** 优雅关闭的终止 + 断开确认总期限（spec §8；模块停用不能无限等待）。 */
+        /**
+         * 优雅关闭中**等待断开确认**的期限（spec §8；模块停用不能无限等待）。
+         * 终止命令的下发在该期限之前执行、不在其内（下发自身的等待另有预算），
+         * 因此不能把本常量描述成“终止 + 确认”的总期限。
+         */
         const val SHUTDOWN_TERMINATION_DEADLINE_MS: Long = 5_000L
 
         /**

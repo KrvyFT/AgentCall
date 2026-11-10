@@ -773,3 +773,136 @@ test("agentcallctl calibrate：拒绝任何 argv 负载且不启动 CLI", () => 
     rmSync(harness.root, { recursive: true, force: true });
   }
 });
+// ---------------------------------------------------------------------------------------------
+// 任务 11H1：桥接退出码 0 不是干净关闭的证据。service.sh 必须在桥接退出后读回持久监督状态
+// （schema 3 的 supervisor-state.json，含 shutdownCode/microphoneIsolated），不干净时打印
+// 显式警告且绝不记录 bridge_exit_clean。
+// ---------------------------------------------------------------------------------------------
+
+const SUPERVISION_STATE = {
+  schema: 3,
+  phase: "ENDED",
+  ownedSession: null,
+  microphoneIsolated: false,
+  blockedReason: null,
+  lastFault: null,
+  updatedAtMs: 1,
+  bootId: null,
+  ownedCallMayBeLive: false,
+  shutdownCode: null,
+};
+
+function writePersistedState(harness, overrides = {}) {
+  writeFileSync(
+    join(harness.dataRoot, "supervisor-state.json"),
+    JSON.stringify({ ...SUPERVISION_STATE, ...overrides }) + NL,
+  );
+}
+
+test(
+  "service.sh：桥接退出码 0 但持久裁决不干净时打印显式警告且不记录 bridge_exit_clean",
+  { timeout: 60000 },
+  async () => {
+    const harness = serviceHarness();
+    const trigger = join(harness.root, "shutdown-trigger");
+    let child = null;
+    try {
+      child = spawn("sh", [harness.script], {
+        env: serviceEnv(harness, {
+          AGENTCALL_FAKE_BRIDGE_STAY: "1",
+          AGENTCALL_FAKE_SHUTDOWN_TRIGGER: trigger,
+          AGENTCALL_GRACEFUL_SHUTDOWN_WAIT_SECONDS: "2",
+          AGENTCALL_BRIDGE_EXIT_WAIT_SECONDS: "2",
+          AGENTCALL_STOP_GRACE_SECONDS: "1",
+        }),
+        stdio: "ignore",
+      });
+      await waitFor(
+        () => existsSync(harness.audioPidFile) && existsSync(harness.bridgePidFile),
+        20000,
+        "bridge/audio pid files",
+      );
+      writePersistedState(harness, {
+        microphoneIsolated: true,
+        lastFault: "shutdown_call_unresolved",
+        ownedCallMayBeLive: true,
+        shutdownCode: "shutdown_call_unresolved",
+      });
+      writeFileSync(trigger, "");
+
+      const { code } = await waitForExit(child, 30000);
+      assert.notEqual(code, 0, "不干净的关闭不得以 0 退出：" + code);
+
+      const log = readFileSync(harness.logFile, "utf8");
+      assert.match(
+        log,
+        /bridge_persisted_verdict schema=3 shutdownCode=shutdown_call_unresolved microphoneIsolated=true/,
+        "桥接退出后必须读回持久关闭裁决：" + log,
+      );
+      assert.match(
+        log,
+        /! microphone_still_isolated source=persisted shutdownCode=shutdown_call_unresolved/,
+        "持久隔离仍为 true 时必须打印机器可读警告：" + log,
+      );
+      assert.match(
+        log,
+        /bridge_stop_unclean reason=microphone_isolated source=persisted/,
+        "不得把持久隔离的停止当成干净停止：" + log,
+      );
+      assert.match(
+        log,
+        /bridge_exit_unclean code=0 shutdownCode=shutdown_call_unresolved microphoneIsolated=true/,
+        "退出码 0 但裁决不干净时必须记录 bridge_exit_unclean：" + log,
+      );
+      assert.equal(/bridge_exit_clean/.test(log), false, "持久裁决不干净时绝不能记录 bridge_exit_clean：" + log);
+    } finally {
+      killQuietly(child);
+      rmSync(harness.root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "service.sh：桥接退出码 0 且持久裁决干净时仍记录 bridge_exit_clean",
+  { timeout: 60000 },
+  async () => {
+    const harness = serviceHarness();
+    const trigger = join(harness.root, "shutdown-trigger");
+    let child = null;
+    try {
+      child = spawn("sh", [harness.script], {
+        env: serviceEnv(harness, {
+          AGENTCALL_FAKE_BRIDGE_STAY: "1",
+          AGENTCALL_FAKE_SHUTDOWN_TRIGGER: trigger,
+          AGENTCALL_GRACEFUL_SHUTDOWN_WAIT_SECONDS: "2",
+          AGENTCALL_BRIDGE_EXIT_WAIT_SECONDS: "2",
+          AGENTCALL_STOP_GRACE_SECONDS: "1",
+        }),
+        stdio: "ignore",
+      });
+      await waitFor(
+        () => existsSync(harness.audioPidFile) && existsSync(harness.bridgePidFile),
+        20000,
+        "bridge/audio pid files",
+      );
+      writePersistedState(harness);
+      writeFileSync(trigger, "");
+
+      const { code } = await waitForExit(child, 30000);
+      assert.equal(code, 0, "持久裁决干净时必须保留 0 退出码");
+
+      const log = readFileSync(harness.logFile, "utf8");
+      assert.match(
+        log,
+        /bridge_persisted_verdict schema=3 shutdownCode=null microphoneIsolated=false/,
+        "持久裁决干净时也必须留下读回证据：" + log,
+      );
+      assert.match(log, /bridge_exit_clean/, "持久裁决干净时才能记录 bridge_exit_clean：" + log);
+      assert.equal(/bridge_exit_unclean/.test(log), false, "干净裁决不得记录 bridge_exit_unclean");
+      assert.equal(/bridge_stop_unclean/.test(log), false, "干净裁决不得记录 bridge_stop_unclean：" + log);
+    } finally {
+      killQuietly(child);
+      rmSync(harness.root, { recursive: true, force: true });
+    }
+  },
+);

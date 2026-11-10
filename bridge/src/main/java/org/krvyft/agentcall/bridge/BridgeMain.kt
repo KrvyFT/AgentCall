@@ -826,9 +826,9 @@ internal class ControlDispatcher(
      *
      * 请求只能提供五项布尔、可选的“预期环境”（仅用于一致性核验）与可选的
      * operatorAttestation。证据环境与时间戳一律由桥接进程生成：环境来自服务端采集
-     * （root 背书只填补桥接观测不到的 transport/route），时间戳由 [CalibrationStore]
-     * 的时钟写入。未知/不一致环境、缺失步骤、非法背书一律拒绝；APP/HOOK 在
-     * [RolePolicy] 层就已被拒绝，本方法再按角色二次拒绝。
+     * （root 背书只填补桥接观测不到的 transport/route/frameworkVersion/simCarrier），
+     * 时间戳由 [CalibrationStore] 的时钟写入。未知/不一致环境、缺失步骤、非法背书一律
+     * 拒绝；APP/HOOK 在 [RolePolicy] 层就已被拒绝，本方法再按角色二次拒绝。
      */
     private fun calibrationRecord(request: RpcRequest, peer: PeerIdentity): RpcResponse {
         // 方法表已把该方法限定给 CLI_ROOT；这里是服务端第二道判定（APP/HOOK 绝不背书）。
@@ -890,7 +890,8 @@ internal class ControlDispatcher(
      * - effectiveEnvironment：应用 root 背书后的判定环境；
      * - environmentComplete / verified / blockers / environmentMatchesEvidence；
      * - evidenceEnvironment：证据里持久化的环境（可能含背书值）；
-     * - operatorAttestation：{operatorAttested, transport, route}，明确标记背书字段；
+     * - operatorAttestation：{operatorAttested, transport, route, frameworkVersion, simCarrier}，
+     *   明确标记每个被 root 操作员背书的字段（观测到的事实绝不标成背书）；
      * - steps / calibratedAtMs。
      */
     private fun calibrationView(observed: EnvironmentKey, evidence: CalibrationEvidence?): JsonObject {
@@ -939,6 +940,12 @@ internal class ControlDispatcher(
         addProperty("operatorAttested", attested.operatorAttested)
         if (attested.transport == null) add("transport", JsonNull.INSTANCE) else addProperty("transport", attested.transport)
         if (attested.route == null) add("route", JsonNull.INSTANCE) else addProperty("route", attested.route)
+        if (attested.frameworkVersion == null) {
+            add("frameworkVersion", JsonNull.INSTANCE)
+        } else {
+            addProperty("frameworkVersion", attested.frameworkVersion)
+        }
+        if (attested.simCarrier == null) add("simCarrier", JsonNull.INSTANCE) else addProperty("simCarrier", attested.simCarrier)
     }
 
     /**
@@ -1068,8 +1075,9 @@ internal class ControlDispatcher(
 
     /**
      * 解析 calibration.record 负载：只允许 steps（五项、全部布尔）、可选的
-     * expectedEnvironment（十个环境字段）与可选的 operatorAttestation（固定三键）。
-     * 多键/缺键/错误类型/词表外取值都整体拒绝。
+     * expectedEnvironment（十个环境字段）与可选的 operatorAttestation
+     * （transport/route + manualTestCompleted 必填，frameworkVersion/simCarrier 可选）。
+     * 多键/缺键/错误类型/词表外取值/非法自由文本都整体拒绝。
      */
     private fun decodeCalibrationRecord(payload: String): CalibrationRecordPayload? {
         if (payload.isEmpty() || payload.length > MAX_CALIBRATION_PAYLOAD_CHARS) return null
@@ -1112,20 +1120,44 @@ internal class ControlDispatcher(
     }
 
     /**
-     * 操作员背书只允许固定三键：transport/route 是固定词表字符串，
-     * manualTestCompleted 必须是 JSON true。其余一切形状都 payload_invalid。
+     * 操作员背书（Task 11E / 11H1）：transport/route 必填且必须是固定词表；
+     * manualTestCompleted 必须是 JSON true；frameworkVersion/simCarrier 可选，出现时
+     * 必须是 [isAttestableFreeFormFact] 认可的有界字符串（空/超长/控制字符/UNKNOWN 都拒绝）。
+     * 其余一切形状都 payload_invalid。
      */
     private fun decodeOperatorAttestation(element: JsonElement): OperatorAttestation? {
         if (!element.isJsonObject) return null
         val json = element.asJsonObject
-        if (json.keySet() != CALIBRATION_ATTESTATION_KEYS) return null
+        if (!CALIBRATION_ATTESTATION_KEYS.containsAll(json.keySet())) return null
+        if (!json.keySet().containsAll(CALIBRATION_ATTESTATION_REQUIRED_KEYS)) return null
         val transport = calibrationAttestationString(json, "transport") ?: return null
         val route = calibrationAttestationString(json, "route") ?: return null
         if (transport !in ATTESTABLE_TRANSPORTS || route !in ATTESTABLE_ROUTES) return null
         val manual = json.get(CALIBRATION_ATTESTATION_MANUAL_TEST)
         if (manual == null || !manual.isJsonPrimitive || !manual.asJsonPrimitive.isBoolean) return null
         if (!manual.asBoolean) return null
-        return OperatorAttestation(transport = transport, route = route)
+        val frameworkVersion = optionalAttestationFact(json, CALIBRATION_ATTESTATION_FRAMEWORK) ?: return null
+        val simCarrier = optionalAttestationFact(json, CALIBRATION_ATTESTATION_SIM_CARRIER) ?: return null
+        return OperatorAttestation(
+            transport = transport,
+            route = route,
+            frameworkVersion = frameworkVersion.value,
+            simCarrier = simCarrier.value,
+        )
+    }
+
+    /**
+     * 可选背书字段的三态解码：字段缺失 = 未背书（value=null）；字段存在且合法 =
+     * value；字段存在但类型/格式不合法 = null（调用方整体拒绝）。
+     */
+    private data class OptionalAttestationFact(val value: String?)
+
+    private fun optionalAttestationFact(json: JsonObject, name: String): OptionalAttestationFact? {
+        val element = json.get(name) ?: return OptionalAttestationFact(value = null)
+        if (!element.isJsonPrimitive || !element.asJsonPrimitive.isString) return null
+        val value = element.asString
+        if (!isAttestableFreeFormFact(value)) return null
+        return OptionalAttestationFact(value = value)
     }
 
     private fun calibrationAttestationString(json: JsonObject, name: String): String? {
@@ -1504,7 +1536,21 @@ internal class ControlDispatcher(
 
         const val CALIBRATION_ATTESTATION_MANUAL_TEST: String = "manualTestCompleted"
 
-        val CALIBRATION_ATTESTATION_KEYS: Set<String> = setOf("transport", "route", CALIBRATION_ATTESTATION_MANUAL_TEST)
+        /** 背书可选的自由文本字段（有界格式校验；观测值已知时永远不生效）。 */
+        const val CALIBRATION_ATTESTATION_FRAMEWORK: String = "frameworkVersion"
+        const val CALIBRATION_ATTESTATION_SIM_CARRIER: String = "simCarrier"
+
+        /** 新背书词表允许的键；transport/route/manualTestCompleted 仍为必填。 */
+        val CALIBRATION_ATTESTATION_REQUIRED_KEYS: Set<String> =
+            setOf("transport", "route", CALIBRATION_ATTESTATION_MANUAL_TEST)
+
+        val CALIBRATION_ATTESTATION_KEYS: Set<String> = CALIBRATION_ATTESTATION_REQUIRED_KEYS + setOf(
+            CALIBRATION_ATTESTATION_FRAMEWORK,
+            CALIBRATION_ATTESTATION_SIM_CARRIER,
+        )
+
+        /** 自由文本背书值的长度上限（与诊断层的观测上限对齐）。 */
+        const val MAX_ATTESTED_FACT_CHARS: Int = 128
 
         /** 线格式步骤名 → 存储步骤；顺序固定，写入后得到完整证据。 */
         val CALIBRATION_STEP_KEYS: Map<String, CalibrationStep> = linkedMapOf(
@@ -1558,17 +1604,35 @@ internal fun machineErrorJson(code: String, message: String): String {
 
 // ---------------------------------------------------------------- 校准环境/背书（Task 11E / C1）
 
-/** root 操作员为桥接观测不到的两项事实背书；词表见 [ATTESTABLE_TRANSPORTS]/[ATTESTABLE_ROUTES]。 */
-internal data class OperatorAttestation(val transport: String, val route: String)
+/**
+ * root 操作员为桥接观测不到的事实背书（Task 11E / 11H1）：
+ * - transport/route 用固定词表（[ATTESTABLE_TRANSPORTS]/[ATTESTABLE_ROUTES]）；
+ * - frameworkVersion/simCarrier 用有界校验的自由文本（[isAttestableFreeFormFact]）；
+ * - 任何字段都只在观测值为 UNKNOWN 时生效，观测到的已知值永远优先。
+ */
+internal data class OperatorAttestation(
+    val transport: String,
+    val route: String,
+    val frameworkVersion: String? = null,
+    val simCarrier: String? = null,
+)
 
 /** 校准视图里被标记为 operator_attested 的事实。 */
 internal data class AttestedFacts(
     val operatorAttested: Boolean,
     val transport: String?,
     val route: String?,
+    val frameworkVersion: String? = null,
+    val simCarrier: String? = null,
 ) {
     companion object {
-        val NONE: AttestedFacts = AttestedFacts(operatorAttested = false, transport = null, route = null)
+        val NONE: AttestedFacts = AttestedFacts(
+            operatorAttested = false,
+            transport = null,
+            route = null,
+            frameworkVersion = null,
+            simCarrier = null,
+        )
     }
 }
 
@@ -1579,32 +1643,44 @@ internal val ATTESTABLE_TRANSPORTS: Set<String> = setOf("CELLULAR", "VOWIFI", Pl
 internal val ATTESTABLE_ROUTES: Set<String> =
     setOf("EARPIECE", "SPEAKER", "HEADSET", "BLUETOOTH", PlatformFacts.UNKNOWN)
 
-/** 背书只填补桥接观测不到的字段：观测值是已知事实时永远以观测值为准，背书不能覆盖。 */
+/**
+ * 背书只填补桥接观测不到的字段：观测值是已知事实时永远以观测值为准，背书不能覆盖。
+ * frameworkVersion/simCarrier 与 transport/route 适用同一规则（Task 11H1）。
+ */
 internal fun applyAttestation(observed: EnvironmentKey, attestation: OperatorAttestation?): EnvironmentKey {
     if (attestation == null) return observed
     return observed.copy(
-        transport = if (observed.transport == PlatformFacts.UNKNOWN) attestation.transport else observed.transport,
-        route = if (observed.route == PlatformFacts.UNKNOWN) attestation.route else observed.route,
+        transport = observed.transport.attestedWhenUnknown(attestation.transport),
+        route = observed.route.attestedWhenUnknown(attestation.route),
+        frameworkVersion = observed.frameworkVersion.attestedWhenUnknown(attestation.frameworkVersion),
+        simCarrier = observed.simCarrier.attestedWhenUnknown(attestation.simCarrier),
     )
 }
 
+private fun String.attestedWhenUnknown(attested: String?): String =
+    if (this == PlatformFacts.UNKNOWN && attested != null) attested else this
+
 /**
- * 证据环境是否属于当前观测设备：除 transport/route 外的字段必须完全一致；
- * 观测不到的两项允许证据使用背书值，桥接能观测到的字段则必须相等。
+ * 证据环境是否属于当前观测设备：除四个可背书字段（transport/route/frameworkVersion/
+ * simCarrier）外的字段必须完全一致；观测不到的可背书字段允许证据使用背书值，
+ * 桥接能观测到的字段则必须相等（Task 11H1：框架版本/SIM 运营商与承载/路由同一规则）。
  */
 internal fun environmentMatchesObserved(observed: EnvironmentKey, evidence: EnvironmentKey): Boolean {
     if (observed.apiLevel != evidence.apiLevel) return false
     if (observed.romFingerprint != evidence.romFingerprint) return false
     if (observed.kernelVersion != evidence.kernelVersion) return false
     if (observed.dialerPackageVersion != evidence.dialerPackageVersion) return false
-    if (observed.frameworkVersion != evidence.frameworkVersion) return false
     if (observed.bridgeVersion != evidence.bridgeVersion) return false
     if (observed.audioPolicyDigest != evidence.audioPolicyDigest) return false
-    if (observed.simCarrier != evidence.simCarrier) return false
-    val transportMatches = observed.transport == PlatformFacts.UNKNOWN || observed.transport == evidence.transport
-    val routeMatches = observed.route == PlatformFacts.UNKNOWN || observed.route == evidence.route
-    return transportMatches && routeMatches
+    if (!observed.frameworkVersion.matchesWhenObserved(evidence.frameworkVersion)) return false
+    if (!observed.simCarrier.matchesWhenObserved(evidence.simCarrier)) return false
+    if (!observed.transport.matchesWhenObserved(evidence.transport)) return false
+    if (!observed.route.matchesWhenObserved(evidence.route)) return false
+    return true
 }
+
+private fun String.matchesWhenObserved(evidence: String): Boolean =
+    this == PlatformFacts.UNKNOWN || this == evidence
 
 /** 判定环境：证据与观测设备匹配时采用证据环境（含背书），否则只用观测事实。 */
 internal fun effectiveEnvironment(
@@ -1617,7 +1693,11 @@ internal fun effectiveEnvironment(
         observed
     }
 
-/** 视图里的背书标记：只有“观测不到 + 证据值是词表内已知值”才算 operator_attested。 */
+/**
+ * 视图里的背书标记：只有“观测不到 + 证据值是合法已知值”才算 operator_attested。
+ * Task 11H1 起 frameworkVersion/simCarrier 与 transport/route 同样标记，绝不把
+ * 操作员背书呈现成桥接实测。
+ */
 internal fun attestedFacts(observed: EnvironmentKey, evidenceEnvironment: EnvironmentKey?): AttestedFacts {
     if (evidenceEnvironment == null || !environmentMatchesObserved(observed, evidenceEnvironment)) {
         return AttestedFacts.NONE
@@ -1632,7 +1712,32 @@ internal fun attestedFacts(observed: EnvironmentKey, evidenceEnvironment: Enviro
             value in ATTESTABLE_ROUTES &&
             value != PlatformFacts.UNKNOWN
     }
-    return AttestedFacts(operatorAttested = transport != null || route != null, transport = transport, route = route)
+    val frameworkVersion = evidenceEnvironment.frameworkVersion.takeIf { value ->
+        observed.frameworkVersion == PlatformFacts.UNKNOWN && isAttestableFreeFormFact(value)
+    }
+    val simCarrier = evidenceEnvironment.simCarrier.takeIf { value ->
+        observed.simCarrier == PlatformFacts.UNKNOWN && isAttestableFreeFormFact(value)
+    }
+    return AttestedFacts(
+        operatorAttested = transport != null || route != null || frameworkVersion != null || simCarrier != null,
+        transport = transport,
+        route = route,
+        frameworkVersion = frameworkVersion,
+        simCarrier = simCarrier,
+    )
+}
+
+/**
+ * 自由文本背书值的有界校验（Task 11H1）：非空、≤ [ControlDispatcher.MAX_ATTESTED_FACT_CHARS]、
+ * 前后无空白、无控制字符、且不是显式 UNKNOWN。用于 frameworkVersion/simCarrier，
+ * 也用于把持久证据里已有的值标记成 operator_attested 前的复核。
+ */
+internal fun isAttestableFreeFormFact(value: String): Boolean {
+    if (value.isEmpty() || value.length > ControlDispatcher.MAX_ATTESTED_FACT_CHARS) return false
+    if (value != value.trim()) return false
+    if (value == PlatformFacts.UNKNOWN) return false
+    if (value.any { it.isISOControl() }) return false
+    return true
 }
 
 /**
