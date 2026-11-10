@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 传统 Xposed 模块作用域：只注入 Google 电话，绝不包含 system_server。 -->
+    <string-array name="xposed_scope">
+        <item>com.google.android.dialer</item>
+    </string-array>
+</resources>

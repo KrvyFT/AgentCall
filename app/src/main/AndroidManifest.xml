@@ -10,6 +10,18 @@
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
-        android:theme="@style/Theme.AgentCall" />
+        android:theme="@style/Theme.AgentCall">
+
+        <!-- 传统 Xposed 模块声明：由用户安装的 LSPosed/Vector 读取，框架本体不随 APK 打包。 -->
+        <meta-data
+            android:name="xposedmodule"
+            android:value="true" />
+        <meta-data
+            android:name="xposeddescription"
+            android:value="AgentCall hooks Google Phone for AI call handling" />
+        <meta-data
+            android:name="xposedminversion"
+            android:value="82" />
+    </application>
 
 </manifest>

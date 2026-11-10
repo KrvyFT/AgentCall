@@ -4,6 +4,14 @@
 # For more details, see
 #   https://d.android.com/r/tools/r8/keep-rules
 
+# Xposed 框架按 assets/xposed_init 中的类名反射实例化入口：必须保留类、
+# 无参构造，以及接口方法名（compileOnly 的 IXposedHookLoadPackage 不在
+# R8 的 library classpath 中，改名会让接口分派失效）。
+-keep class org.krvyft.agentcall.hook.HookEntry { *; }
+
+# 入口包内由发现/注册逻辑按名引用的类型保留名字，便于诊断与后续 Hook 接线。
+-keepnames class org.krvyft.agentcall.hook.** { *; }
+
 # If your project uses WebView with JS, uncomment the following
 # and specify the fully qualified class name to the JavaScript interface
 # class:
