@@ -66,6 +66,14 @@ data class AgentCallStatus(
     /** 最近一次影响安全的错误机器码（触发/音频/撤销失败等）。 */
     val lastError: String? = null,
     /**
+     * 事件流/轮询器的诊断机器码（Task 7B3 FIX ROUND 1），例如
+     * `session_event_incomplete`/`bridge_unavailable`/`session_events_deliver_failed`。
+     *
+     * 与 [lastError] **分开**：轮询失败不是“这通电话的交还失败”，恢复后（[SessionEventPoller]
+     * 的下一次干净轮询）立即清空；[HandbackJournal.outcomeFor] 永不读它。
+     */
+    val lastDiagnostic: String? = null,
+    /**
      * [lastError] 归属的会话；null 表示服务级/未知会话（例如 bootstrap/轮询失败）。
      *
      * 错误与交还结果一样必须绑定会话：上一通的 handback_revoke_failed/audio_failed 绝不能
@@ -308,10 +316,25 @@ class AgentCallService : Service() {
             publish = sessionCoordinator::onEvent,
             scope = scope,
             dispatcher = Dispatchers.Default,
+            // 桥接重启信标：uptime 回退 = 新进程，轮询器先清空基线再读（7B3 CRITICAL）。
+            epochSource = client,
+            // 服务重启后从上次已投递的 seq 继续，绝不重放旧 handback/断开事实。
+            cursorStore = SharedPreferencesSessionEventCursorStore(this),
             onError = { code ->
-                // 只把固定机器码写进服务状态；轮询失败绝不静默、绝不伪造事件。
-                // 这是服务级错误（没有会话归属），不会被当成某通电话的接管失败。
-                AgentCallRuntime.update { it.copy(lastError = code, lastErrorSession = null) }
+                // 只把固定机器码写进**诊断**；轮询失败绝不静默、绝不伪造事件，也绝不
+                // 变成某通电话的交还失败（IMPORTANT 3）。
+                AgentCallRuntime.update { it.copy(lastDiagnostic = code) }
+            },
+            onDiagnostic = { code ->
+                AgentCallRuntime.update { it.copy(lastDiagnostic = code) }
+            },
+            onRecovered = {
+                // 恢复（一次没有诊断的成功轮询）后清除诊断残留。
+                AgentCallRuntime.update { if (it.lastDiagnostic == null) it else it.copy(lastDiagnostic = null) }
+            },
+            onSupervisorHandback = { id, outcome ->
+                // 监督端交还事实绑定会话：由协调器裁决撤销路径与可见结论。
+                sessionCoordinator.onSupervisorHandback(id, outcome)
             },
             logger = ::log,
         )
@@ -336,8 +359,9 @@ class AgentCallService : Service() {
                 throw cancelled
             } catch (failure: Throwable) {
                 log("bootstrap_failed " + failure.javaClass.simpleName)
+                // 服务级诊断：绝不写进 lastError（那会被当成某通电话的交还失败）。
                 AgentCallRuntime.update {
-                    it.copy(ready = false, lastError = "bootstrap_failed", lastErrorSession = null)
+                    it.copy(ready = false, lastDiagnostic = "bootstrap_failed")
                 }
                 coordinator?.onEvent(SessionEvent.ReadyChanged(false))
             }
@@ -533,6 +557,50 @@ private class BridgeConversation(
             logger = logger,
         ) ?: return
         engine.run(id, audio, config)
+    }
+}
+
+/**
+ * 事件游标的持久化（Task 7B3 FIX ROUND 1）。
+ *
+ * 只保存“最近一次已投递的 seq + 当时桥接的 uptime”，不含号码、会话 token、密钥或事件负载。
+ * 服务重启后从它继续：桥接环里的旧 handback/断开事实不会被重新投递一遍。若桥接在此期间
+ * 重启（uptime 回退），轮询器仍然会清空基线重新同步。
+ */
+private class SharedPreferencesSessionEventCursorStore(context: Context) : SessionEventCursorStore {
+
+    private val prefs = context.applicationContext
+        .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    @Volatile
+    private var lastWritten: SessionEventCursor? = null
+
+    override fun read(): SessionEventCursor? {
+        if (!prefs.contains(KEY_SEQ)) return null
+        val seq = prefs.getLong(KEY_SEQ, -1L)
+        if (seq < 0L) return null
+        val uptime = if (prefs.contains(KEY_UPTIME)) {
+            prefs.getLong(KEY_UPTIME, -1L).takeIf { it >= 0L }
+        } else {
+            null
+        }
+        return SessionEventCursor(seq = seq, uptimeMs = uptime).also { lastWritten = it }
+    }
+
+    override fun write(cursor: SessionEventCursor) {
+        // 每 500 ms 一次的轮询绝大多数时候 seq 没变：不要制造无意义的磁盘写入。
+        if (lastWritten == cursor) return
+        lastWritten = cursor
+        val editor = prefs.edit().putLong(KEY_SEQ, cursor.seq)
+        val uptime = cursor.uptimeMs
+        if (uptime == null) editor.remove(KEY_UPTIME) else editor.putLong(KEY_UPTIME, uptime)
+        editor.apply()
+    }
+
+    companion object {
+        const val PREFS_NAME: String = "agentcall.session_events"
+        const val KEY_SEQ: String = "lastSeq"
+        const val KEY_UPTIME: String = "lastUptimeMs"
     }
 }
 

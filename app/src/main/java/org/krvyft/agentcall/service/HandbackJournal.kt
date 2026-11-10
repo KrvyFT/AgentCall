@@ -103,6 +103,8 @@ object HandbackJournal {
         val startsNewCall = state != SessionState.ENDED && status.activeSession != session
         val keepError = when {
             error == null -> false
+            // 事件流/传输诊断绝不是这通电话的交还失败：立即丢弃（任务 7B3 FIX ROUND 1）。
+            isDiagnosticOnly(error) -> false
             errorSession == session -> true
             errorSession == null -> !startsNewCall
             // 属于别的会话的错误：任何状态都不得保留。
@@ -138,6 +140,13 @@ object HandbackJournal {
         }
         val error = status.lastError ?: return HandbackOutcome.Pending
         if (status.lastErrorSession != session) return HandbackOutcome.Pending
+        // 轮询器/事件流的诊断码（session_event_incomplete、bridge_unavailable、…）不是接管失败：
+        // 它们此前经 lastError 直接进入“交还失败”，掩盖了真实的交还结果并绕过了文案过滤。
+        // 事件流诊断现在写在 AgentCallStatus.lastDiagnostic，这里再做一次防御性隔离。
+        if (isDiagnosticOnly(error)) return HandbackOutcome.Pending
         return HandbackOutcome.Failed(error)
     }
+
+    /** 只属于事件流/轮询诊断、绝不能被当成“这通电话交还失败”的机器码。 */
+    fun isDiagnosticOnly(code: String): Boolean = code in SessionEventPoller.DIAGNOSTIC_ONLY_CODES
 }

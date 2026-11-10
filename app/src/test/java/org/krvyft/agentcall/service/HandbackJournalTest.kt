@@ -173,4 +173,55 @@ class HandbackJournalTest {
         assertNull(residue.error)
         assertNull(residue.errorSession)
     }
+
+    // ------------------------------------------- 事件流诊断 ≠ 交还失败（7B3 FIX ROUND 1）
+
+    /**
+     * IMPORTANT 3：轮询器/事件流的机器码（session_event_incomplete、bridge_unavailable、…）
+     * 既不再写进 lastError，也绝不能被 [HandbackJournal.outcomeFor] 解释成“这通电话接管失败”
+     * ——那会让接管页显示“交还失败: session_event_incomplete”，并在恢复后继续残留。
+     */
+    @Test
+    fun anEventFeedDiagnosticIsNeverAHandbackFailure() {
+        for (code in SessionEventPoller.DIAGNOSTIC_ONLY_CODES) {
+            assertEquals(
+                "poller code must not become a handback failure: " + code,
+                HandbackOutcome.Pending,
+                HandbackJournal.outcomeFor(
+                    AgentCallStatus(
+                        activeSession = sessionA,
+                        lastError = code,
+                        lastErrorSession = sessionA,
+                    ),
+                    sessionA,
+                ),
+            )
+        }
+        // 真正的交接错误仍然显示。
+        assertEquals(
+            HandbackOutcome.Failed("handback_revoke_failed"),
+            HandbackJournal.outcomeFor(
+                AgentCallStatus(
+                    activeSession = sessionA,
+                    lastError = "handback_revoke_failed",
+                    lastErrorSession = sessionA,
+                ),
+                sessionA,
+            ),
+        )
+    }
+
+    /** 诊断码必须在状态变化时立即被丢弃（服务恢复后不得残留）。 */
+    @Test
+    fun aDiagnosticCodeIsDroppedFromTheResidueOnAnyStateChange() {
+        val status = AgentCallStatus(
+            activeSession = sessionA,
+            lastError = SessionEventPoller.ERROR_POLL_FAILED,
+        )
+
+        val residue = HandbackJournal.residueOnStateChanged(status, sessionA, SessionState.ACTIVE_AI)
+
+        assertNull(residue.error)
+        assertNull(residue.errorSession)
+    }
 }
