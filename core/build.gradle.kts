@@ -34,5 +34,9 @@ dependencies {
     // spec §7：完整号码按可配置地区规范化，禁止自写号段/后缀近似匹配。
     implementation(libs.libphonenumber)
 
+    // 本地控制协议与配置 JSON 的唯一实现（版本目录固定 2.11.0）。
+    // Gson 类型不出现在公开签名中，消费方只看到 RpcRequest/RpcResponse/AgentConfig。
+    implementation(libs.gson)
+
     testImplementation(libs.junit)
 }
