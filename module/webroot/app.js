@@ -244,13 +244,20 @@
     });
   }
 
-  function markInvalidFields(issues) {
+  /** 只有落在同一页面作用域内的字段才会被清理/标红；scope 为空时作用于全部页面。 */
+  function fieldInScope(field, scope) {
+    return !scope || B.pageForField(field) === scope;
+  }
+
+  function markInvalidFields(issues, scope) {
     Object.keys(FIELD_INPUTS).forEach(function (field) {
+      if (!fieldInScope(field, scope)) return;
       var element = $(FIELD_INPUTS[field]);
       if (element) element.className = element.className.replace(/\s*is-invalid/g, "");
     });
     (issues || []).forEach(function (item) {
       if (!item.blocking) return;
+      if (!fieldInScope(item.field, scope)) return;
       var element = $(FIELD_INPUTS[item.field]);
       if (element) element.className += " is-invalid";
     });
@@ -260,7 +267,7 @@
    * 阻断项与非阻断提醒按字段归到各自页面；提醒绝不覆盖阻断项
    * （否则一次保存失败后用户只看到“空白名单”而看不到真正要修的错误）。
    */
-  function renderPageIssues(blocking, warnings) {
+  function renderPageIssues(blocking, warnings, scope) {
     var items = (blocking || []).concat(warnings || []);
     var buckets = { rules: [], ai: [], dialog: [] };
     items.forEach(function (item) {
@@ -279,7 +286,7 @@
         }),
       );
     });
-    markInvalidFields(blocking);
+    markInvalidFields(blocking, scope);
   }
 
   /** 名单语义提醒单独放在规则页顶部，保持醒目；不改写已渲染的阻断项。 */
@@ -733,7 +740,7 @@
         state.loaded = true;
         fillSavedPage(scope, result.form);
         clearDirty(scope);
-        renderPageIssues([], result.warnings || []);
+        renderPageIssues([], result.warnings || [], scope);
         renderWarnings(result.warnings);
         hideBanner();
         applySaveAvailability();
@@ -741,7 +748,7 @@
         return result;
       }
       var failure = result || { ok: false, code: "unknown_error", issues: [] };
-      renderPageIssues(failure.issues || [], failure.warnings || []);
+      renderPageIssues(failure.issues || [], failure.warnings || [], scope);
       renderWarnings(failure.warnings || []);
       recordError(failure.code, failure.message || "");
       var blockingCount = (failure.issues || []).filter(function (item) {
@@ -1087,7 +1094,8 @@
             },
           ]);
         }
-        markInvalidFields(issues);
+        // 逐端点格式校验只允许触碰 AI 页字段：不得清除规则页/对话页已有的错误标记。
+        markInvalidFields(issues, "ai");
       });
     });
   }

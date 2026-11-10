@@ -2,9 +2,10 @@
 # AgentCall 卸载清理（spec §8/§11）。
 #
 # 能力边界（必须诚实）：
-# - 本脚本只能“请求停止桥接进程”，不能终止或交还正在进行的 AI 通话。
-#   当前桥接没有会话/租约实现（session.request 返回 method_not_implemented），
-#   shutdown 只关闭配置服务与 abstract socket，不保证任何通话被交还。
+# - 桥接已经实现会话/租约（session.request / session.command / session.heartbeat /
+#   session.events / session.handover 与租约管理都在桥接内）。
+# - 但 shutdown 与卸载路径尚未接入终止/交还：shutdown 只关闭配置服务与 abstract
+#   socket，不能终止或交还正在进行的 AI 通话。该交接由单独任务跟踪，不在本脚本内修复。
 # - 如卸载时正在 AI 通话，请在 Google 电话中手动结束该通话，再继续清理。
 #
 # 停止顺序（与脚本末尾的实际执行顺序一致）：
@@ -198,10 +199,12 @@ else
     fi
 fi
 
-say "- 说明：桥接当前没有会话/租约实现（session.request 为 method_not_implemented），"
-say "  本脚本无法终止或交还正在进行的 AI 通话；shutdown 只关闭配置服务与 socket。"
+say "- 说明：桥接已实现会话/租约（session.request/command/heartbeat/events/handover），"
+say "  但 shutdown/卸载尚未接入终止或交还路径：本脚本无法终止或交还正在进行的 AI 通话。"
+say "  该交接缺口单独跟踪，不在本脚本内修复。"
 say "  如卸载时正在 AI 通话，请在 Google 电话中手动结束后再清理。"
-say "! 本脚本无法确认任何 AI 通话已被交还（桥接没有会话/租约能力）；如正在通话请先在 Google 电话中手动结束"
+say "! 本脚本无法确认任何 AI 通话已被终止或交还（终止/交还路径尚未接入，单独跟踪）"
+say "  如正在通话请先在 Google 电话中手动结束"
 say "! TERM 只结束当前进程：service.sh 的重启循环默认在 5 s（RESTART_DELAY_SECONDS）后重新拉起进程。"
 say "  按 KernelSU 的标记语义，移除模块会先写 remove/disable 标记（真机卸载时序未验证）；service.sh 每次重启前重新检查标记，标记存在时不再拉起。"
 say "  若在没有 remove/disable 标记的情况下手动执行本脚本，桥接可能在约 5 s 内被重新拉起。"

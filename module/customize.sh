@@ -1,10 +1,11 @@
 #!/system/bin/sh
 # AgentCall 安装定制脚本（由 KernelSU 安装器 source；见 KernelSU 模块文档）。
 #
-# 只做三件事：
+# 只做四件事：
 # 1. 给固定命令包装器补可执行位（模块文件默认 0644）。
 # 2. 校验桥接运行时容器存在（缺失则中止安装并给出可操作信息）。
 # 3. 预创建 root 私有数据目录（0700），不迁移、不改写既有配置。
+# 4. 清理上一次 WebView 崩溃可能遗留的 inbox 明文负载（只删本模块拥有的前缀文件）。
 #
 # 明确不做：不改 Google 电话默认角色，不改 vendor 音频策略，不改 webroot 权限
 # （KernelSU 安装时自动设置，用户不要覆盖），不写 system.prop，不动 SELinux。
@@ -38,6 +39,13 @@ umask 077
 DATA_ROOT=/data/adb/agentcall
 mkdir -p "$DATA_ROOT" "$DATA_ROOT/inbox" "$DATA_ROOT/logs" 2>/dev/null
 chmod 0700 "$DATA_ROOT" "$DATA_ROOT/inbox" "$DATA_ROOT/logs" 2>/dev/null
+
+# inbox 是 WebUI 一次性写入的明文密钥负载目录；WebView 崩溃或进程被杀时负载可能残留。
+# 安装时只清理本模块拥有的固定前缀文件，不碰目录里的其它内容（0700 目录本就不对外）。
+for payload in "$DATA_ROOT"/inbox/config-set*.json; do
+    [ -e "$payload" ] || continue
+    rm -f "$payload" 2>/dev/null
+done
 
 ui_print "- AgentCall: root 私有配置目录就绪（/data/adb/agentcall，0700）"
 ui_print "- AgentCall: 未修改 Google 电话默认角色、vendor 音频配置或 SELinux"

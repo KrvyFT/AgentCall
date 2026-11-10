@@ -109,8 +109,12 @@ test("真实桥：密钥只经 root 私有文件 stdin 传输，绝不出现在 
   assert.equal(result.ok, true);
   assert.equal(result.data.config.revision, 4);
 
-  // 唯一一条命令，且完全固定：不接受任何用户数据作为参数。
-  assert.deepEqual(fake.commands, [CTL + " config-set < " + INBOX]);
+  // 唯一一条命令：CLI 契约仍然是 config-set + stdin，但负载路径按次唯一。
+  assert.equal(fake.commands.length, 1);
+  const inboxPath = fake.writes[0].path;
+  assert.equal(fake.commands[0], CTL + " config-set < " + inboxPath);
+  assert.match(inboxPath, new RegExp("^" + B.INBOX_DIR + "/config-set\\.[a-z0-9-]+\\.json$"));
+  assert.notEqual(inboxPath, INBOX, "不得再共用固定负载路径（两个 WebUI 实例会互相覆盖）");
   const secretBase64 = B.toBase64Utf8(SECRET);
   for (const command of fake.commands) {
     assert.equal(command.includes(SECRET), false);
@@ -120,17 +124,50 @@ test("真实桥：密钥只经 root 私有文件 stdin 传输，绝不出现在 
 
   // 密钥确实通过文件通道（base64 只是该 Java 桥字节写入方法的编码，不经过 shell）。
   assert.equal(fake.writes.length, 1);
-  assert.equal(fake.writes[0].path, INBOX);
   const written = JSON.parse(fake.writes[0].text);
   assert.equal(written.expectedRevision, 3);
   assert.equal(written.patch.secrets.ASR.action, "replace");
   assert.equal(written.patch.secrets.ASR.value, SECRET);
   // 写后立即删除临时文件。
-  assert.equal(fake.files.has(INBOX), false);
+  assert.equal(fake.files.has(inboxPath), false);
 
   const logText = JSON.stringify(bridge.logs());
   assert.equal(logText.includes(SECRET), false);
   assert.equal(logText.includes(secretBase64), false);
+});
+
+test("两个 WebUI 实例并发保存：唯一负载路径避免 A 的 CLI 读到 B 的负载", async () => {
+  const fake = fakeManager();
+  const commands = [];
+  const callbacks = [];
+  // 让两次写文件都先落盘、CLI 调用挂起：正固定路径下会互相覆盖，CAS 仍可能通过。
+  fake.ksu.exec = (command, optionsJson, callbackName) => {
+    commands.push(command);
+    // 捕获回调函数本身：同一进程里两个 bridge 实例的 callbackName 可能撞名，
+    // 但每个实例各自的回调仍必须收到自己的响应。
+    callbacks.push({ command, callback: globalThis[callbackName] });
+  };
+  const firstBridge = B.createBridge({ scope: { ksu: fake.ksu } });
+  const secondBridge = B.createBridge({ scope: { ksu: fake.ksu } });
+  const firstSave = firstBridge.call("config-set", { expectedRevision: 0, patch: { enabled: true } });
+  const secondSave = secondBridge.call("config-set", { expectedRevision: 0, patch: { enabled: false } });
+
+  assert.equal(fake.writes.length, 2, "两个实例必须各自写入一个负载");
+  assert.notEqual(fake.writes[0].path, fake.writes[1].path, "固定路径会让 A 的 CLI 读到 B 的负载");
+  assert.equal(commands.length, 2);
+  assert.equal(commands[0], CTL + " config-set < " + fake.writes[0].path);
+  assert.equal(commands[1], CTL + " config-set < " + fake.writes[1].path);
+  assert.equal(JSON.parse(fake.files.get(fake.writes[0].path)).patch.enabled, true);
+  assert.equal(JSON.parse(fake.files.get(fake.writes[1].path)).patch.enabled, false);
+
+  callbacks.forEach((entry, index) => {
+    assert.equal(fake.files.has(fake.writes[index].path), true, "各自 CLI 执行时自己的负载仍在磁盘上");
+    entry.callback(0, redacted({ enabled: index === 0, revision: 1 }), "");
+  });
+  const [first, second] = await Promise.all([firstSave, secondSave]);
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, true);
+  assert.equal(fake.files.size, 0, "两次保存后都不得留下明文负载");
 });
 
 test("inbox 目录由 WebUI 显式收紧为 0700（ownerOnly 读写执行、组/其它无权限）", async () => {
@@ -153,7 +190,8 @@ test("写入中途失败时删除半成品 inbox 负载（文档承诺“总是�
   const result = await bridge.call("config-set", { expectedRevision: 0, patch: { enabled: true } });
   assert.equal(result.ok, false);
   assert.equal(result.code, "inbox_write_failed");
-  assert.equal(fake.files.has(INBOX), false, "失败后不得留下含密钥的半成品文件");
+  assert.equal(fake.writes.length, 1, "失败路径应先确认自己写了哪个唯一负载路径");
+  assert.equal(fake.files.has(fake.writes[0].path), false, "失败后不得留下含密钥的半成品文件");
   assert.equal(fake.commands.length, 0, "写入失败时不得执行 config-set");
 });
 
@@ -203,7 +241,8 @@ test("CAS 冲突不覆盖：只发一次写请求，不自动重试或抬升 rev
   assert.equal(result.conflict, true);
   assert.equal(conflict.commands.length, 1);
   assert.equal(bridge.lastKnownRevision(), null);
-  assert.equal(conflict.files.has(INBOX), false);
+  assert.equal(conflict.writes.length, 1);
+  assert.equal(conflict.files.has(conflict.writes[0].path), false);
 });
 
 test("未知操作、参数走私与非法负载都在执行前被拒绝", async () => {

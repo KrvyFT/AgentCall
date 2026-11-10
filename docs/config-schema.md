@@ -22,13 +22,18 @@
 | `/data/adb/agentcall/config.json` | 公开配置 + 密钥 + schema + revision | 0600 |
 | `/data/adb/agentcall/pairing.json` | 配对记录（包名/UID/签名摘要/版本） | 0600 |
 | `/data/adb/agentcall/config.schema-<n>.json.bak` | 迁移前旧 schema 备份 | 0600 |
-| `/data/adb/agentcall/inbox` | WebUI 写入的 `config-set` 临时负载 | 0700（WebUI 创建时显式 ownerOnly rwx，不依赖 umask；`customize.sh` 预创建） |
-| `/data/adb/agentcall/inbox/config-set.json` | 单次写入负载；写后立即删除 | 写入后收紧为 0000 |
+| `/data/adb/agentcall/inbox` | WebUI 写入的 `config-set` 一次性负载 | 0700（WebUI 创建时显式 ownerOnly rwx，不依赖 umask；`customize.sh` 预创建） |
+| `/data/adb/agentcall/inbox/config-set.<token>-<seq>.json` | 单次写入负载（每次保存唯一文件名）；正常路径读写后立即删除 | 写入后收紧为 0000 |
 | `/data/adb/agentcall/logs/service.log` | 服务日志（有大小上限） | 0700 目录，服务自身轮转 |
 
 密钥以**明文**保存在 root 私有单文件里，依靠目录/文件权限与 root 隔离，不做加密。
 这符合 spec §6.4/§11：密钥不进入普通应用备份、导出或日志，但不能防御同设备其它
 已授权 root 进程。
+
+inbox 中的一次性明文负载只在一次保存期间存在：正常路径在 CLI 返回后立即删除；WebView
+崩溃或进程被杀时可能残留，由 `service.sh`/`customize.sh` 在启动时清理本模块拥有的
+`config-set*.json`（不触碰 inbox 中其它文件）。固定路径 `config-set.json` 是旧版兼容
+形态，启动清理同样覆盖。
 
 写入使用“同目录临时文件 → fsync → rename”的原子替换；revision 与内容一起落盘，
 不会读到半份配置。
@@ -108,10 +113,13 @@
 
 - `config` 含 `revision`，不含 `secrets`。
 - `secrets` 的值为 `CONFIGURED` 或 `MISSING`，没有原值、没有长度、没有前缀。
-- `status` 负载：`bridgeVersion`、`protocolVersion`、`revision`、`enabled`、`paired`、
-  `uptimeMs`、`activeConnections`、`rejectedConnections`、`supervisionPhase`、
-  `supervisionOwned`、`microphoneIsolated`、`supervisionBlocked`、`supervisionLastFault`、
-  `hookConnected`、`dialerDefaultRole`。
+- `status` 负载（16 个键）：`bridgeVersion`、`protocolVersion`、`revision`、`enabled`、
+  `paired`、`uptimeMs`、`processId`、`activeConnections`、`rejectedConnections`、
+  `supervisionPhase`、`supervisionOwned`、`microphoneIsolated`、`supervisionBlocked`、
+  `supervisionLastFault`、`hookConnected`、`dialerDefaultRole`。
+- `processId`：桥接进程每次启动生成的随机字符串，是判断“桥接是否重启过”的唯一信标。
+  缺失、非字符串、含空白/控制字符或超长时，调用方必须按“代次未知”处理，不得当成同一进程；
+  `uptimeMs` 只作展示，不能替代它。
 - `hookConnected`：boolean，或字符串 `"unknown"`。表示 HOOK 角色是否在 **5000 ms**
   心跳窗口内报告过心跳，数据源是监督端按会话记录的内存状态（`Supervisor.peerAlive`），
   不发远程请求、不读密钥。未接入监督状态时返回 `"unknown"`。
@@ -161,8 +169,11 @@
 - `enabledPhoneAccounts` 属于 APK 侧；WebUI 的补丁不包含它，避免清空 APK 写入的启用项。
 - stdin 上限 `MAX_CONTROL_FRAME_BYTES - 1024 = 64512` 字节（UTF-8）。
   WebUI 在写文件前按同一上限检查；超限返回 `payload_invalid`。
-- 配置内容只经 stdin 传输；命令行只有固定的
-  `<moduleDir>/bin/agentcallctl config-set < /data/adb/agentcall/inbox/config-set.json`。
+- 配置内容只经 stdin 传输；命令行只有本次保存的**唯一**负载路径
+  `<moduleDir>/bin/agentcallctl config-set < /data/adb/agentcall/inbox/config-set.<token>-<seq>.json`。
+  路径由前端常量、每实例随机 token 与递增序号生成，不含用户输入；CLI 契约仍然是
+  “从 stdin 读 config-set”。每次保存使用唯一文件名，两个 WebUI 实例不会互相覆盖负载
+  （固定路径曾让 A 的 CLI 读到 B 的 payload，CAS 仍可能通过）。
   密钥永远不进入进程 argv、URL、日志或错误消息。
 - **页面作用域**：WebUI 的每个页面保存只提交本页字段，校验也只针对本页；绝不夹带其它页面
   正在编辑（未确认）的内容，尤其是 AI 密钥意图：
@@ -251,6 +262,9 @@
 | `config_root_rejected` | 配置根不在 `/data/adb/agentcall` 之下 |
 | `forbidden` | 角色无权调用该方法 |
 | `method_not_implemented` | 固定表中尚未实现的方法 |
+| `calibration_unavailable` | 校准存储未接线或不可用；不得假装已验证 |
+| `calibration_environment_unknown` | 当前/预期环境事实不完整，拒绝把校准绑定到不可复现环境 |
+| `calibration_environment_mismatch` | 预期环境与当前设备环境不一致 |
 | `internal_error` | 未预期异常（只回类名） |
 
 业务校验 issue code（`config_invalid` 消息内）：`ANSWER_DELAY_OUT_OF_RANGE`、
@@ -299,7 +313,7 @@ WebUI 的实际命令行（完整字符串，无用户数据）：
 ```
 /data/adb/modules/agentcall/bin/agentcallctl status
 /data/adb/modules/agentcall/bin/agentcallctl config-get
-/data/adb/modules/agentcall/bin/agentcallctl config-set < /data/adb/agentcall/inbox/config-set.json
+/data/adb/modules/agentcall/bin/agentcallctl config-set < /data/adb/agentcall/inbox/config-set.<token>-<seq>.json
 /data/adb/modules/agentcall/bin/agentcallctl pair
 /data/adb/modules/agentcall/bin/agentcallctl diagnose
 /data/adb/modules/agentcall/bin/agentcallctl shutdown
@@ -309,6 +323,12 @@ WebUI 的实际命令行（完整字符串，无用户数据）：
 - 模块目录必须匹配 `^/data/adb/modules/[A-Za-z][A-Za-z0-9._-]+$`；无法确认时拒绝执行。
 - 旧管理器没有 `moduleInfo()` 时回退到固定路径 `/data/adb/modules/agentcall`，
   不拼接任何外部输入。
+
+**校准 RPC（11A，已落地于桥接）**：`calibration.read`（APP 只读，CLI_ROOT 也可读）与
+`calibration.record`（仅 CLI_ROOT）是控制 socket 上的固定 RPC 方法，不属于 `agentcallctl`
+的六条固定命令；包装器没有新增命令。`calibration.record` 只接受五项布尔人工测试步骤与
+可选的“预期环境”，环境与时间戳一律由桥接进程重新采集/写入；未知或不一致环境整体拒绝。
+校准存储未接线时返回 `calibration_unavailable`，绝不假装已验证。
 
 ---
 
@@ -343,11 +363,15 @@ WebUI 的实际命令行（完整字符串，无用户数据）：
 写入路径：
 
 1. 前端把 `{expectedRevision, patch}` 序列化为 UTF-8 JSON。
-2. 通过 `ksu.io().FileOutputStream()` 写入 `/data/adb/agentcall/inbox/config-set.json`。
+2. 通过 `ksu.io().FileOutputStream()` 写入本次保存的唯一负载
+   `/data/adb/agentcall/inbox/config-set.<token>-<seq>.json`。
    这里的 base64 只是 Java 文件桥的字节编码，不经过 shell、不进 argv。
 3. 文件权限收紧为 0000；目录 0700。
-4. 执行固定的 `agentcallctl config-set < <inbox>`。
-5. 无论成功失败都删除临时文件；成功与否只以后端回读为准。
+4. 执行 `agentcallctl config-set < <本次唯一负载路径>`；CLI 契约未变，仍只从 stdin 读取。
+5. 无论成功失败都删除本次临时文件；成功与否只以后端回读为准。WebView 崩溃残留由
+   `service.sh`/`customize.sh` 启动清理兜底。
+6. 唯一负载名取代固定文件名后，两个 WebUI 实例的写入不再交错；不需要额外的跨实例锁文件，
+   也不存在“持锁等待”的失败模式。
 
 WebUI 不加载任何在线 CDN、不发起 fetch/XHR、不用 `innerHTML` 渲染不受信任文本；
 配置与日志一律 `textContent`。
@@ -357,12 +381,12 @@ WebUI 不加载任何在线 CDN、不发起 fetch/XHR、不用 `innerHTML` 渲�
 页面的标记。总开关是独立保存动作，不标记也不清除任何页面 chip。
 
 **连接测试归属（控制器裁决）**：特权桥接进程**不得**代替用户发起远程 API 请求
-（spec §6.3），WebUI 也不读取密钥。因此逐端点连接测试属于 APK 侧诊断（Task 7）：
+（spec §6.3），WebUI 也不读取密钥。逐端点连接测试由 APK 侧诊断（Task 7）**实现**：
 
 - AI 页只做本地“地址格式校验”（按钮文案为“校验地址格式（非连接测试）”）；
-- AI 页有一个明确的“连接测试”卡片，状态恒为“未实现（需 APK 端）”，并写明
-  “连接测试在 AgentCall APK 诊断页执行，需真实远程 API 请求（会使用密钥并可能计费）；
-  WebUI 不发起远程请求，也不伪造测试结果”；
+- AI 页的“连接测试”卡片明确写明“连接测试在 AgentCall APK 诊断页执行，需真实远程 API
+  请求（会使用密钥并可能计费）；WebUI 不发起远程请求，也不伪造测试结果”，并标注状态为
+  “APK 诊断页提供”；
 - 当前没有 APK 的 deep link 约定，因此只提供路径说明（AgentCall APK → 诊断 → 连接测试），
   不提供会失败的链接。
 
@@ -378,7 +402,7 @@ WebUI 不加载任何在线 CDN、不发起 fetch/XHR、不用 `innerHTML` 渲�
 - 读取到更大的 schema：`config_schema_unsupported`，拒绝读取与覆盖，
   旧版模块不会降级覆盖新版配置。
 - 模块升级：`customize.sh` 只补可执行位、校验桥接容器、预创建 0700 目录，
-  不迁移、不改写既有配置；配置迁移由桥接在读取时完成。
+  并清理 inbox 中崩溃遗留的一次性负载；不迁移、不改写既有配置；配置迁移由桥接在读取时完成。
 - 卸载：`uninstall.sh` 分开探测 abstract socket 是否存在与固定 CLI 是否可执行
   （socket 存在不等于 CLI 可执行），然后：
   1. 两者都可用 → 固定 CLI `shutdown`，在上限 15 秒内等待 socket 消失；
@@ -419,9 +443,11 @@ WebUI 不加载任何在线 CDN、不发起 fetch/XHR、不用 `innerHTML` 渲�
   6. 卸载时 `uninstall.sh` 先收回待处理的 `restart.requested`，避免 `shutdown` 后
      又被重启循环拉起。
 
-  **诚实边界**：当前桥接没有会话/租约实现（`session.request` 为
-  `method_not_implemented`），`shutdown` 只关闭配置服务与 socket，**不能终止或交还
-  正在进行的 AI 通话**；脚本会打印这一点，并提示用户先在 Google 电话中手动结束。
+  **诚实边界**：桥接已实现会话/租约（`session.request`、`session.command`、
+  `session.heartbeat`、`session.events`、`session.handover` 与租约管理），但
+  `shutdown`/卸载路径尚未接入终止或交还：`shutdown` 只关闭配置服务与 socket，
+  **不能终止或交还正在进行的 AI 通话**；脚本会打印这一点，并提示用户先在 Google 电话中
+  手动结束。该交接缺口由单独任务跟踪，不在本文承诺已完成。
   不修改 Google 电话默认角色、vendor 音频配置或 SELinux。
 
   **未验证**：上述 PID 核验/终止分支只有 `sh -n` 与宿主脚本断言/进程替身证据，

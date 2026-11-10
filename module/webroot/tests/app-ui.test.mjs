@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { installDom, installGlobalDom } from "./dom-shim.mjs";
-import { fakeManager, CTL, INBOX } from "./fake-manager.mjs";
+import { fakeManager, CTL } from "./fake-manager.mjs";
 
 const require = createRequire(import.meta.url);
 const B = require("../bridge.js");
@@ -138,7 +138,9 @@ test("KernelSU 真实路径：init 后无需任何页面保存即可保存总开
 
   const configSetCommands = fake.commands.filter((command) => command.indexOf(" config-set ") !== -1);
   assert.equal(configSetCommands.length, 1, "总开关必须真的发起一次 config-set");
-  assert.equal(configSetCommands[0], CTL + " config-set < " + INBOX);
+  const inboxPrefix = CTL + " config-set < " + B.INBOX_DIR + "/config-set.";
+  assert.equal(configSetCommands[0].indexOf(inboxPrefix), 0, "CLI 契约仍是 config-set + stdin，但负载路径按次唯一");
+  assert.match(configSetCommands[0].slice(inboxPrefix.length), /^[a-z0-9-]+\.json$/);
   assert.equal(fake.writes.length, 1);
   const payload = JSON.parse(fake.writes[0].text);
   assert.deepEqual(payload, { expectedRevision: 4, patch: { enabled: true } });
@@ -253,6 +255,33 @@ test("页面保存只提交本页字段：规则页保存不得夹带 AI 密钥"
   }
 });
 
+test("逐端点“校验地址格式”只标记/清理 AI 页字段，不清除其它页面的错误标记", async () => {
+  const holder = {};
+  const fake = fakeManager({ handlers: defaultHandlers(holder) });
+  holder.current = fake;
+  const { doc } = await boot({ fake });
+
+  // 规则页与对话页各自留下一个阻断标记。
+  doc.getElementById("rules-region").value = "X";
+  doc.getElementById("rules-save").click();
+  await tick(20);
+  assert.match(doc.getElementById("rules-region").className, /is-invalid/, "规则页非法字段必须先被标红");
+  doc.getElementById("dlg-speed").value = "9";
+  doc.getElementById("dlg-save").click();
+  await tick(20);
+  assert.match(doc.getElementById("dlg-speed").className, /is-invalid/, "对话页非法字段必须先被标红");
+
+  // 逐端点格式校验：只应清掉/写入 AI 页的标记。
+  doc.getElementById("ai-asr-url").value = "http://insecure.example.com";
+  doc.getElementById("ai-asr-model").value = "whisper-1";
+  doc.getElementById("ai-asr-test").click();
+  await tick(0);
+
+  assert.match(doc.getElementById("ai-asr-url").className, /is-invalid/, "端点格式错误必须标红本字段");
+  assert.match(doc.getElementById("rules-region").className, /is-invalid/, "逐端点校验不得清除规则页标记");
+  assert.match(doc.getElementById("dlg-speed").className, /is-invalid/, "逐端点校验不得清除对话页标记");
+});
+
 test("概览的默认拨号角色/Hook 连通性：真实布尔按值渲染，缺失或 unknown 一律显示未知", async () => {
   const holder = {};
   const fake = fakeManager({ handlers: defaultHandlers(holder) });
@@ -348,6 +377,7 @@ test("连接测试归属：WebUI 只显示诚实状态，明确真实请求由 A
   assert.match(app, /AgentCall APK 诊断页/);
   assert.equal(/WebUI (执行|发起)连接测试/.test(html + app), false, "不得宣称 WebUI 执行连接测试");
   assert.equal(/本页(会)?发起真实请求/.test(html + app), false);
+  assert.equal(/未实现/.test(html), false, "APK 已实现逐端点连接测试，WebUI 不得再声称连接测试未实现");
 });
 
 

@@ -90,6 +90,22 @@ rotate_log() {
     fi
 }
 
+# WebUI 把一次性 config-set 负载（含明文密钥）写进 inbox 后，正常路径会在 CLI 返回后删除。
+# WebView 崩溃或进程被杀时不会执行删除，明文文件会跨启动存活；启动时清理本模块拥有的
+# 固定前缀文件（固定 config-set.json 与唯一命名的 config-set*.json），不碰其它内容。
+clean_inbox_payloads() {
+    cleaned=0
+    for payload in "$INBOX_DIR"/config-set*.json; do
+        [ -e "$payload" ] || continue
+        if rm -f "$payload" 2>/dev/null; then
+            cleaned=$((cleaned + 1))
+        fi
+    done
+    if [ "$cleaned" -gt 0 ]; then
+        log_line "inbox_payload_cleaned count=$cleaned"
+    fi
+}
+
 bridge_pid=
 audio_manager_pid=
 stopping=0
@@ -291,6 +307,7 @@ fi
 
 rotate_log
 log_line "service_start moddir=$MODDIR"
+clean_inbox_payloads
 
 waited=0
 while [ "$("$GETPROP" sys.boot_completed 2>/dev/null)" != "1" ]; do

@@ -96,15 +96,31 @@ test("uninstall.sh：先尝试停止桥接（CLI 或 PID 回退），再清理�
   assert.equal(/chmod|set_perm/.test(uninstall), false, "卸载脚本不修改模块/webroot 权限");
 });
 
-test("uninstall.sh 诚实性：不宣称桥接没有的“交还会话”能力，并区分 socket 与 CLI 可执行性", () => {
+test("uninstall.sh 诚实性：桥接已实现会话/租约，但 shutdown 尚未接入终止/交还，并区分 socket 与 CLI 可执行性", () => {
   const uninstall = read("uninstall.sh");
-  // 桥接当前没有会话/租约（session.request 为 method_not_implemented），脚本必须说明它无法终止/交还通话。
-  assert.match(uninstall, /(没有|无).*(会话|租约)/, "必须说明桥接没有会话/租约实现");
-  assert.match(uninstall, /(无法|不能).*(终止|交还).*(通话|AI)/, "必须明确无法保证终止/交还正在进行的通话");
+  // 桥接已经实现会话/租约（session.request/command/heartbeat/events/handover），
+  // 不得再复述“没有会话/租约、session.request 为 method_not_implemented”的旧结论。
+  assert.match(uninstall, /(已实现|已有|已经实现)[\s\S]{0,80}(会话|租约)/, "必须如实说明桥接已实现会话/租约");
+  assert.match(uninstall, /session\.(request|command|heartbeat|events|handover)/, "必须点名桥接已有的会话方法");
+  assert.equal(/(没有|无)[^。\n]{0,40}(会话|租约)/.test(uninstall), false, "不得再宣称桥接没有会话/租约");
+  assert.equal(/method_not_implemented/.test(uninstall), false, "不得再把 session.request 说成 method_not_implemented");
+  // 能力边界仍然存在：shutdown/卸载尚未接入终止或交还，不得反过来夸大已有能力。
+  assert.match(uninstall, /(无法|不能)[\s\S]{0,60}(终止|交还)[\s\S]{0,60}(通话|AI)/, "必须明确无法终止/交还正在进行的通话");
+  assert.match(uninstall, /(尚未|未)[\s\S]{0,60}(接入|支持)[\s\S]{0,60}(终止|交还|交接)/, "必须说明终止/交还路径尚未接入");
   assert.equal(/交还\/终止其托管的 AI 会话/.test(uninstall), false, "不得复述虚假的交还契约");
   assert.match(uninstall, /socket_present/, "必须单独探测 abstract socket 是否存在");
   assert.match(uninstall, /ctl_usable/, "必须单独判断固定 CLI 是否可执行");
   assert.equal(/\] && \[ -x "\$CTL" \]/.test(uninstall), false, "不得把 socket 存在与 CLI 可执行混在同一个条件里");
+});
+
+test("docs/config-schema.md 不再宣称桥接没有会话/租约（与实现对齐）", () => {
+  const docs = readFileSync(join(MODULE, "..", "docs", "config-schema.md"), "utf8");
+  assert.equal(/当前桥接没有会话\/租约实现/.test(docs), false, "不得再宣称桥接没有会话/租约");
+  assert.equal(/session\.request[\s\S]{0,40}method_not_implemented/.test(docs), false, "不得再把 session.request 说成未实现");
+  assert.match(docs, /会话\/租约/, "必须如实说明桥接已有会话/租约能力");
+  assert.match(docs, /session\.(request|command|heartbeat|events|handover)/, "必须点名桥接已有的会话方法");
+  assert.match(docs, /processId/, "status 字段表必须包含 processId");
+  assert.equal(/连接测试[\s\S]{0,60}未实现/.test(docs), false, "APK 已实现逐端点连接测试，文档不得再写未实现");
 });
 
 test("uninstall.sh / agentcallctl：$0 不含斜杠时仍解析出正确目录", () => {
@@ -122,6 +138,16 @@ test("customize.sh 只补固定包装器可执行位，不改 webroot 官方权�
   assert.equal(/chmod[^\n]*webroot|set_perm[^\n]*webroot/.test(customize), false, "webroot 权限由 KernelSU 安装器统一管理");
   assert.match(customize, /abort/, "缺失桥接容器/命令包装器时必须中止安装而非半装");
   assert.equal(/sys\.prop|resetprop|setenforce|settings put/.test(customize), false, "安装脚本不得改系统属性、SELinux 或默认应用");
+});
+
+test("customize.sh：安装时清理 inbox 中 WebView 崩溃遗留的 config-set 负载", () => {
+  const customize = read("customize.sh");
+  assert.match(
+    customize,
+    /for payload in "\$DATA_ROOT"\/inbox\/config-set\*\.json; do/,
+    "安装时必须遍历本模块拥有的固定前缀负载",
+  );
+  assert.match(customize, /rm -f "\$payload"/, "安装时必须删除遗留的明文负载");
 });
 
 test("agentcallctl：固定六条命令，配置只从 stdin 进入，未知命令在启动进程前拒绝", () => {
@@ -360,6 +386,40 @@ test(
       const log = readFileSync(harness.logFile, "utf8");
       assert.match(log, /bridge_exit_clean/);
       assert.match(log, /audio_worker_stopped/);
+    } finally {
+      killQuietly(child);
+      rmSync(harness.root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "service.sh：启动时清理 inbox 中崩溃遗留的 config-set 明文负载（只删本模块拥有的文件）",
+  { timeout: 60000 },
+  async () => {
+    const harness = serviceHarness();
+    let child = null;
+    try {
+      const inbox = join(harness.dataRoot, "inbox");
+      mkdirSync(inbox, { recursive: true });
+      const fixed = join(inbox, "config-set.json");
+      const stale = join(inbox, "config-set.instance-a-1.json");
+      const foreign = join(inbox, "notes.txt");
+      writeFileSync(fixed, '{"expectedRevision":0,"patch":{}}');
+      writeFileSync(stale, '{"expectedRevision":0,"patch":{}}');
+      writeFileSync(foreign, "keep me");
+
+      child = spawn("sh", [harness.script], {
+        env: serviceEnv(harness, { AGENTCALL_FAKE_BRIDGE_STAY: "1" }),
+        stdio: "ignore",
+      });
+      await waitFor(() => existsSync(harness.bridgePidFile), 20000, "bridge pid file");
+
+      assert.equal(existsSync(fixed), false, "固定路径的崩溃残留必须在启动时删除");
+      assert.equal(existsSync(stale), false, "唯一命名的崩溃残留必须在启动时删除");
+      assert.equal(existsSync(foreign), true, "不得删除 inbox 中不属于本模块的其它文件");
+      const log = readFileSync(harness.logFile, "utf8");
+      assert.match(log, /inbox_payload_cleaned count=2/, "清理必须记录数量：" + log);
     } finally {
       killQuietly(child);
       rmSync(harness.root, { recursive: true, force: true });

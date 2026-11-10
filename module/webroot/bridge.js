@@ -4,8 +4,9 @@
  * 设计边界（spec §6.4/§11）：
  * - 只调用模块内固定包装器 agentcallctl 的六条命令；不存在任意 shell 拼接路径，
  *   任何用户输入都不会进入命令行字符串。
- * - 配置写入只从 stdin 进入：本文件把补丁 JSON 写入 root 私有目录下的临时文件，
- *   命令行里只有固定的重定向路径，因此密钥不可能出现在 argv。
+ * - 配置写入只从 stdin 进入：本文件把补丁 JSON 写入 root 私有目录下本次唯一的临时文件，
+ *   命令行里只有该次保存的重定向路径（内部常量 + 随机 token/序号，不含用户输入），
+ *   因此密钥不可能出现在 argv。
  * - 管理器缺少受控文件写入接口（ksu.io）时进入 readonly：读取可用，保存一律拒绝，
  *   绝不降级成 base64/echo 之类会泄漏到 argv 的“替代方案”，也绝不显示保存成功。
  * - 没有管理器注入接口（普通浏览器）时进入 demo：数据显式标注为演示，保存失败。
@@ -25,7 +26,11 @@
   var MODULE_ROOT = "/data/adb/modules/" + MODULE_ID;
   var DATA_ROOT = "/data/adb/agentcall";
   var INBOX_DIR = DATA_ROOT + "/inbox";
+  // 旧版固定负载路径：仅作为兼容/清理常量保留，新的保存不再使用它。
   var INBOX_PATH = INBOX_DIR + "/config-set.json";
+  // 每次保存使用唯一负载文件名（同一实例内递增，跨实例由随机 token 区分）。固定路径会
+  // 让两个 WebUI 实例互相覆盖负载（A 的 CLI 读 B 的 payload 仍可能通过 CAS）。
+  var INBOX_FILE_PREFIX = "config-set.";
   var LOG_PATH = DATA_ROOT + "/logs/service.log";
   var MODULE_DIR_PATTERN = /^\/data\/adb\/modules\/[A-Za-z][A-Za-z0-9._-]+$/;
   // restart 是模块侧控制动作：agentcallctl 写重启请求后执行固定 CLI shutdown，
@@ -382,6 +387,14 @@
     var ksu = hasOwn(opts, "ksu") ? opts.ksu : scope.ksu;
     var support = detectSupport({ ksu: ksu });
     var state = { revision: null, logs: [], sequence: 0 };
+    // 每个 WebUI 实例一个随机 token；路径只由常量 + 该 token + 递增序号组成，
+    // 不含任何用户输入，也不进入 argv 之外的任何位置。
+    var instanceToken = Date.now().toString(36) + "-" + (Math.random().toString(36).slice(2, 10) || "0");
+
+    function nextInboxPath() {
+      state.sequence += 1;
+      return INBOX_DIR + "/" + INBOX_FILE_PREFIX + instanceToken + "-" + state.sequence + ".json";
+    }
 
     function recordLog(operation, errno, code) {
       state.logs.push({
@@ -402,11 +415,12 @@
       return support.moduleDir + "/bin/agentcallctl";
     }
 
-    function commandFor(operation) {
+    function commandFor(operation, inboxPath) {
       var control = controlPath();
       if (operation === "config-set") {
-        // 固定字符串：只有固定重定向路径，没有用户数据，也没有任何密钥。
-        return control + " config-set < " + INBOX_PATH;
+        // CLI 契约不变：config-set 只从 stdin 读；重定向路径是本次保存的唯一负载，
+        // 由内部常量 + 随机 token/序号生成，没有用户数据，也没有任何密钥。
+        return control + " config-set < " + inboxPath;
       }
       return control + " " + operation;
     }
@@ -457,7 +471,7 @@
       });
     }
 
-    function writeInbox(text) {
+    function writeInbox(text, inboxPath) {
       var io;
       try {
         io = ksu.io();
@@ -477,14 +491,14 @@
         } catch (error) {
           /* 管理器不支持 chmod 时由 agentcallctl/customize.sh 预创建的 0700 目录兜底 */
         }
-        var target = io.File(INBOX_PATH);
+        var target = io.File(inboxPath);
         if (target.exists() && typeof target.isSymlink === "function" && target.isSymlink()) {
           target.delete();
         } else if (target.exists()) {
           target.delete();
         }
         var output = io.FileOutputStream();
-        var streamId = output.open(INBOX_PATH, false);
+        var streamId = output.open(inboxPath, false);
         if (!streamId) return { ok: false, reason: "open" };
         var written = output.write(streamId, toBase64Utf8(text));
         var flushed = output.flush(streamId);
@@ -493,7 +507,7 @@
         // 纵深防御：临时文件从 0644 收紧到 0000，只有 root（CAP_DAC_OVERRIDE）能读；
         // 目录本身由 agentcallctl 以 0700 创建，未授权进程无法穿越。
         try {
-          var created = io.File(INBOX_PATH);
+          var created = io.File(inboxPath);
           if (created && typeof created.setReadable === "function") {
             created.setReadable(false, false);
             created.setWritable(false, false);
@@ -507,9 +521,9 @@
       }
     }
 
-    function deleteInbox() {
+    function deleteInbox(inboxPath) {
       try {
-        var file = ksu.io().File(INBOX_PATH);
+        var file = ksu.io().File(inboxPath);
         if (file.exists()) file.delete();
       } catch (error) {
         /* 删除失败不改变保存结论 */
@@ -539,16 +553,17 @@
       if (utf8ByteLength(text) > CONFIG_WRITE_LIMIT_BYTES) {
         return reject(CODE.PAYLOAD_INVALID, "配置补丁超过 stdin 上限（" + CONFIG_WRITE_LIMIT_BYTES + " 字节）");
       }
-      var written = writeInbox(text);
+      var inboxPath = nextInboxPath();
+      var written = writeInbox(text, inboxPath);
       if (!written.ok) {
         // 失败路径也可能留下已经创建/部分写入的负载（含密钥），必须在这里删除。
-        deleteInbox();
+        deleteInbox(inboxPath);
         recordLog("config-set", -1, CODE.INBOX_WRITE_FAILED);
         return reject(CODE.INBOX_WRITE_FAILED, errorText(CODE.INBOX_WRITE_FAILED) + "（" + written.reason + "）");
       }
-      return runCommand(commandFor("config-set"))
+      return runCommand(commandFor("config-set", inboxPath))
         .then(function (raw) {
-          deleteInbox();
+          deleteInbox(inboxPath);
           var parsed = parseCliResult(raw);
           recordLog("config-set", raw.errno, parsed.ok ? "ok" : parsed.code);
           if (!parsed.ok) {
@@ -564,7 +579,7 @@
           return { ok: true, source: "bridge", data: parsed.data };
         })
         .then(function (result) {
-          deleteInbox();
+          deleteInbox(inboxPath);
           return result;
         });
     }
