@@ -164,6 +164,20 @@ abstract class PackageRuntimeTask : DefaultTask() {
             throw GradleException(
                 "runtime container is missing required classes: " + missing.joinToString())
         }
+        // app_process 的 PathClassLoader 只从 classpath JAR 根部的 classes.dex 加载类。
+        // 多 dex 时，“这些类存在于容器某个 dex”不等于“能被加载”：必须全部在 classes.dex。
+        if (dexEntries.size > 1) {
+            val primary = dexEntries.getValue("classes.dex")
+            val notInPrimary = REQUIRED_DESCRIPTORS.filter { descriptor ->
+                indexOf(primary, descriptor.toByteArray(Charsets.UTF_8)) < 0
+            }
+            if (notInPrimary.isNotEmpty()) {
+                throw GradleException(
+                    "release APK is multidex (" + dexEntries.keys.joinToString()
+                        + ") but app_process loads only classes.dex; required classes only in"
+                        + " secondary dex: " + notInPrimary.joinToString())
+            }
+        }
 
         val target = containerJar.get().asFile
         target.parentFile.mkdirs()

@@ -514,12 +514,32 @@ class PackagingTests(PackagingFixture):
         self.assert_packaging_fails("not JSON")
 
     def test_required_class_only_in_secondary_dex_fails(self):
+        # The Gradle packaging task refuses this container too (I5): app_process only
+        # loads classes.dex, so certifying required descriptors across *all* dex
+        # entries would green-light a container that cannot start.  The bridge APK
+        # carries the same layout so the manifest/APK check cannot mask the failure.
         classes = all_classes()
-        write_container_with_manifest(self.jar, self.manifest, {
+        layout = {
             "classes.dex": [name for name in classes if name != "kotlin/Unit"],
             "classes2.dex": ["kotlin/Unit"],
-        })
-        self.assert_packaging_fails("classes.dex")
+        }
+        write_bridge_apk(self.bridge_apk, layout)
+        write_container_with_manifest(self.jar, self.manifest, layout, source_apk=self.bridge_apk)
+        self.assert_packaging_fails("app_process only loads classes.dex")
+        self.assert_packaging_fails("kotlin/Unit")
+
+    def test_multidex_container_with_all_required_classes_in_primary_dex_passes(self):
+        # Positive case for the same rule: extra dex entries are fine, missing
+        # required classes from classes.dex are not.
+        layout = {
+            "classes.dex": all_classes(),
+            "classes2.dex": ["fixture/Extra"],
+        }
+        write_bridge_apk(self.bridge_apk, layout)
+        write_container_with_manifest(self.jar, self.manifest, layout, source_apk=self.bridge_apk)
+        self.assertEqual(package.verify_container(self.jar), [])
+        result = self.package()
+        self.assertTrue(result.zip_path.is_file())
 
     def test_missing_kotlin_runtime_fails(self):
         classes = [name for name in all_classes() if name != "kotlin/Unit"]
