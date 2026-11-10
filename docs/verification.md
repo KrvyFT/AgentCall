@@ -1,416 +1,232 @@
-# AgentCall 验证记录
+# AgentCall 最终验证记录
 
-本文件记录实际执行过的检查与真实结果。未执行的项明确标注“未验证”，不由静态阅读代替构建通过。
+本文件记录 AgentCall 在交付提交上的实际执行结果。只写可复现命令与原始结果；
+没有执行的项一律进入「未运行」清单，不用静态阅读或 JVM 测试代替真机结论。
 
 - 记录时间：2026-11-10（Asia/Shanghai）
-- 工作目录：`/home/krvy/Projects/AgentCall`
-- 对应任务：任务 1 — 延续模板，建立 Kotlin 构建与契约
+- 仓库：`/home/krvy/Projects/AgentCall`
+- 分支 / HEAD：`master` / `1ee7277`
+- 远程仓库：`https://github.com/KrvyFT/AgentCall`（public，默认分支 `master`）；文档中不含任何令牌或凭据。
+- 验收执行者：控制器（controller）；本文件在交付时重新读取测试 XML、重跑 `make test` 与
+  `make package-check`，并核对产物哈希、签名与工具链版本。
+- 相关文档：安装与回退见 `docs/install.md`，真机矩阵见 `docs/device-validation.md`。
 
 ## 1. 工具链事实
 
-```console
-$ ./gradlew --version
-
-------------------------------------------------------------
-Gradle 9.6.0
-------------------------------------------------------------
-
-Build time:    2026-06-18 23:19:03 UTC
-Revision:      3f750f03d77e42327c5f9fcb9992110088330a32
-
-Kotlin:        2.3.21
-Groovy:        4.0.32
-Ant:           Apache Ant(TM) version 1.10.17 compiled on April 6 2026
-Launcher JVM:  17.0.21.0.3 (Arch Linux 17.0.21.0.3+1)
-Daemon JVM:    Compatible with Java 25, any vendor, nativeImageCapable=false (from gradle/gradle-daemon-jvm.properties)
-OS:            Linux 7.3.3-x64v3-xanmod1-1 amd64
-```
-
-说明：
-
-- `Kotlin: 2.3.21` 是 Gradle 内置用于构建脚本的 Kotlin 版本，不是 Android 模块的编译器版本。
-- `Daemon JVM: Compatible with Java 25` 来自 `gradle/gradle-daemon-jvm.properties`（`toolchainVersion=25`）。本任务未修改 Wrapper、Daemon 配置或仓库声明。
-- `./gradlew -q javaToolchains` 显示可用 JDK：Arch Linux JDK 17（`/usr/lib/jvm/java-17-openjdk`）、Arch Linux JDK 21、JetBrains JDK 25（`/opt/android-studio/jbr`，Detected by: Current JVM）。
-
-Android 构建事实：
-
 | 项目 | 值 | 依据 |
 | --- | --- | --- |
-| AGP | 9.5.1（内置 Kotlin，未应用 kotlin-android） | `gradle/libs.versions.toml`、`:core` 与 `:app` 的 plugins 块 |
-| compileSdk | 37 | `:app`、`:core` 的 `compileSdk { version = release(37) }` |
-| minSdk | 36 | 同上 `defaultConfig` |
-| Java 源/目标 | VERSION_11 | 两个模块的 `compileOptions` |
-| Kotlin jvmTarget | JVM_11 | 两个模块的 `kotlin { compilerOptions { jvmTarget } }` |
-| Kotlin stdlib（core 运行类路径解析结果） | 2.2.10 | `:core:dependencies --configuration debugRuntimeClasspath` |
+| Gradle | 9.6.0（Wrapper） | `gradle/wrapper/gradle-wrapper.properties`、`./gradlew --version` |
+| Launcher JVM | 17.0.21.0.3（Arch Linux） | `./gradlew --version` |
+| Daemon JVM | `/opt/android-studio/jbr`，Java 25.0.4 | `gradle/gradle-daemon-jvm.properties` 的 `toolchainVersion=25`；`/opt/android-studio/jbr/bin/java -version` |
+| AGP | 9.5.1，内置 Kotlin（未应用 `kotlin-android`） | 模块 plugins 块与构建输出 |
+| compileSdk | 37，platform `android-37.0` | `app/build.gradle.kts`、`bridge/build.gradle.kts`；本机 SDK platforms |
+| targetSdk / minSdk | 37 / 36 | 同上 `defaultConfig` |
+| build-tools | 36.0.0 | 本机 SDK `build-tools/36.0.0`（`aapt2`/`apksigner` 实际使用） |
+| Node | 26.13.0 | `node --version` |
+| Python | 3.14.9 | `python3 --version` |
 
-### 字节码目标验证（不是假设）
+说明：`./gradlew --version` 输出里的 `Kotlin: 2.3.21` 是 Gradle 构建脚本自带的 Kotlin 版本，
+不是 Android 模块的 Kotlin 编译器；模块编译器来自 AGP 9.5.1 内置 Kotlin。
 
-```console
-$ javap -v core/build/intermediates/built_in_kotlinc/debug/compileDebugKotlin/classes/org/krvyft/agentcall/core/model/SessionId.class | grep -m1 'major version'
-  major version: 55
+## 2. 环境与镜像
 
-$ javap -v app/build/intermediates/built_in_kotlinc/debugUnitTest/compileDebugUnitTestKotlin/classes/org/krvyft/agentcall/ExampleUnitTest.class | grep -m1 'major version'
-  major version: 55
+- 本机对 `DL.google.com` 与 `foojay` 的 TLS 访问被阻断，直接走官方仓库不可用。
+- 因此使用**机器级** `~/.gradle/init.d` 镜像配置；该文件不属于仓库，仓库内没有镜像地址、
+  凭据或令牌。构建可复现性依赖这台机器的该配置，换机需自行准备等价镜像。
+- 所有 Gradle 调用按仓库约定串行化：`flock /tmp/agentcall-gradle.lock ./gradlew ...`，
+  避免并发争抢 daemon 与 build 目录。
+- 交付时 `adb devices` 为空；没有设备参与本次最终验收。
+
+## 3. 最终验收矩阵
+
+在 HEAD `1ee7277` 上由控制器执行：
+
+```sh
+flock /tmp/agentcall-gradle.lock ./gradlew \
+  :core:testDebugUnitTest :bridge:testDebugUnitTest :app:testDebugUnitTest \
+  :app:lintDebug :app:assembleRelease :bridge:packageRuntime --rerun-tasks
 ```
 
-major version 55 = Java 11 字节码，与 `compileOptions` 的 `VERSION_11` 一致。`:app` 当前没有主源码 Kotlin，因此用其单元测试编译产物验证 jvmTarget 生效。
+结果：`BUILD SUCCESSFUL`，**225 个 actionable task 实际执行**（`--rerun-tasks`，没有复用旧结果）。
 
-## 2. 依赖版本（固定，无动态版本）
+| 验证面 | 实际结果 |
+| --- | --- |
+| `:core:testDebugUnitTest` | 125 tests，0 failures / 0 errors / 0 skipped |
+| `:bridge:testDebugUnitTest` | 283 tests，0 failures / 0 errors / 0 skipped |
+| `:app:testDebugUnitTest` | 323 tests，0 failures / 0 errors / 0 skipped |
+| 合计 JVM | **731 tests，全部通过** |
+| `:app:lintDebug` | SUCCESSFUL；0 errors，14 warnings（明细见 4.2） |
+| `:app:assembleRelease` | SUCCESSFUL |
+| `:bridge:packageRuntime` | SUCCESSFUL |
+| `make test` | PASS（JVM + WebUI node + Python 打包测试 + shell 语法） |
+| `make build` | PASS（release APK + bridge 运行时容器 + `dist/` 打包） |
+| `make package-check` | PASS（结构 / DEX manifest / 版本 / 签名 / 密钥泄漏 / SHA-256） |
 
-版本目录 `gradle/libs.versions.toml` 新增/使用的固定版本：
+## 4. 分项证据
 
-| alias | 坐标 | 版本 | 模块内是否已使用 |
-| --- | --- | --- | --- |
-| `libs.plugins.android.library` | `com.android.library` | 9.5.1（与 android-application 同一 agp） | `:core` |
-| `libs.kotlinx.coroutines.core` | `org.jetbrains.kotlinx:kotlinx-coroutines-core` | 1.9.0 | `:core` `api`（`AudioSession.downlink: Flow` 是公开契约，消费方需看到同一份协程类型） |
-| `libs.kotlinx.coroutines.test` | `kotlinx-coroutines-test` | 1.9.0 | 否（任务 2 起的虚拟时间测试用） |
-| `libs.libphonenumber` | `com.googlecode.libphonenumber:libphonenumber` | 9.0.43 | 否（任务 2 号码规范化） |
-| `libs.gson` | `com.google.code.gson:gson` | 2.11.0 | 是（任务 3：`:core` 协议/配置编码，`:bridge` 声明同一版本） |
-| `libs.okhttp` | `com.squareup.okhttp3:okhttp` | 4.12.0 | 否（任务 6 才加 usage） |
-| `libs.okhttp.mockwebserver` | `com.squareup.okhttp3:mockwebserver` | 4.12.0 | 否（任务 6 测试） |
+### 4.1 JVM 单元测试
 
-修复轮补充：`:core` 的协程依赖由 `implementation` 改为 `api`。`./gradlew :app:dependencies --configuration debugCompileClasspath` 输出中 `project ':core'` 下直接包含 `org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0`，证明消费方（app，以及后续 bridge）的编译类路径可见该类型；修复前它只出现在运行类路径。
+测试计数不是抄报告，而是交付时从 JUnit XML 重新汇总
+（`*/build/test-results/testDebugUnitTest/TEST-*.xml`，由上述矩阵生成）：
 
-选取依据：
+| 模块 | 测试类 XML 数 | tests | failures | errors | skipped |
+| --- | --- | --- | --- | --- | --- |
+| `:core` | 7 | 125 | 0 | 0 | 0 |
+| `:bridge` | 44 | 283 | 0 | 0 | 0 |
+| `:app` | 26 | 323 | 0 | 0 | 0 |
+| 合计 | 77 | **731** | 0 | 0 | 0 |
 
-- libphonenumber：`~/.gradle/caches/modules-2/files-2.1/com.googlecode.libphonenumber/libphonenumber` 中只有 9.0.43，故固定为 9.0.43，并在下面实测可解析。
-- gson：2.11.0 已在本地缓存，按控制器决定优先 2.11.0。
-- coroutines：1.9.0 已在本地缓存，按控制器决定优先 1.9.0。
+这些是宿主 JVM 上的逻辑测试，**不能**代替任何真机结论（见第 5 节）。
 
-### 真实解析结果
+### 4.2 Lint
 
-`:core` 实际运行类路径（`./gradlew :core:dependencies --configuration debugRuntimeClasspath`）：
+`:app:lintDebug` 通过，报告末行为 `0 errors, 14 warnings`：
 
-```text
-+--- org.jetbrains.kotlin:kotlin-stdlib:2.2.10
-\--- org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0
-     \--- org.jetbrains.kotlinx:kotlinx-coroutines-core-jvm:1.9.0
-          +--- org.jetbrains.kotlinx:kotlinx-coroutines-bom:1.9.0
-          \--- org.jetbrains.kotlin:kotlin-stdlib:2.0.0 -> 2.2.10
-```
+- 13 条是既有告警：`PrivateApi`（`ServiceDiscovery` 反射访问 `ActivityThread`）、
+  `QueryPermissionsNeeded`（同文件），以及依赖/Gradle/AGP 版本提示（`GradleDependency` 5、
+  `NewerVersionAvailable` 5、`AndroidGradlePluginVersion` 1）。
+- 第 14 条是 `UseKtx`（`AgentCallService` 的 `SharedPreferences.edit` 提示），来自后续新增的服务代码。
 
-版本目录中尚未被任何模块引用的坐标，用与工程相同仓库声明（`google()` + `mavenCentral()` + 机器级镜像 init 脚本）的临时探针工程解析，确认可获取：
+验收摘要曾把既有告警记为 13 条；lint 报告的完整计数是 14 条，差异就是这条 `UseKtx`。
+14 条全部是 warning，没有 error，不阻塞本次验收。
 
-```console
-$ ./gradlew -p /tmp/agentcall-depcheck resolveDeps --no-configuration-cache
-> Task :resolveDeps
-RESOLVED gson-2.11.0.jar
-RESOLVED libphonenumber-9.0.43.jar
-RESOLVED mockwebserver-4.12.0.jar
-RESOLVED okhttp-4.12.0.jar
-RESOLVED error_prone_annotations-2.27.0.jar
-RESOLVED kotlinx-coroutines-test-jvm-1.9.0.jar
-RESOLVED okio-jvm-3.6.0.jar
-RESOLVED kotlinx-coroutines-core-jvm-1.9.0.jar
-RESOLVED kotlin-stdlib-jdk7-1.9.10.jar
-RESOLVED kotlin-stdlib-2.0.0.jar
-RESOLVED kotlin-stdlib-jdk8-1.9.10.jar
-RESOLVED junit-4.13.2.jar
-RESOLVED annotations-23.0.0.jar
-RESOLVED hamcrest-core-1.3.jar
+### 4.3 构建与运行时容器
 
-BUILD SUCCESSFUL in 19s
-```
+- `:app:assembleRelease`：SUCCESSFUL，产出 `app/build/outputs/apk/release/app-release-unsigned.apk`。
+- `:bridge:packageRuntime`：SUCCESSFUL，从 bridge release APK 收集 dex 并生成运行时容器与
+  `bridge/agentcall-bridge.dex-manifest.json`。
+- `make build`：PASS，随后由 `tools/package.py` 完成签名、确定性模块 ZIP 与 `SHA256SUMS`。
 
-探针工程是 `/tmp` 下的一次性验证目录，不进入仓库；其 `kotlin-stdlib 2.0.0` 只是该探针的传递解析结果，实际 `:core` 由 AGP 内置 Kotlin 升为 2.2.10（见上）。
+### 4.4 脚本与 WebUI
 
-## 3. 命令与结果
+交付时重跑 `make test` 通过（退出码 0）：
 
-### 3.1 改动前基线
+- JVM 单测：同上 731 项。
+- WebUI node 测试：`node --test module/webroot/tests/*.test.mjs`，79 tests / 79 pass / 0 fail / 0 skipped。
+- Python 打包测试：`python3 -m unittest discover -s tools/tests -v`，52 tests，OK；`py_compile` 通过。
+- 模块脚本语法：`sh -n` 检查 `customize.sh`、`service.sh`、`uninstall.sh`、`bin/agentcallctl`。
+- `make package-check` 重跑：`Status: PASS`（结构、版本、签名、SHA-256 见 4.5）。
 
-```console
-$ ./gradlew :app:assembleDebug :app:testDebugUnitTest
-...
-BUILD SUCCESSFUL in 730ms
-39 actionable tasks: 39 up-to-date
-Configuration cache entry reused.
-```
+### 4.5 产物、哈希与签名
 
-说明：该次运行复用控制器先前已生成的构建产物（全部 UP-TO-DATE），只证明模板基线可构建可测，不构成功能证明；`:app` 当时 `compileDebugKotlin` 为 `NO-SOURCE`（无主源码 Kotlin），只有模板 `ExampleUnitTest`（2+2）在跑。
+`dist/` 已被 `.gitignore` 忽略，不提交；本次交付产物：
 
-### 3.2 TDD 红灯（契约测试先失败）
-
-```console
-$ ./gradlew :core:testDebugUnitTest --tests '*ContractTest'
-> Task :core:compileDebugUnitTestKotlin FAILED
-e: .../ContractTest.kt:76:45 Unresolved reference 'PeerRole'.
-e: .../ContractTest.kt:101:13 Unresolved reference 'SessionState'.
-e: .../ContractTest.kt:107:22 Unresolved reference 'AgentConfig'.
-e: .../ContractTest.kt:125:22 Unresolved reference 'AudioFormatSpec'.
-e: .../ContractTest.kt:130:13 Unresolved reference 'PcmChunk'.
-e: .../ContractTest.kt:145:26 Unresolved reference 'SessionEvent'.
-...
-FAILURE: Build failed with an exception.
-* What went wrong:
-Execution failed for task ':core:compileDebugUnitTestKotlin' (registered by plugin 'com.android.internal.library').
-> A failure occurred while executing ... GradleKotlinCompilerWorkAction
-   > Compilation error. See log for more details
-BUILD FAILED in 10s
-```
-
-失败原因符合预期：契约类型尚不存在，编译失败即“缺少类型时的红灯”。（首轮输出省略号处是同一批 `Unresolved reference`，退出码 1。）
-
-### 3.3 TDD 绿灯
-
-补齐 `C/model` 与 `C/port` 后：
-
-```console
-$ ./gradlew :core:testDebugUnitTest --tests '*ContractTest'
-> Task :core:testDebugUnitTest
-
-BUILD SUCCESSFUL in 1s
-```
-
-补齐契约后曾出现一次测试自身调用缺参（`snapshot(number = null)` 未传必填的 `processEpoch`/`callId`），修正该测试笔误后即通过；那次失败属于测试写法问题，不是契约实现缺失，未计入红灯证据。
-
-测试报告 `core/build/test-results/testDebugUnitTest/TEST-org.krvyft.agentcall.core.model.ContractTest.xml`：
-
-```text
-tests= 11 failures= 0 errors= 0 skipped= 0
-- sameNumberDifferentCallIdsAreDistinctSessions
-- sameCallIdInAnotherProcessEpochIsDistinctSession
-- snapshotCarriesTelecomFacts
-- secretUpdateKeepAndClearAreDistinct
-- protocolVersionDefaultsToOne
-- peerRolesCoverThreeDevices
-- stateChangedEventCarriesTheCallSnapshot
-- sessionStatesFollowSpecPath
-- agentConfigDefaultsKeepAutomationOff
-- pcmContractsDeclarePcm16AndCompareByContent
-- sealTypesExposeTheDocumentedEvents
-```
-
-### 3.4 app 引用 core
-
-```console
-$ ./gradlew :app:assembleDebug :core:testDebugUnitTest
-...
-> Task :app:mergeLibDexDebug
-> Task :app:packageDebug
-> Task :app:assembleDebug
-> Task :core:testDebugUnitTest
-
-BUILD SUCCESSFUL in 17s
-57 actionable tasks: 42 executed, 15 up-to-date
-```
-
-额外确认 `:core` 实际进入 APK（不是只加依赖声明）：
-
-```console
-$ unzip -p app/build/outputs/apk/debug/app-debug.apk classes2.dex | strings | grep -m3 'agentcall/core/model'
-/()Lorg/krvyft/agentcall/core/model/AgentConfig;
-/()Lorg/krvyft/agentcall/core/model/ApiEndpoint;
-3()Lorg/krvyft/agentcall/core/model/AudioFormatSpec;
-```
-
-### 3.5 提交前完整验证
-
-按要求执行一次完整命令（结果通过，但 `:core:testDebugUnitTest` 因缓存为 UP-TO-DATE）：
-
-```console
-$ ./gradlew :app:assembleDebug :app:testDebugUnitTest :core:testDebugUnitTest
-...
-> Task :app:testDebugUnitTest
-> Task :core:testDebugUnitTest
-
-BUILD SUCCESSFUL in 946ms
-64 actionable tasks: 6 executed, 58 up-to-date
-Configuration cache entry reused.
-GRADLE_EXIT:0
-```
-
-为避免“UP-TO-DATE 不等于测试真的跑过”，再强制执行全部任务：
-
-```console
-$ ./gradlew :app:assembleDebug :app:testDebugUnitTest :core:testDebugUnitTest --rerun-tasks
-...
-> Task :app:packageDebug
-> Task :app:assembleDebug
-> Task :core:testDebugUnitTest
-> Task :app:testDebugUnitTest
-
-BUILD SUCCESSFUL in 2s
-64 actionable tasks: 64 executed
-Configuration cache entry reused.
-GRADLE_EXIT:0
-```
-
-强制重跑后的报告：`:app` `ExampleUnitTest` tests=1 failures=0；`:core` `ContractTest` tests=11 failures=0。
-
-`:app` 的 `ExampleUnitTest`（2+2）通过，但按计划不计入功能证明；功能证明是 `:core` 的 ContractTest。
-
-## 4. 验证了与未验证的边界
-
-已验证（本机、宿主 JVM）：
-
-- Gradle 9.6.0 / Launcher JVM 17 / Daemon 需要 Java 25 的实际输出。
-- `:core` Android library 与 `:app` 在 AGP 9.5.1 内置 Kotlin 下可配置、可编译、可打包，`:core` 类进入 APK dex。
-- Kotlin 字节码目标为 Java 11（major version 55），app 与 core 一致。
-- 版本目录中全部新坐标均可从本机镜像解析（含未被模块引用的 gson/libphonenumber/coroutines-test/okhttp/mockwebserver）。
-- ContractTest 11 项断言通过：会话身份不含号码、进程代次、SecretUpdate 三态、协议版本 1、事件携带通话快照、PCM16 单声道与内容相等、默认配置关闭自动接管。
-
-未验证 / 有意不做：
-
-- 无真机：没有任何仪器测试或真实通话、音频、Hook、KernelSU 验证；本任务也不产生这些行为。
-- 未运行 `assembleRelease` 与设备安装；任务 1 的收尾命令不含它们。
-- 未验证 okhttp/mockwebserver 在模块中的实际使用：按控制器决定只固定版本目录，任务 6 才有 usage。
-- 未添加 Xposed 仓库：本任务不引入 Xposed 依赖，按“不添加未使用配置/不新增工程级仓库”的约束，留到任务 4 引入 `compileOnly` 时再于 `settings.gradle.kts` 以精确 group 允许；任务 4 的 Modify 列表未列出 `settings.gradle.kts`，届时需要一并处理（见任务 1 报告“问题/风险”）。
-- 镜像可达性依赖机器级 `~/.gradle/init.d/agentcall-mirrors.gradle.kts`；本任务未修改该文件，也未新增工程级仓库。
-
-## 5. 任务 3 — 特权运行容器、IPC、配置与诊断（2026-11-10）
-
-本任务新增 `:bridge`（Android application，仅作 DEX 容器）与 `:core:protocol`，并记录实际执行结果。
-无测试设备：所有真机凭据/SELinux/app_process 行为都未验证，不给设备结论。
-
-### 5.1 模块事实
-
-| 项目 | 值 | 依据 |
+| 文件 | 大小 | SHA-256 |
 | --- | --- | --- |
-| `:bridge` 插件 | `com.android.application`（AGP 9.5.1，内置 Kotlin） | `bridge/build.gradle.kts` |
-| namespace / applicationId | `org.krvyft.agentcall.bridge` | 同上 |
-| compileSdk / targetSdk / minSdk | 37 / 37 / 36 | 同上 |
-| Java / Kotlin 目标 | VERSION_11 / JVM_11 | 同上 |
-| 组件 | 无 Launcher Activity、无 exported 组件 | 合并后 manifest 只有 `<application android:allowBackup="false">` |
-| 依赖 | `implementation(project(":core"))`、`implementation(libs.gson)` | 版本目录中 gson 仍为 2.11.0，无新增坐标 |
-| settings | 增加 `include(":bridge")` | `settings.gradle.kts` |
-| keep 规则 | `BridgeMain`/`AgentCallCli` 的 main 与类名；`bridge.**` 中带 main 的入口 | `bridge/src/main/keepRules/rules.keep` |
+| `dist/agentcall-1.0.zip` | 1,362,660 B | `a1ff82fd5cf87f4e70d824ac6740a3f714ec1bb735a933e1473c5e84ece02f67` |
+| `dist/agentcall-1.0.apk` | 6,435,668 B | `cf479056686b262f9f2c005e43e53fad56f9364b24d048d71580122915942003` |
+| `dist/SHA256SUMS` | 168 B | 两行，分别匹配上面两个摘要 |
 
-`:bridge:assembleDebug` 首次构建（只建模块、尚无 Kotlin 源码）：
+模块 ZIP 共 **11 个条目**（`bin/agentcallctl`、`bridge/agentcall-bridge.jar`、
+`bridge/agentcall-bridge.dex-manifest.json`、`customize.sh`、`module.prop`、`service.sh`、
+`uninstall.sh`、`webroot/` 4 个静态资源），含 dex manifest，不含 `webroot/tests/`、私钥或令牌。
 
-```console
-$ ./gradlew :bridge:assembleDebug
-...
-> Task :bridge:packageDebug
-> Task :bridge:assembleDebug
+**签名（重要）**：APK 由本机 debug keystore 签名，证书
+`CN=Android Debug`，SHA-256
+`3974a6d9dc587fe200107ff1c90b5ff20b0bcf4edcfb61dc030e9c6d2cd81085`。
+这是 **debug 签名，不是发布密钥，不可分发**。正式分发前必须用发布密钥重签，并在重签后
+重新生成 `SHA256SUMS`（重签会改变 APK 摘要）；步骤见 `docs/install.md` 第 1 节。
+检查器只如实报告签名者，不会把 debug 证书猜成发布证书。
 
-BUILD SUCCESSFUL in 2s
-50 actionable tasks: 32 executed, 18 up-to-date
-GRADLE_EXIT=0
+### 4.6 版本与打包结构
+
+- **版本单一来源**是 `:app` 的 `versionName/versionCode`：`1.0` / `1`。
+- `:bridge` 在构建时从 `:app` 的 `defaultConfig` 派生 `BuildConfig.VERSION_NAME`
+  （`BridgeInfo.VERSION`），不另写一份版本号。
+- 运行时容器携带 **dex manifest（schema 2）**：记录每个 dex 的 name/SHA-256/size、
+  来源 bridge APK 摘要与 `bridgeVersion`；本次容器内为 `classes.dex`
+  （sha256 `b72391c09b24e05be396fe2aa6b144f943164601bf76989959ef206dcb3c5401`）。
+- 模块 `module.prop` 为 `1.0` / `1`，与 APK 版本一致；不一致时打包直接失败。
+- DEX 覆盖只用容器 manifest 校验，不用 app APK（两者是不同产物）。
+
+## 5. 本地已验证 / 设备未验证 / 阻塞项
+
+### 5.1 本地已验证（宿主环境）
+
+- 最终验收矩阵：225 个任务执行，BUILD SUCCESSFUL。
+- JVM 单测：core 125 / bridge 283 / app 323，合计 731，0 failures / 0 errors / 0 skipped。
+- Lint：`:app:lintDebug` SUCCESSFUL，0 errors、14 warnings（全部 warning）。
+- Release APK 与 bridge 运行时容器均构建成功。
+- `make test` PASS：JVM + WebUI node（79）+ Python（52）+ 4 个模块脚本语法。
+- `make build` PASS；`make package-check` PASS。
+- 产物结构、版本一致性、DEX manifest 覆盖、debug 签名类型、密钥泄漏检查与 SHA-256 均已核对。
+- 容器 manifest 的版本、每个 dex 的哈希与大小、来源 APK 摘要已核对。
+
+### 5.2 设备未验证（没有任何一行在真机上执行）
+
+1. LSPosed/Vector 是否加载模块。
+2. Google 电话 `InCallService` 的真实发现与回调。
+3. Telecom 主线程行为。
+4. 隐藏音频 API 是否可见可用，以及 HAL 行为。
+5. `AudioRecord` / `AudioTrack` 播放头（playback head）。
+6. 麦克风隔离的读回验证。
+7. 两条传输上的 `LocalSocket` 对端凭据（peer credentials）。
+8. `app_process` 的 bridge/audio-worker 启动与 `service.sh` 重启。
+9. KernelSU WebView 的 `ksu.io` 路径与卸载时序。
+10. FGS / 通知 / 锁屏 / 重启 / 进程死亡。
+11. 真实付费 API 请求。
+12. 重采样（resampler）的真实音频。
+
+### 5.3 阻塞项（保持失败关闭，不伪造）
+
+1. **校准证据写入通道缺失（端到端）**：APK 校准页只能写自身
+   SharedPreferences；bridge 的 `CalibrationStore` 没有读/写 RPC，固定 CLI 命令表也没有校准
+   写操作。因此没有任何客户端能写入「五项人工测试」事实。生产就绪**有意保持
+   NOT_READY（`calibration_not_verified`）**，自动接听在真机上无法被启用，直到出现可验证的
+   运营者写入路径。必须继续 fail closed，不能在本机记录层面伪造授权。
+2. **APK 只有 debug 签名**：不可分发；需发布密钥重签并重生成 `SHA256SUMS`。
+3. **交付时没有连接设备**：`adb devices` 为空。此前实现期间曾只读观察到一台
+   XQ-DQ72（API 37），但 `adb shell` 是 uid 2000，`su` 不可用，所以**没有在设备上运行
+   任何东西**；现在设备也已不在线。
+4. 因此没有仪器测试、模块安装、Hook 加载、真实音频/通话或付费请求证据；
+   `docs/device-validation.md` 的 D01–D12 全部仍为「未验证」。
+
+## 6. 回合预算裁决（必须保留）
+
+- **45 秒上限覆盖 ASR / LLM / TTS 的生成阶段**，不覆盖音频播放
+  （`ApiTransport.TURN_TIMEOUT_MS = 45_000`）。
+- 音频播放有**自己的有界等待**：名义 PCM 时长 + **15 秒宽限**
+  （`ConversationEngine.PLAYBACK_GRACE_MS = 15_000`），并且可被取消立即中断。
+- spec/plan 文本仍写「整个回合 45 秒」。交付文档在此明确裁决：播放**不**计入这 45 秒。
+  后续维护者不得把播放静默塞回回合预算，否则长 TTS 会被误判超时。
+
+## 7. 重新配对语义
+
+配对记录绑定 **uid + 签名 SHA-256 + versionName**。任一项变化都必须重新配对：
+
+- APK 升级 → `versionName` 变化 → `peer_version_mismatch`；
+- Google 电话升级 → `versionName` 变化 → `peer_version_mismatch`；
+- APK 卸载重装 → uid 变化 → `peer_uid_mismatch`。
+
+WebUI 在保存/读取失败时显示「配对已失效」横幅，并给出「重新配对」入口
+（经固定 `agentcallctl pair` 执行，首次配对仍只能用 root CLI）。重新配对不是可选的
+排障步骤，而是升级后的必要条件。
+
+## 8. 没有运行的项目
+
+- 没有运行任何仪器测试（instrumented tests）；没有在设备上安装 APK 或 KernelSU 模块。
+- 没有加载 LSPosed/Vector，也没有触发 Google 电话 Hook。
+- 没有真实来电、真实音频、麦克风隔离、重采样或对端听音验证。
+- 没有安装/卸载 KernelSU 模块，未验证 WebView、`service.sh` 重启或卸载时序。
+- 没有锁屏、Doze、重启、通知、进程死亡或 FGS 行为验证。
+- 没有发起任何真实付费 API 请求（ASR/LLM/TTS）。
+- 没有写入任何校准证据；没有启用自动接听。
+- 没有用发布密钥重签 APK。
+- 没有重跑完整验收矩阵之外的设备检查；本文件中的矩阵结果来自控制器在 HEAD `1ee7277` 的执行。
+
+## 9. 复现入口
+
+```sh
+# 单一 Gradle 验收命令（串行化）
+flock /tmp/agentcall-gradle.lock ./gradlew \
+  :core:testDebugUnitTest :bridge:testDebugUnitTest :app:testDebugUnitTest \
+  :app:lintDebug :app:assembleRelease :bridge:packageRuntime --rerun-tasks
+
+# 统一入口
+make test            # JVM + WebUI node + Python + shell 语法
+make build           # release APK + bridge 运行时容器 + dist 打包
+make package-check   # 结构 / DEX / 版本 / 签名 / 密钥泄漏 / SHA-256
 ```
 
-### 5.2 TDD 红灯（先写测试，实现尚不存在）
-
-`hookCannotReadSecrets`、`claimedUidIsIgnored` 在 `CT/protocol/RolePolicyTest.kt`；
-`truncatedFrameRejected`、`oversizedFrameRejected` 在 `CT/protocol/RpcCodecTest.kt`；
-`staleRevisionDoesNotOverwrite` 在 `BT/config/ConfigStoreTest.kt`。
-
-```console
-$ ./gradlew :core:testDebugUnitTest --tests '*protocol*'
-> Task :core:compileDebugUnitTestKotlin FAILED
-e: .../RpcCodecTest.kt:345:48 Unresolved reference 'patch'.
-e: .../RpcCodecTest.kt:358:13 Unresolved reference 'RpcCodec'.
-...
-BUILD FAILED in 761ms
-GRADLE_EXIT=1
-
-$ ./gradlew :bridge:testDebugUnitTest
-> Task :bridge:compileDebugUnitTestKotlin FAILED
-e: .../ConfigStoreTest.kt:192:29 Unresolved reference 'ConfigStore'.
-e: .../ConfigStoreTest.kt:200:37 Unresolved reference 'ConfigStore'.
-e: .../ConfigStoreTest.kt:226:22 Unresolved reference 'ConfigErrorCode'.
-e: .../ConfigStoreTest.kt:257:22 Unresolved reference 'PairingRecord'.
-...
-BUILD FAILED in 673ms
-GRADLE_EXIT=1
-```
-
-失败预期：测试先于实现提交，Kotlin 在编译期找不到被测类型（与任务 1/2 的判定方式一致）。
-同一编译单元中的 `hookCannotReadSecrets`/`claimedUidIsIgnored` 也因 `RolePolicy` 未实现而失败。
-
-### 5.3 TDD 绿灯与最终验证
-
-```console
-$ ./gradlew :core:testDebugUnitTest :bridge:testDebugUnitTest :bridge:assembleDebug :app:assembleDebug --rerun-tasks
-...
-> Task :app:assembleDebug
-> Task :bridge:assembleDebug
-> Task :core:testDebugUnitTest
-> Task :bridge:testDebugUnitTest
-
-BUILD SUCCESSFUL in 3s
-98 actionable tasks: 98 executed
-GRADLE_EXIT:0
-```
-
-测试报告（`--rerun-tasks` 后）：
-
-| 测试类 | tests | skipped | failures | errors |
-| --- | --- | --- | --- | --- |
-| `core.model.ContractTest`（任务 1 回归） | 14 | 0 | 0 | 0 |
-| `core.rules.RuleMatcherTest`（任务 2 回归） | 21 | 0 | 0 | 0 |
-| `core.session.LeaseRegistryTest`（任务 2 回归） | 8 | 0 | 0 | 0 |
-| `core.session.SessionReducerTest`（任务 2 回归） | 34 | 0 | 0 | 0 |
-| `core.protocol.RpcCodecTest` | 16 | 0 | 0 | 0 |
-| `core.protocol.RolePolicyTest` | 8 | 0 | 0 | 0 |
-| `bridge.AgentCallCliTest` | 2 | 0 | 0 | 0 |
-| `bridge.ConfigRootTest` | 5 | 0 | 0 | 0 |
-| `bridge.config.ConfigStoreTest` | 11 | 0 | 0 | 0 |
-| `bridge.config.FilePermissionsTest` | 4 | 0 | 0 | 0 |
-| `bridge.ipc.ConnectionLanesTest` | 3 | 0 | 0 | 0 |
-| `bridge.ipc.PeerVerifierTest` | 12 | 0 | 0 | 0 |
-
-仪器测试只编译、未执行（本机无设备）：
-
-```console
-$ ./gradlew :bridge:assembleDebugAndroidTest
-BUILD SUCCESSFUL
-```
-
-失败路径覆盖（JVM）：64 KiB 帧上限与截断/非正长度（读取正文前失败）、请求 ID/方法/版本/会话校验、
-响应 payload 与 error 互斥、HOOK 无法读取配置与密钥、消息自称 uid/role 不提权、角色与内核 uid 一致性、
-CAS 冲突不改旧配置、空密钥拒绝、损坏/未来 schema 失败关闭、密钥 Keep/Replace/Clear、脱敏导出不含密钥、
-端点空值归一化为 null、0700/0600 权限与无临时文件残留、schema 迁移先备份。
-
-修复轮（task 3 fix 1）新增的 JVM 覆盖：
-
-- `PeerVerifierTest`（12 项，fake `PackageIdentitySource`）：uid 0 → CLI_ROOT；未配对、未知 uid、
-  uid 拥有的包与配对包不符、签名缺失/不符、配对后版本变化、配对记录里的 uid 被其他 uid 冒用
-  全部拒绝；已配对 APP/Google 电话分别得到 APP/HOOK，身份 uid 只来自内核凭据；签名大小写不敏感；
-  版本名缺失（UNKNOWN）与配对记录一致时不误拒。
-- `ConnectionLanesTest`（3 项）：两条 PCM 长连接占满 PCM lane 时控制请求仍在 2 s 内被服务；
-  PCM 第三条连接有界失败且不消耗控制槽位；关闭后提交立即有界失败。
-- `FilePermissionsTest`（4 项）：非 POSIX 回退返回 false 时 `config_storage_failed` 失败关闭；
-  回退成功时不报错；回退实现真实得到 0600/0700；注入权限执行器失败时 ConfigStore 构造失败关闭。
-- `ConfigRootTest`（5 项）：生产入口只接受 `/data/adb/agentcall` 及其规范化子目录；
-  任意临时目录、同前缀兄弟目录、`..` 越界路径都以 `config_root_rejected` 拒绝且不创建目录。
-- `AgentCallCliTest`（2 项）：响应请求 ID 与请求不一致时客户端拒绝（`response_id_mismatch`，
-  不打印负载）；一致时正常输出。
-- `ConfigStoreTest` 新增：schema 1.5 / -0.5 / -1 显式 `config_corrupt`（不截断、不迁移），
-  schema 1.0 按整数接受且不触发迁移；旧配对文件缺 uid 时 `config_corrupt`（重新配对，不降级信任）。
-
-### 5.4 DEX 与公开签名证据
-
-```console
-$ unzip -l bridge/build/outputs/apk/debug/bridge-debug.apk | grep classes
-  classes.dex ... classes10.dex           （10 个 dex，含 Kotlin/Gson/core）
-
-$ grep -l -a -F 'Lorg/krvyft/agentcall/bridge/BridgeMain;' /tmp/bridge-dex/classes*.dex
-/tmp/bridge-dex/classes6.dex
-$ grep -l -a -F 'Lorg/krvyft/agentcall/bridge/AgentCallCli;' /tmp/bridge-dex/classes*.dex
-/tmp/bridge-dex/classes6.dex
-$ grep -l -a -F 'Lorg/krvyft/agentcall/core/model/PeerIdentity;' /tmp/bridge-dex/classes*.dex
-/tmp/bridge-dex/classes2.dex ... classes7.dex
-$ grep -l -a -F 'Lcom/google/gson/Gson;' /tmp/bridge-dex/classes*.dex
-/tmp/bridge-dex/classes.dex
-```
-
-`javap` 检查 `C/protocol` 公开签名：只出现共享契约、JDK 与 sealed 结果类型，没有 Gson 类型。
-
-### 5.5 未验证 / 阻塞（不得当作设备结论）
-
-- `BridgeMain` 在 app_process 中的真实启动、`activityThread.systemMain()` 获取 PackageManager 的反射路径：
-  未验证；获取失败时实现选择退出（`package_manager_unavailable`），不降级信任。
-- `LocalSocket#getPeerCredentials` 返回真实 uid/pid、不同 UID 被拒绝、SELinux 可达性：
-  仅写了 `BI/ipc/PeerCredentialsTest.kt`，本机无设备未执行。
-- 配对记录保存配对时从 PackageManager 解析的包名、uid、签名与 AgentCall/Google 电话版本名；
-  连接期四者都复核（uid 不匹配 `peer_uid_mismatch`，版本变化 `peer_version_mismatch`，必须重新配对）。
-  旧配对文件缺 uid/版本按 `config_corrupt` 处理。上述 JVM 判定由 fake PackageIdentitySource 覆盖，
-  真机上 PackageManager 的 uid/版本解析与重新配对流程未验证。
-- 配对与 CLI 在真机上的 root 身份、WebView 桥（任务 8）未验证。
-- PCM 通道已实现独立 bind/限长/凭据校验，并有独立执行器与连接上限
-  （`ConnectionLanes`，控制 lane 不会被 PCM 流饿死）；本任务没有音频生产者，`:bridge` 运行容器
-  未注入 sink，真正音频接入属任务 5。真实 socket 下的并发行为仍未在设备上验证。
-- 生产入口 `BridgeMain` 的配置根限制（只允许 `/data/adb/agentcall` 及其子目录）由
-  `ConfigRootTest` 覆盖；测试注入临时目录走 `ConfigStore` 构造参数（文档化 test-only 门），
-  生产路径没有 argv 可触发的测试开关。真机 app_process 启动未验证。
-- 未运行 `:bridge:assembleRelease` 的收缩验证（任务 9 负责真实 DEX 容器与 keep 规则检查）。
+产物会被 `dist/` 接收（不提交）。安装、配对、重签与卸载见 `docs/install.md`；
+真机矩阵与翻绿证据要求见 `docs/device-validation.md`。

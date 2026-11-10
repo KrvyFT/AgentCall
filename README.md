@@ -4,8 +4,12 @@ AgentCall 在不替换 Google 电话（`com.google.android.dialer`）的前提�
 Xposed Hook 观察来电与通话状态，AgentCall APK 完成远程 ASR / LLM / TTS 语音回合，KernelSU 模块里的
 `app_process` 特权桥执行 Telecom 控制、音频注入、root 侧配置与中文 WebUI。
 
-> **状态：可构建、可打包，不等于可用。** 当前仓库没有任何真机通话、音频、人工接管或故障终止证据；
-> APK 的配对 / 校准 / 诊断界面尚未实现。设备验收（spec §12）全部待做，见「状态与边界」。
+> **状态：本地构建与最终验收矩阵通过，不等于可用。** 在 HEAD `1ee7277` 上，225 个任务的
+> 验收矩阵全部通过：JVM 单测 core 125 / bridge 283 / app 323（0 失败），lint 0 error，
+> release APK 与模块 ZIP 已打包。但**没有真机证据**：交付时未连接设备；配对（WebUI/root CLI）
+> 与 APK 的校准 / 诊断界面已实现，校准证据却无法端到端写入桥接，因此生产就绪仍为 `NOT_READY`
+> （`calibration_not_verified`）。设备验收（spec §12）全部待做，见「状态与边界」与
+> `docs/verification.md`。
 
 ## 架构
 
@@ -24,7 +28,7 @@ KernelSU 模块 / root 特权桥 (app_process，uid 0)
         ▲
         │ 本地 socket + 配对
 AgentCall APK (org.krvyft.agentcall, 普通应用 uid)
-  └─ 远程语音回合、会话状态机、配对/校准/诊断（界面待实现）
+  └─ 远程语音回合、会话状态机、校准/诊断界面与配对（WebUI/root CLI；校准写入桥接的通道缺失）
 ```
 
 规则、时钟、会话状态机、协议与安全边界都在 `core`：它不依赖 Android，由 JVM 单测覆盖；
@@ -44,7 +48,7 @@ AgentCall APK (org.krvyft.agentcall, 普通应用 uid)
 ## 构建与测试
 
 先决条件（本机已验证环境）：Gradle Wrapper 与 Launcher JVM 17，Daemon JVM 由
-`gradle-daemon-jvm.properties` 指定；Android SDK（compileSdk 37）；Node 26；Python 3.14。
+`gradle-daemon-jvm.properties` 指定；Android SDK（compileSdk 37，platform `android-37.0`，build-tools 36.0.0）；Node 26.13.0；Python 3.14.9。
 不下载任何额外二进制：Android 工具只取本机 SDK `build-tools`，Gradle 依赖走现有仓库配置。
 
 Gradle 调用必须串行化，仓库约定：
@@ -80,6 +84,18 @@ python3 tools/check_package.py    # 失败即非零退出
   apksigner 的 v4 `.idsig` 旁文件不生成（不属于发布物）。
 - `dist/SHA256SUMS`：`sha256sum` 兼容格式。
 
+本次交付产物（HEAD `1ee7277`，`dist/` 不提交）：
+
+| 文件 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `dist/agentcall-1.0.zip` | 1,362,660 B | `a1ff82fd5cf87f4e70d824ac6740a3f714ec1bb735a933e1473c5e84ece02f67` |
+| `dist/agentcall-1.0.apk` | 6,435,668 B | `cf479056686b262f9f2c005e43e53fad56f9364b24d048d71580122915942003` |
+| `dist/SHA256SUMS` | 168 B | 与上面两行一致 |
+
+APK 由本机 debug keystore 签名（`CN=Android Debug`，证书 SHA-256
+`3974a6d9dc587fe200107ff1c90b5ff20b0bcf4edcfb61dc030e9c6d2cd81085`），**不可分发**；
+正式分发前必须用发布密钥重签，并重新生成 `SHA256SUMS`，步骤见 `docs/install.md` 第 1 节。
+
 **DEX 覆盖只用容器 manifest**：`:bridge:packageRuntime` 从 bridge release APK 收集 dex 并写出
 manifest，打包与 `check_package.py` 都拿容器与 manifest 比对（名称 + SHA-256 + size），
 存在 bridge APK 时再交叉核对一次；**不使用 app APK**——app APK 是另一个产物，
@@ -99,14 +115,16 @@ manifest，打包与 `check_package.py` 都拿容器与 manifest 比对（名称
 
 | 范围 | 状态 |
 | --- | --- |
-| JVM 单测（core/bridge/app）、WebUI node 测试、打包测试 | 本地执行，见 `make test` 与 Task 9 报告 |
-| release APK、模块 ZIP、SHA256SUMS、打包检查 | 本地已验证 |
+| JVM 单测（core/bridge/app） | 本地已验证：125 / 283 / 323，合计 731，0 failures / 0 errors / 0 skipped（HEAD `1ee7277`） |
+| WebUI node 测试、Python 打包测试、模块脚本语法 | 本地已验证：node 79/79、Python 52 tests OK、`sh -n` 4 个脚本（`make test` PASS） |
+| `:app:lintDebug` | 本地已验证：SUCCESSFUL，0 errors、14 warnings（13 条既有告警 + 1 条 `UseKtx`） |
+| release APK、模块 ZIP、SHA256SUMS、打包检查 | 本地已验证：`make build` / `make package-check` PASS；产物与哈希见上表 |
 | `app_process` 容器入口（BridgeMain/AgentCallCli/AudioWorkerMain）与 Kotlin/coroutines/Gson/core 运行库 | 结构级已验证（自研 DEX 解析：只校验类描述符与方法名存在，不校验方法原型/字节码语义） |
-| 真机 Google 电话原功能、真实来电、≥3 轮双向对话 | **未验证** |
+| 真机 Google 电话原功能、真实来电、≥3 轮双向对话 | **未验证**（交付时无设备连接） |
 | 音频 downlink/uplink、麦克风隔离、真实 Google 电话 | **未验证**（无设备证据，不宣称可用） |
 | 人工接管、故障终止、锁屏/重启握手 | **未验证** |
-| KernelSU 真机安装、WebView WebUI | **未验证**（无真机） |
-| APK 配对 / 校准 / 诊断界面 | **未实现**（Task 7 范围） |
+| KernelSU 真机安装、WebView WebUI、`ksu.io` 路径 | **未验证**（无真机） |
+| 配对（WebUI/root CLI）与 APK 校准/诊断界面 | 已实现；但桥接 `CalibrationStore` 没有读/写 RPC，校准证据无法写入，真机自动接听保持关闭（`calibration_not_verified`） |
 | 双卡、VoWiFi、蓝牙 | **未验证**，未测组合不启用 |
 
 多 DEX 说明：`app_process` 的 `PathClassLoader` 只从 classpath JAR 根部的 `classes.dex` 加载类。

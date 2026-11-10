@@ -1,7 +1,10 @@
 # AgentCall 安装、配置与回退
 
 本文描述 AgentCall 的安装范围、配对、配置、校准、升级与卸载。**所有真机步骤均为「未验证」**：
-本仓库当前没有真机 Google 电话、KernelSU WebView 或音频证据，标注「未验证」的条目不能当作已可用。
+交付时 `adb devices` 为空，本仓库没有真机 Google 电话、KernelSU WebView 或音频证据。
+最终验收矩阵（HEAD `1ee7277`，225 个任务）只在本地通过：JVM 单测 731
+（core 125 / bridge 283 / app 323）、lint 0 error、release APK 与模块 ZIP 已打包；
+标注「未验证」的条目仍不能当作已可用。
 
 ## 1. 产物与前提
 
@@ -12,6 +15,12 @@
 | `dist/agentcall-<version>.zip` | KernelSU 模块（含 `bridge/agentcall-bridge.jar` 与 `webroot/`） |
 | `dist/agentcall-<version>.apk` | AgentCall APK（Xposed 模块 + 远程语音回合） |
 | `dist/SHA256SUMS` | 两个产物的 SHA-256 |
+
+本次交付（HEAD `1ee7277`）：`agentcall-1.0.zip` 1,362,660 B，SHA-256
+`a1ff82fd5cf87f4e70d824ac6740a3f714ec1bb735a933e1473c5e84ece02f67`；
+`agentcall-1.0.apk` 6,435,668 B，SHA-256
+`cf479056686b262f9f2c005e43e53fad56f9364b24d048d71580122915942003`。
+以 `dist/SHA256SUMS` 为准。
 
 版本单一来源是 APK 的 `versionName/versionCode`；ZIP 内 `module.prop` 由它渲染，不一致时打包直接失败。
 桥接容器也读同一来源：`:bridge` 在构建时从 `:app` 的 `defaultConfig` 生成 `BuildConfig.VERSION_NAME`
@@ -28,6 +37,8 @@ sha256sum -c SHA256SUMS
 ```
 
 **签名**：默认用本机 Android debug keystore 重签，是 **debug 签名**，不是发布密钥。
+本次交付 APK 的签名证书为 `CN=Android Debug`，证书 SHA-256
+`3974a6d9dc587fe200107ff1c90b5ff20b0bcf4edcfb61dc030e9c6d2cd81085`，**不可分发**。
 检查器只如实报告签名者（debug / custom signer / unsigned / unverified），不猜测非 debug 证书
 “是不是发布密钥”。不同签名的同名 APK 不能直接覆盖安装；正式分发前必须用你自己的发布密钥重签：
 
@@ -48,8 +59,9 @@ python3 tools/check_package.py --dist dist --expected-signer 'CN=你的发布证
 `--allow-unverified-signing` **只**关闭签名校验（报告仍打印 warning），不改变版本/包名读取，
 因此它不能让“没有 SDK build-tools”的机器通过检查；该场景只能在装有 SDK build-tools 的环境运行。
 
-前提（未验证 = 未在本仓库验证）：Android 16/17（`minSdk 36`，目标与唯一验证 ROM 为已知 API 37 Xperia）、
-已安装 KernelSU、已安装 LSPosed 或 Vector、已安装官方 Google 电话 `com.google.android.dialer`。
+前提（未验证 = 未在本仓库验证）：Android 16/17（`minSdk 36`，targetSdk 37；实现期间只在
+API 37 Xperia 上做过只读观察，**没有在该设备上安装或验证任何东西**）、已安装 KernelSU、
+已安装 LSPosed 或 Vector、已安装官方 Google 电话 `com.google.android.dialer`。
 模块不重签 Google 电话、不注入 `system_server`、不改 SELinux、不自动改默认拨号器角色。
 
 ## 2. 安装顺序（未验证）
@@ -101,7 +113,8 @@ su -c /data/adb/modules/agentcall/bin/agentcallctl pair org.krvyft.agentcall
 - APK 卸载重装导致 uid 变化 → `peer_uid_mismatch`；
 - Google 电话升级导致 `versionName` 变化 → `peer_version_mismatch`。
 
-以上任一情况都**必须重新执行 `pair`**（WebUI 与 APK 的重新配对提示见第 6 节）。
+以上任一情况都**必须重新执行 `pair`**。WebUI 在读取/保存失败时显示「配对已失效」横幅并给出
+「重新配对」入口（经固定 `agentcallctl pair`，见第 5 节）；APK 只显示配对/就绪状态，不发起配对。
 
 ## 5. 配置与 WebUI（未验证）
 
@@ -159,8 +172,10 @@ su -c '/data/adb/modules/agentcall/bin/agentcallctl config-set < /data/adb/agent
 `patch` 是整体校验：任一字段非法则整包拒绝，不会部分生效；`expectedRevision` 是 CAS 版本，
 不匹配时需重新 `config-get` 读取当前 `revision`。写入成功返回新的脱敏配置（`revision+1`）。
 
-WebUI 的「连接测试」按钮只做本地地址格式校验，**不发起远程请求**；逐端点真实连接测试属于
-APK 诊断页，当前**未实现**。语音/文本会发送给你配置的供应商，可能产生费用。
+WebUI 的「连接测试」按钮只做本地地址格式校验，**不发起远程请求**；特权桥接本身也不发起任何
+远程 API 请求。逐端点真实连接测试在 **APK 诊断页**手动触发，每次都会先要求确认「将发起真实
+付费请求」：ASR 发送 100 ms WAV、LLM 发送最小对话、TTS 发送短文本，每个已配置端点各一次；
+不显示或记录密钥与响应正文，未配置端点不发请求。语音/文本会发送给你配置的供应商，可能产生费用。
 
 ## 7. 规则与校准
 
@@ -169,13 +184,21 @@ APK 诊断页，当前**未实现**。语音/文本会发送给你配置的供�
 未知/隐藏号码默认人工处理。
 
 校准依赖真实设备上的音频证据（downlink 抽取、uplink 注入、麦克风隔离、特权终止能力）。
-当前 APK 校准页**未实现**；root 侧只能查看能力/环境报告：
+APK 校准页已实现，可记录五项人工测试；但它只写 APK 自己的 SharedPreferences，**桥接的
+`CalibrationStore` 没有读/写 RPC，固定 CLI 命令表也没有校准写操作**。因此：
+
+- 校准证据无法端到端写入桥接，APK 本机勾选**不会**解锁自动接听；
+- 生产就绪有意保持 `NOT_READY`（`calibration_not_verified`），真机自动接听在出现可验证的
+  运营者写入路径之前无法启用；
+- 这是 fail-closed 设计，不是可绕过的步骤：不得用本机记录、静态阅读或创建音频对象伪造校准。
+
+root 侧可查看能力/环境报告：
 
 ```sh
 su -c /data/adb/modules/agentcall/bin/agentcallctl diagnose
 ```
 
-在真机校准完成前，产物一律按「待适配/验证」对待，不宣称音频可用。
+在真机校准完成且桥接能读到证据前，产物一律按「待适配/验证」对待，不宣称音频可用。
 
 ## 8. 升级、回退与卸载
 
@@ -232,7 +255,9 @@ su -c /data/adb/modules/agentcall/bin/agentcallctl diagnose
 | 步骤 | 状态 |
 | --- | --- |
 | 模块 ZIP 结构、DEX 入口、版本、SHA-256、密钥泄漏检查 | 本地已验证（`make package-check`） |
-| JVM/JS/Python/脚本检查 | 本地已验证（`make test`） |
+| 最终验收矩阵（HEAD `1ee7277`，225 任务） | 本地 PASS：JVM 731、lint 0 errors、release APK、bridge 运行时容器 |
+| JVM/JS/Python/脚本检查 | 本地已验证：JVM 731（core 125 / bridge 283 / app 323）、node 79、Python 52、`sh -n` 4 个脚本（`make test` PASS） |
+| 配对（WebUI/root CLI）与 APK 校准/诊断界面 | 已实现；校准证据写入桥接的通道缺失（阻塞，见第 7 节） |
 | 模块安装、重启后 `service.sh` 拉起桥 | **未验证** |
 | LSPosed/Vector 作用域与 Hook 生效 | **未验证** |
 | 首次配对、重新配对、`peer_version_mismatch` 提示 | **未验证** |
@@ -242,4 +267,5 @@ su -c /data/adb/modules/agentcall/bin/agentcallctl diagnose
 | 双卡、VoWiFi、蓝牙 | **未验证**，未测组合不启用 |
 
 结论：安装步骤按设计写成，但**除本地构建/打包/结构检查外，没有真机证据**；
-在完成 spec §12 设备验收前，不要把本模块当作可用的电话助理。
+交付时也没有设备连接。校准写入通道缺失使真机自动接听无法启用（保持
+`calibration_not_verified`）。在完成 spec §12 设备验收前，不要把本模块当作可用的电话助理。

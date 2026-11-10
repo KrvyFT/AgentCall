@@ -6,6 +6,15 @@
 - **当前结论：本文件所有验证项均为「未验证」。没有任何一行被真机执行过，也没有任何一行被标记为「已验证」。**
 - JVM 单元测试（`:core:testDebugUnitTest`、`:bridge:testDebugUnitTest`）只证明无设备可测的逻辑；它们不是、也不能代替任何一行真机结论。
 
+## 交付时状态（HEAD `1ee7277`，2026-11-10 最终验收）
+
+- 最终验收矩阵（225 个任务）通过：JVM core 125 / bridge 283 / app 323，合计 731，0 失败；
+  lint 0 errors；release APK 与模块 ZIP 已打包，详见 `docs/verification.md`。
+- **交付时 `adb devices` 为空，没有设备连接。** 实现期间曾只读观察到 XQ-DQ72（API 37），
+  但 shell uid 2000 没有 `su`，所以没有安装模块、启动桥接、发起通话或执行任何音频测试。
+- 结论不变：**D01–D12 每一行仍为「未验证」**；最终 JVM 计数不构成任何一行真机结论，
+  也不能把任何一行改成「已验证通过/已验证不支持」。
+
 ## 1. 状态定义与翻绿规则
 
 | 状态 | 含义 |
@@ -25,7 +34,7 @@
 
 音频类结论还必须满足 spec §9：方法存在、权限通过、对象创建成功都不等于对端收到语音；只有「对端听到测试语音」与「本机麦克风隔离生效」同时成立，才能解锁对应环境。
 
-## 2. 当前环境事实（只读观察，不是验证结果）
+## 2. 当时（任务 5）的设备只读观察（不是验证结果）
 
 编写本文件时从本机执行了以下只读命令：
 
@@ -60,7 +69,7 @@ ls: /data/adb/modules/agentcall: Permission denied
 
 结论与限制：
 
-- 本机曾观察到一台 API 37（Android 17）Xperia 设备；这只说明设备可用，**不构成任何验证结果**。本次没有在该设备上安装模块、启动桥接、发起真实通话或执行音频测试。
+- 任务 5 期间曾观察到一台 API 37（Android 17）Xperia 设备；这只说明当时设备可见，**不构成任何验证结果**。当时没有在该设备上安装模块、启动桥接、发起真实通话或执行音频测试；交付时该设备也已不在线（`adb devices` 为空）。
 - `adb shell` 是 uid 2000 的 shell，没有 `su`；本会话无法通过 adb 读取 `/data/adb/modules/agentcall`。因此 **KernelSU 模块、`agentcallctl`、真实特权音频/终止路径都无法从当前 adb 会话执行**。需要设备侧 root 入口或人工在 KernelSU 管理器中完成安装后再验证。
 - 设备/ROM 可能在后续任务中被替换；每行证据必须重新记录实际设备，不得沿用本节的只读信息。
 - 型号与指纹字段说明（2026-11-10 用上表命令重新只读复核）：`ro.product.model` = `XQ-DQ72`，而 `ro.build.fingerprint` 的 `Sony/XQ-GE74/XQ-GE` 是 ROM 构建的 product/device 段；两者是不同系统属性，不是互相矛盾的观察。设备序列号与两个值均为只读观察，**仍不是验证结果**。
@@ -115,7 +124,7 @@ adb shell grep @org.krvyft.agentcall.control /proc/net/unix \
 | D11 | 音频进程故障与有限重启 | 未验证 | 预算内重启；耗尽后故障终止；隔离保持 |
 | D12 | 校准证据与环境绑定 | 未验证 | 五项全过且环境一致才解锁；任一字段变化立即失效 |
 
-> 进程级注入（D06/D09/D11）的当前阻塞：`service.sh` 已同时启动 `BridgeMain`（控制面 + 监督角色 + 500 ms 轮询）与独立 `AudioWorkerMain`，但本机 adb 是 uid 2000 无 `su`，无法安装模块、定点 kill/stop 监督或音频工作进程。该阻塞不改变 JVM 测试结论，也不代表真机通过。
+> 进程级注入（D06/D09/D11）的当前阻塞：`service.sh` 已同时启动 `BridgeMain`（控制面 + 监督角色 + 500 ms 轮询）与独立 `AudioWorkerMain`，但实现期间的 adb 会话是 uid 2000 无 `su`，交付时且已无设备连接，无法安装模块、定点 kill/stop 监督或音频工作进程。该阻塞不改变 JVM 测试结论，也不代表真机通过。
 
 ## 5. 逐行步骤、判据与翻转证据
 
@@ -215,7 +224,7 @@ adb shell grep @org.krvyft.agentcall.control /proc/net/unix \
 
 翻转所需证据：注入命令/进程号、`logcat`+`service.log` 时间线、`dumpsys audio`/`dumpsys telecom`、接管界面录屏、对端录音、`status.json`（phase/blockedReason）。
 
-当前阻塞：进程入口已接入——`service.sh` 以独立 app_process 启动 `AudioWorkerMain`，bridge 容器（`BridgeMain`）内构造监督角色并以 500 ms 周期调用 `Supervisor.poll`；但本机 adb 是 uid 2000 无 `su`，无法安装模块、定点 kill 监督/音频进程或执行本行。仍未验证；JVM `AudioWorker`/`Supervisor` 测试不能替代本行。
+当前阻塞：进程入口已接入——`service.sh` 以独立 app_process 启动 `AudioWorkerMain`，bridge 容器（`BridgeMain`）内构造监督角色并以 500 ms 周期调用 `Supervisor.poll`；但实现期间 adb 是 uid 2000 无 `su`，交付时无设备连接，无法安装模块、定点 kill 监督/音频进程或执行本行。仍未验证；JVM `AudioWorker`/`Supervisor` 测试不能替代本行。
 
 ### D07 人工接管
 
@@ -266,7 +275,7 @@ adb shell grep @org.krvyft.agentcall.control /proc/net/unix \
 
 翻转所需证据：高速录屏/系统时间、`logcat`+`service.log` 时间戳、`dumpsys telecom` 前后、进程号、对端录音、`status.json`（phase=TERMINATING/blockedReason）。
 
-当前阻塞：监督/音频进程入口已接入（`BridgeMain` 内监督角色 + 独立 `AudioWorkerMain`，`service.sh` 分别有限重启）；心跳按 SessionId 记录，外来会话心跳不能给旧通话续命，`poll` 在同一轮最多终止同一会话一次。但本机 adb 无 root，APP/Hook 心跳与故障注入仍无法执行。仍未验证。
+当前阻塞：监督/音频进程入口已接入（`BridgeMain` 内监督角色 + 独立 `AudioWorkerMain`，`service.sh` 分别有限重启）；心跳按 SessionId 记录，外来会话心跳不能给旧通话续命，`poll` 在同一轮最多终止同一会话一次。但实现期间 adb 无 root、交付时无设备连接，APP/Hook 心跳与故障注入仍无法执行。仍未验证。
 
 ### D10 Hook 死亡后的独立特权 Telecom 终止
 
@@ -301,7 +310,7 @@ adb shell grep @org.krvyft.agentcall.control /proc/net/unix \
 
 翻转所需证据：每次 kill 的进程号/时间、`service.log` 重启计数、`status.json`（restartAttempts）、`logcat`、`dumpsys telecom`、对端录音。
 
-当前阻塞：音频工作进程入口已接入（独立 app_process，`service.sh` 有限重启）；重启预算已移到监督端（`RestartBudget`，60 s 窗口最多 3 次），音频工作进程重启不会清零预算，预算耗尽触发 `terminateOwned`。本机 adb 无 root，仍无法执行 kill/重启注入。仍未验证。
+当前阻塞：音频工作进程入口已接入（独立 app_process，`service.sh` 有限重启）；重启预算已移到监督端（`RestartBudget`，60 s 窗口最多 3 次），音频工作进程重启不会清零预算，预算耗尽触发 `terminateOwned`。实现期间 adb 无 root、交付时无设备连接，仍无法执行 kill/重启注入。仍未验证。
 
 ### D12 校准证据与环境绑定
 
@@ -349,6 +358,10 @@ adb shell grep @org.krvyft.agentcall.control /proc/net/unix \
 
 ## 7. 任务 5 的 JVM 证据（不是真机证据）
 
+> 本节的 108 / 161 是任务 5 当时的历史计数；最终交付（HEAD `1ee7277`）的计数是
+> core 125 / bridge 283 / app 323，合计 731，见 `docs/verification.md`。本节保留历史记录，
+> 不用它冒充最终数字。
+
 已执行（可复现）：
 
 ~~~console
@@ -364,9 +377,9 @@ BUILD SUCCESSFUL
 ## 8. 当前未验证/阻塞清单
 
 - 全部 D01–D12：未验证。
-- 设备侧 root/模块：本次 adb 会话无 `su`，无法安装/启动模块或执行 `agentcallctl`；需人工准备 root 环境。
-- 监督/音频工作进程：入口已接入。`service.sh` 启动 `BridgeMain`（控制面 + 监督角色 + 500 ms 轮询 + 状态持久化）与独立 `AudioWorkerMain`（PCM/隔离，root 私有 abstract socket），各自有限重启；但本机 adb 无 root，D06/D09/D11 的进程级注入**仍未执行**，SELinux 域、app_process 类加载、真实 AudioManager 反射均未验证。
-- 自动接听仍被两道 fail-closed 闸门关闭：校准证据未验证 + `UnverifiedCallIdentityVerifier` 不可用（`blocksAutoAnswer=true`）。因此真机上监督端当前不会拥有任何 AI 通话；D06/D09 需要先完成 D10 的身份核验与 D12 校准。
+- 设备侧 root/模块：实现期间 adb 会话无 `su`，交付时无设备连接；无法安装/启动模块或执行 `agentcallctl`；需人工准备 root 环境。
+- 监督/音频工作进程：入口已接入。`service.sh` 启动 `BridgeMain`（控制面 + 监督角色 + 500 ms 轮询 + 状态持久化）与独立 `AudioWorkerMain`（PCM/隔离，root 私有 abstract socket），各自有限重启；但实现期间 adb 无 root、交付时无设备连接，D06/D09/D11 的进程级注入**仍未执行**，SELinux 域、app_process 类加载、真实 AudioManager 反射均未验证。
+- 自动接听仍被两道 fail-closed 闸门关闭：校准证据未验证 + `UnverifiedCallIdentityVerifier` 不可用（`blocksAutoAnswer=true`）。因此真机上监督端当前不会拥有任何 AI 通话；D06/D09 需要先完成 D10 的身份核验与 D12 校准。校准写入通道本身也缺失（bridge `CalibrationStore` 无读/写 RPC），所以 D12 在当前构建下无法从设备侧解除，见 `docs/verification.md` 5.3。
 - 监督端持久状态 `supervisor-state.json`（含 boot_id）、同一开机重启策略（有旧所有权时保持隔离并 BLOCKED）、重启预算与隔离读回均只有 JVM 证据；崩溃/重启时序与 `SystemClock.elapsedRealtime` 行为未在真机验证。
 - 特权 Telecom 精确终止：没有经过真机验证的身份来源；默认 `UnverifiedCallIdentityVerifier` 阻止自动接听，`ReflectiveTelecomTermination` 未在目标 ROM 验证。
 - 音频 HAL/受限方法：未在任何真机上确认三个 AOSP 受限方法可见、可调用、可创建对象，更未确认对端能听到注入。
