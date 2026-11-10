@@ -44,28 +44,96 @@ class HookEntry : IXposedHookLoadPackage {
         if (lpparam.packageName != TARGET_PACKAGE) return
         // 进程级闸门：同一进程重复 handleLoadPackage 不得重复安装 Hook/传输线程。
         if (!HookInstallGuard.claim()) return
+        var runtime: HookRuntime? = null
         try {
             val installed = HookRuntime(lpparam.classLoader)
-            if (!installed.installFromPackageManager()) {
-                // 延迟路径同样没装成（连 Instrumentation 都不可用）才释放闸门；成功挂上
-                // 延迟 Hook 后必须继续占位，避免第二个入口重复安装（M6）。
-                if (!installed.deferUntilApplicationCreated()) {
-                    HookInstallGuard.release()
-                }
+            runtime = installed
+            // 只有立即安装或延迟安装至少挂上一个 Hook 才保持闸门占用；零成功（包括
+            // hookMethod 全部失败）会释放闸门，允许下一次入口重试（M6、Task 11G 3）。
+            if (!holdGuardAfterInstallAttempt(installed::installFromPackageManager, installed::deferUntilApplicationCreated)) {
+                installed.stop()
             }
         } catch (failure: Throwable) {
             // 安装异常不是“已安装”：允许下一次入口重试（M6）。
             HookInstallGuard.release()
+            runtime?.stop()
             logToFramework("hook entry failed: " + failure.javaClass.name + ": " + (failure.message ?: "no message"))
         }
     }
+}
+
+/**
+ * 单个 Hook 方法的安装记账（Task 11G 3）。
+ *
+ * 与 Xposed 解耦（hook 动作由 lambda 注入），因此“零成功必须释放闸门、失败方法必须
+ * 可重试”的契约可在 JVM 里验证。只有 [hook] 真正返回后才把方法记为已安装。
+ */
+internal class HookMethodInstaller(
+    private val hook: (Method) -> Unit,
+    private val logger: (String) -> Unit = {},
+) {
+
+    private val installedMethods: MutableSet<Method> = HashSet()
+
+    /** 已确认安装成功的 hook 数量。 */
+    fun installedCount(): Int = synchronized(installedMethods) { installedMethods.size }
+
+    /**
+     * 尝试安装 [methods] 中尚未确认成功的方法。
+     *
+     * @return true 当且仅当调用后至少有一个方法处于已安装状态（含之前成功的）。
+     *   零成功时调用方必须释放闸门，否则本进程再也不能重试。
+     */
+    fun install(methods: Collection<Method>): Boolean {
+        val fresh = synchronized(installedMethods) { methods.filter { it !in installedMethods } }
+        var installedNow = 0
+        for (method in fresh) {
+            try {
+                hook(method)
+                // 只有 hookMethod 真正返回后才记账：失败的方法留在候选集里，下一次可重试。
+                synchronized(installedMethods) { installedMethods.add(method) }
+                installedNow += 1
+            } catch (failure: Throwable) {
+                logger(
+                    "cannot hook " + method.declaringClass.name + "#" + method.name +
+                        ": " + failure.javaClass.name,
+                )
+            }
+        }
+        val installedAny = synchronized(installedMethods) { installedMethods.isNotEmpty() }
+        logger(
+            "installed " + installedNow + " of " + fresh.size + " hook(s): " +
+                fresh.joinToString(",") { it.declaringClass.simpleName + "#" + it.name },
+        )
+        return installedAny
+    }
+}
+
+/**
+ * 入口级安装尝试（Task 11G 3 / M6）：立即安装失败时回退到“Application 创建后再安装”。
+ *
+ * @return true 表示本次入口至少安装了一个 hook（即时或延迟路径），闸门应保持占用；
+ *   false 表示零 hook，已释放闸门，下一次 handleLoadPackage 可以重试。
+ */
+internal fun holdGuardAfterInstallAttempt(
+    installNow: () -> Boolean,
+    defer: () -> Boolean,
+): Boolean {
+    val installed = installNow() || defer()
+    if (!installed) HookInstallGuard.release()
+    return installed
 }
 
 /** 单个 Google 电话进程的 Hook 运行期装配；持有注册表、传输与 Call→门面映射。 */
 private class HookRuntime(private val loader: ClassLoader) {
 
     private val handles = Collections.synchronizedMap(IdentityHashMap<Call, AndroidCallHandle>())
-    private val installedMethods: MutableSet<Method> = Collections.synchronizedSet(HashSet())
+
+    /** 方法级安装记账：零成功时调用方必须释放闸门（Task 11G 3）。 */
+    private val installer = HookMethodInstaller(
+        hook = { method -> XposedBridge.hookMethod(method, hookCallbackFor(method.name)) },
+        logger = ::log,
+    )
 
     private val adapter = HookCallbackAdapter(onCallback = ::onServiceCallback, logger = ::log)
 
@@ -127,8 +195,9 @@ private class HookRuntime(private val loader: ClassLoader) {
             log("InCallService callbacks could not be resolved")
             return false
         }
-        install(methods)
-        return true
+        // 返回“是否至少有一个 hook 成功”：零成功时入口会回退到延迟安装，最终仍零成功
+        // 则释放闸门，而不是假装已安装（Task 11G 3）。
+        return install(methods)
     }
 
     /**
@@ -151,8 +220,13 @@ private class HookRuntime(private val loader: ClassLoader) {
                                 log("no InCallService callbacks discovered after Application creation")
                                 // 延迟安装最终失败：释放闸门，允许后续入口再试一次（M6）。
                                 HookInstallGuard.release()
-                            } else {
-                                install(methods)
+                                stop()
+                            } else if (!install(methods)) {
+                                // 发现到了方法但一个都没挂上：同样是零 hook，必须释放闸门
+                                // 并停掉空转的传输线程（Task 11G 3）。
+                                log("no InCallService hook could be installed after Application creation")
+                                HookInstallGuard.release()
+                                stop()
                             }
                         }
                     }
@@ -168,22 +242,16 @@ private class HookRuntime(private val loader: ClassLoader) {
 
     // ------------------------------------------------------------------ 安装
 
-    private fun install(methods: Set<Method>) {
-        val fresh = synchronized(installedMethods) { methods.filter { installedMethods.add(it) } }
-        if (fresh.isEmpty()) return
+    /** @return true 当且仅当当前至少有一个 hook 已成功安装。 */
+    private fun install(methods: Set<Method>): Boolean {
         // 先起传输线程再安装 Hook：避免第一个 onCallAdded 的快照落在“线程尚未启动”的窗口里。
         transport?.start()
-        for (method in fresh) {
-            try {
-                XposedBridge.hookMethod(method, hookCallbackFor(method.name))
-            } catch (failure: Throwable) {
-                log("cannot hook " + method.declaringClass.name + "#" + method.name + ": " + failure.javaClass.name)
-            }
-        }
-        log(
-            "installed " + fresh.size + " hook(s): " +
-                fresh.joinToString(",") { it.declaringClass.simpleName + "#" + it.name },
-        )
+        return installer.install(methods)
+    }
+
+    /** 零 hook 的失败路径：停掉空转的传输线程，避免重试时叠加第二条（Task 11G 3）。 */
+    fun stop() {
+        transport?.stop()
     }
 
     private fun hookCallbackFor(methodName: String): XC_MethodHook = object : XC_MethodHook() {

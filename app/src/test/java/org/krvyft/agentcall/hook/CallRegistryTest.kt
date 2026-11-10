@@ -300,13 +300,16 @@ class CallRegistryTest {
     fun routeChangeOnModuleOwnedActiveCallHandsBackToHuman() {
         val handle = FakeCallHandle()
         val listener = RecordingListener()
-        val registry = CallRegistry(listener = listener)
+        var now = 1_000_000_000L
+        val registry = CallRegistry(listener = listener, clockNs = { now })
         val session = registry.observe(handle)
         assertEquals(CommandResult.Accepted, registry.answer(session))
         handle.emit(
             snapshot = ringingSnapshot().copy(state = CallState.ACTIVE, routeFingerprint = "earpiece"),
             source = ActionSource.MODULE,
         )
+        // 走出接通后的沉降窗口：此后的路由变化才可能是用户动作。
+        now += CallRegistry.ROUTE_CHANGE_GRACE_NS
 
         // AI 通话中用户真的切换了音频路由（指纹变化）：来源不明，必须保守交还。
         handle.emit(
@@ -601,6 +604,99 @@ class CallRegistryTest {
         assertFalse(registry.isHandedBack(session))
         assertTrue(listener.handbacks.isEmpty())
         assertEquals(CommandResult.Accepted, registry.hangup(session))
+    }
+
+    @Test
+    fun benignMaskOrMuteOnlyAudioChangeAfterActiveDoesNotHandBack() {
+        val handle = FakeCallHandle()
+        val listener = RecordingListener()
+        var now = 1_000_000_000L
+        val registry = CallRegistry(listener = listener, clockNs = { now })
+        val session = registry.observe(handle)
+        assertEquals(CommandResult.Accepted, registry.answer(session))
+        handle.emit(
+            snapshot = ringingSnapshot().copy(state = CallState.ACTIVE, routeFingerprint = "audio:2"),
+            source = ActionSource.MODULE,
+        )
+
+        // Task 11G 1：蓝牙可用性/静音开关只改变 supportedRouteMask/isMuted，活动路由仍是
+        // 同一条 "audio:2"；框架重报同一指纹不得交还。
+        now += 2_000_000_000L
+        handle.emit(
+            kind = EventKind.ROUTE_CHANGED,
+            source = ActionSource.UNKNOWN,
+            snapshot = ringingSnapshot().copy(state = CallState.ACTIVE, routeFingerprint = "audio:2"),
+            reason = "audio_route_changed",
+        )
+
+        assertFalse(registry.isHandedBack(session))
+        assertTrue(listener.handbacks.isEmpty())
+        assertEquals(CommandResult.Accepted, registry.hangup(session))
+        assertEquals(1, handle.disconnectCount)
+    }
+
+    @Test
+    fun routeEventInsidePostActiveGraceIsANoOp() {
+        val handle = FakeCallHandle()
+        val listener = RecordingListener()
+        var now = 1_000_000_000L
+        val registry = CallRegistry(listener = listener, clockNs = { now })
+        val session = registry.observe(handle)
+        assertEquals(CommandResult.Accepted, registry.answer(session))
+        handle.emit(
+            snapshot = ringingSnapshot().copy(state = CallState.ACTIVE, routeFingerprint = "audio:1"),
+            source = ActionSource.MODULE,
+        )
+
+        // 接通后的沉降窗口内，框架可能重配到另一个路由；这只是 settling，不得交还。
+        now += 500_000_000L
+        handle.emit(
+            kind = EventKind.ROUTE_CHANGED,
+            source = ActionSource.UNKNOWN,
+            snapshot = ringingSnapshot().copy(state = CallState.ACTIVE, routeFingerprint = "audio:2"),
+            reason = "audio_route_changed",
+        )
+        assertFalse(registry.isHandedBack(session))
+        assertTrue(listener.handbacks.isEmpty())
+
+        // 窗口内的 settling 已成为新基线：窗口结束后同一路由的重复上报仍不交还。
+        now += CallRegistry.ROUTE_CHANGE_GRACE_NS
+        handle.emit(
+            kind = EventKind.ROUTE_CHANGED,
+            source = ActionSource.UNKNOWN,
+            snapshot = ringingSnapshot().copy(state = CallState.ACTIVE, routeFingerprint = "audio:2"),
+            reason = "audio_route_changed",
+        )
+        assertFalse(registry.isHandedBack(session))
+        assertEquals(CommandResult.Accepted, registry.hangup(session))
+        assertEquals(1, handle.disconnectCount)
+    }
+
+    @Test
+    fun realActiveRouteChangeAfterGraceHandsBack() {
+        val handle = FakeCallHandle()
+        val listener = RecordingListener()
+        var now = 1_000_000_000L
+        val registry = CallRegistry(listener = listener, clockNs = { now })
+        val session = registry.observe(handle)
+        assertEquals(CommandResult.Accepted, registry.answer(session))
+        handle.emit(
+            snapshot = ringingSnapshot().copy(state = CallState.ACTIVE, routeFingerprint = "audio:1"),
+            source = ActionSource.MODULE,
+        )
+
+        // 窗口结束后活动路由真的变了（用户切到扬声器/蓝牙）：必须保守交还。
+        now += CallRegistry.ROUTE_CHANGE_GRACE_NS + 1L
+        handle.emit(
+            kind = EventKind.ROUTE_CHANGED,
+            source = ActionSource.UNKNOWN,
+            snapshot = ringingSnapshot().copy(state = CallState.ACTIVE, routeFingerprint = "audio:2"),
+            reason = "audio_route_changed",
+        )
+
+        assertTrue(registry.isHandedBack(session))
+        assertEquals(1, listener.handbacks.size)
+        assertEquals("route_change", listener.handbacks.single().third)
     }
 
     @Test

@@ -30,7 +30,9 @@ import org.krvyft.agentcall.core.model.SessionId
  *   人工，后续挂断命令被拒绝。[ActionSource.MODULE] 的路由变化不交还。
  * - 路由事件只有“真的换了指纹”才交还：接听窗口内的路由事件只是重新取基线（框架会在
  *   接通前后重复上报音频状态），接通后重复上报同一指纹也不交还；无法取得指纹时无法
- *   证明变化，按 no-op 处理（I2）。
+ *   证明变化，按 no-op 处理（I2）。指纹只含活动路由/端点（不含 isMuted/
+ *   supportedRouteMask），且接通后有 [ROUTE_CHANGE_GRACE_NS] 的沉降窗口，窗口内的
+ *   路由事件只重取基线（Task 11G 1）。
  * - 未映射的 Telecom 瞬时状态以 [EventKind.UNKNOWN_STATE] 上报：保留上一次已知状态，
  *   既不猜成 ACTIVE，也不撤销待执行接听。
  * - 终态（DISCONNECTED/DESTROYED）先向监听者发出最终快照，再移除会话，控制器不必等
@@ -50,6 +52,7 @@ class CallRegistry(
     private val callIdFactory: () -> String = ::randomToken,
     private val sink: CommandSink = CommandSink.NONE,
     private val listener: RegistryListener = RegistryListener.NONE,
+    private val clockNs: () -> Long = System::nanoTime,
 ) {
 
     private class Registration(
@@ -65,6 +68,8 @@ class CallRegistry(
         var latestRouteFingerprint: String? = null,
         /** 模块接听时的音频路由指纹；只有与它不同的事件才算“真的改了路由”。 */
         var routeBaseline: String? = null,
+        /** 接通后的路由沉降窗口截止时刻（单调时钟）；窗口内的路由事件只重取基线。 */
+        var routeGraceUntilNs: Long = 0L,
     )
 
     private val lock = Any()
@@ -260,6 +265,9 @@ class CallRegistry(
                         registration.moduleOwned = true
                         // 进入 ACTIVE 后以“当前”音频状态为基线：接通前的事件不再算变化。
                         registration.routeBaseline = fingerprint
+                        // 框架在接通后还会重配音频（蓝牙可用性、静音开关等）：给一个短
+                        // 沉降窗口，窗口内的路由事件只重取基线（Task 11G 1）。
+                        registration.routeGraceUntilNs = clockNs() + ROUTE_CHANGE_GRACE_NS
                     }
                     event.kind == EventKind.STATE_CHANGED && snapshot.state != CallState.RINGING -> cancelPendingLocked(
                         registration,
@@ -278,12 +286,18 @@ class CallRegistry(
                             // 模块自己的路由动作：更新基线，绝不交还。
                             registration.routeBaseline = fingerprint ?: registration.routeBaseline
                         } else if (snapshot.state == CallState.ACTIVE && fingerprint != null) {
-                            val baseline = registration.routeBaseline
-                            if (baseline == null) {
-                                // 第一次观测到可比较的音频状态：没有“之前”可比，不交还。
+                            if (clockNs() < registration.routeGraceUntilNs) {
+                                // 接通后的沉降窗口：框架重配音频不是用户改路由；重取基线，
+                                // 窗口结束后同一路由的重复上报也不会被误判（Task 11G 1）。
                                 registration.routeBaseline = fingerprint
-                            } else if (fingerprint != baseline) {
-                                handBackLocked(registration, event.source, "route_change")
+                            } else {
+                                val baseline = registration.routeBaseline
+                                if (baseline == null) {
+                                    // 第一次观测到可比较的音频状态：没有“之前”可比，不交还。
+                                    registration.routeBaseline = fingerprint
+                                } else if (fingerprint != baseline) {
+                                    handBackLocked(registration, event.source, "route_change")
+                                }
                             }
                         }
                     }
@@ -360,7 +374,15 @@ class CallRegistry(
         sink.onCommandAttempt(CommandAttempt(id, command, ActionSource.MODULE, result))
     }
 
-    private companion object {
+    internal companion object {
+        /**
+         * 接通后的路由沉降窗口（Task 11G 1）。
+         *
+         * 框架会在 ACTIVE/音频通道打开后的短暂时间内重复重配路由（蓝牙可用性、静音
+         * 开关等良性事件）；窗口内的路由事件只重取基线，绝不交还。
+         */
+        const val ROUTE_CHANGE_GRACE_NS: Long = 1_000_000_000L
+
         const val MAX_CALL_ID_ATTEMPTS = 4
         const val MAX_SESSION_FIELD_CHARS = 64
 

@@ -463,6 +463,54 @@ class AudioPcmRelayTest {
         )
     }
 
+    /**
+     * Task 11G 2：旧实现先发布 writing=true 再更新时间戳；一次 tick 恰好落在两个赋值之间
+     * 时，会读到“正在写 + 上一次的旧时间戳”，把刚开始的写误判成 stall。发布必须是原子的。
+     */
+    @Test
+    fun aWatchdogTickBetweenWritingFlagAndTimestampCannotFalseFault() {
+        val now = 10_000L
+        lateinit var progress: AppWriteProgress
+        var gapTicks = 0
+        val clock = object : MonotonicClock {
+            override fun nowMs(): Long {
+                // clock.nowMs() 在两个赋值之间被求值：模拟看门狗恰好在此刻抽检。
+                if (gapTicks == 0) {
+                    gapTicks += 1
+                    assertFalse(
+                        "a tick inside the flag/timestamp publish gap must not fault",
+                        progress.stalled(now + 201L, 200L),
+                    )
+                }
+                return now
+            }
+        }
+        progress = AppWriteProgress(clock)
+
+        progress.begin()
+
+        assertEquals(1, gapTicks)
+        // 真正的 >2 s 无进展仍然必须 fault。
+        assertTrue(progress.stalled(now + 201L, 200L))
+    }
+
+    @Test
+    fun progressRefreshKeepsAFreshWriteAliveAndARealStallStillFaults() {
+        val clock = TestClock(0L)
+        val progress = AppWriteProgress(clock)
+
+        progress.begin()
+        clock.now = 100L
+        progress.progress()
+        clock.now = 300L
+        assertFalse("exactly at the threshold is not a stall", progress.stalled(clock.now, 200L))
+        clock.now = 301L
+        assertTrue("more than the threshold without progress is a stall", progress.stalled(clock.now, 200L))
+
+        progress.end()
+        assertFalse("a finished write is never a stall", progress.stalled(Long.MAX_VALUE, 200L))
+    }
+
     @Test
     fun sweepDisownedReleasesBindingsForSessionsTheSupervisorNoLongerOwns() {
         owner.own(sessionA)

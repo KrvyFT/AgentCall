@@ -1,5 +1,6 @@
 package org.krvyft.agentcall.hook
 
+import java.lang.reflect.Method
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
@@ -79,4 +80,62 @@ class HookAdapterTest {
         assertTrue(HookInstallGuard.claim())
         assertFalse(HookInstallGuard.claim())
     }
+
+    @Test
+    fun zeroSuccessfulHooksReleaseTheGuardSoTheProcessCanRetry() {
+        // Task 11G 3：install() 吞掉每个 hookMethod 失败后，旧代码仍把闸门当作“已安装”，
+        // 进程从此无法重试。零成功必须释放闸门。
+        HookInstallGuard.resetForTest()
+        val methods = listOf(lengthMethod())
+        val installer = HookMethodInstaller(hook = { throw IllegalStateException("hook rejected") })
+        assertTrue(HookInstallGuard.claim())
+
+        val installed = holdGuardAfterInstallAttempt(
+            installNow = { installer.install(methods) },
+            defer = { false },
+        )
+
+        assertFalse(installed)
+        assertEquals(0, installer.installedCount())
+        assertTrue("zero hooks must release the guard so the process can retry", HookInstallGuard.claim())
+    }
+
+    @Test
+    fun failedMethodsAreRetriedAndASuccessfulHookKeepsTheGuard() {
+        HookInstallGuard.resetForTest()
+        val method = lengthMethod()
+        val attempted = mutableListOf<Method>()
+        var reject = true
+        val installer = HookMethodInstaller(
+            hook = { candidate ->
+                attempted += candidate
+                if (reject) throw IllegalStateException("hook rejected")
+            },
+        )
+        assertTrue(HookInstallGuard.claim())
+
+        assertFalse(
+            "a zero-hook attempt must not keep the guard",
+            holdGuardAfterInstallAttempt({ installer.install(listOf(method)) }, { false }),
+        )
+        assertEquals(0, installer.installedCount())
+        assertTrue("after a zero-hook attempt the process must be able to retry", HookInstallGuard.claim())
+
+        reject = false
+        assertTrue(holdGuardAfterInstallAttempt({ installer.install(listOf(method)) }, { false }))
+        assertEquals("the failed method must be retried, not assumed installed", 2, attempted.size)
+        assertEquals(1, installer.installedCount())
+        assertFalse("at least one successful hook keeps the guard claimed", HookInstallGuard.claim())
+    }
+
+    @Test
+    fun deferredInstallationAloneKeepsTheGuardBecauseAHookWasInstalled() {
+        HookInstallGuard.resetForTest()
+        assertTrue(HookInstallGuard.claim())
+
+        assertTrue(holdGuardAfterInstallAttempt(installNow = { false }, defer = { true }))
+        assertFalse("the deferred hook is a real hook and must keep the guard", HookInstallGuard.claim())
+    }
+
+    private fun lengthMethod(): Method = String::class.java.getDeclaredMethod("length")
 }

@@ -678,11 +678,7 @@ class AudioPcmRelay(
         @Volatile
         private var onWriteFailure: (() -> Unit)? = null
 
-        @Volatile
-        private var lastProgressAtMs = 0L
-
-        @Volatile
-        private var writeInProgress = false
+        private val progress = AppWriteProgress(clock)
 
         @Synchronized
         fun startWriter(onStall: () -> Unit, onWriteFailure: () -> Unit) {
@@ -754,18 +750,17 @@ class AudioPcmRelay(
                         if (stopFlag.get()) return
                         continue
                     }
-                    writeInProgress = true
-                    lastProgressAtMs = clock.nowMs()
+                    progress.begin()
                     val written = PcmLaneCodec.writeFrame(output, next.type, next.body)
-                    lastProgressAtMs = clock.nowMs()
-                    writeInProgress = false
+                    progress.progress()
+                    progress.end()
                     if (!written) {
                         onWriteFailure?.invoke()
                         return
                     }
                 }
             } catch (t: Throwable) {
-                writeInProgress = false
+                progress.end()
                 if (!stopFlag.get()) onWriteFailure?.invoke()
             }
         }
@@ -778,8 +773,7 @@ class AudioPcmRelay(
                     return
                 }
                 if (stopFlag.get()) return
-                if (!writeInProgress) continue
-                if (clock.nowMs() - lastProgressAtMs <= appSinkStallTimeoutMs) continue
+                if (!progress.stalled(clock.nowMs(), appSinkStallTimeoutMs)) continue
                 if (!stallReported.compareAndSet(false, true)) return
                 onStall?.invoke()
                 return
@@ -841,5 +835,44 @@ class AudioPcmRelay(
 
         /** APP 输出方向超过看门狗阈值没有写入进展：按音频通路故障收尾（I3）。 */
         const val ERROR_APP_STREAM_STALLED: String = "audio_pcm_app_stream_stalled"
+    }
+}
+
+/**
+ * APP 写入进度状态（Task 11G 2）。
+ *
+ * 旧实现分两次赋值 `writeInProgress = true` 与 `lastProgressAtMs = now`；看门狗恰好落在
+ * 两者之间时会读到“正在写 + 上一次的旧时间戳”，把一次刚开始的写误判成 >2 s stall 并
+ * 关闭一条健康连接。这里用单个状态对象发布这两个字段，任何 tick 只能看到一致快照。
+ */
+internal class AppWriteProgress(private val clock: MonotonicClock) {
+
+    /** “是否正在写”和“最近进展时刻”必须作为**一个**不可分割的快照发布。 */
+    private class State(val writing: Boolean, val lastProgressAtMs: Long)
+
+    private val state = AtomicReference(State(writing = false, lastProgressAtMs = 0L))
+
+    /**
+     * 开始一次写：时间戳先求值，再与新状态**一次性**发布。看门狗在求值间隙抽检时看到的是
+     * 旧状态（writing=false），绝不会看到“writing=true + 旧时间戳”。
+     */
+    fun begin() {
+        state.set(State(writing = true, lastProgressAtMs = clock.nowMs()))
+    }
+
+    /** 一次写取得了进展；writing 保持 true，时间戳原子更新。 */
+    fun progress() {
+        state.set(State(writing = true, lastProgressAtMs = clock.nowMs()))
+    }
+
+    /** 写结束（正常或异常）：保留最近进展时刻，供下一次 begin 之前的状态读取。 */
+    fun end() {
+        state.updateAndGet { previous -> State(writing = false, lastProgressAtMs = previous.lastProgressAtMs) }
+    }
+
+    /** @return true 表示写线程已经超过 [timeoutMs] 没有取得进展。 */
+    fun stalled(nowMs: Long, timeoutMs: Long): Boolean {
+        val observed = state.get()
+        return observed.writing && nowMs - observed.lastProgressAtMs > timeoutMs
     }
 }

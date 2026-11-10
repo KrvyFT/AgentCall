@@ -91,21 +91,34 @@ internal object CallCounts {
 }
 
 /**
- * 音频路由/端点的稳定指纹（纯字符串，便于 JVM 侧比较）。
+ * **活动**音频路由/端点的稳定指纹（纯字符串，便于 JVM 侧比较）。
  *
- * 框架会在接通、端点切换等时机重复回调同一个音频状态；只有指纹变化才是“用户真的改了
- * 路由”。任何字段不可读都返回 null（无法证明变化，注册表按 no-op 处理）。
+ * 框架会在接通、端点切换等时机重复回调同一个音频状态；只有活动路由/端点变化才是
+ * “用户真的改了路由”。supportedRouteMask 与 isMuted 会随蓝牙可用性、静音开关等良性
+ * 事件变化，**不参与**指纹（Task 11G 1）。任何字段不可读都返回 null（无法证明变化，
+ * 注册表按 no-op 处理）。
  */
 internal object RouteFingerprint {
 
     fun ofAudioState(state: CallAudioState?): String? {
         if (state == null) return null
         return try {
-            "audio:" + state.route + ":" + (if (state.isMuted) 1 else 0) + ":" + state.supportedRouteMask
+            audioFingerprint(state.route, state.isMuted, state.supportedRouteMask)
         } catch (failure: Throwable) {
             null
         }
     }
+
+    /**
+     * 纯字符串指纹（便于 JVM 测试）。
+     *
+     * 只有活动 [route] 参与：静音开关与 supportedRouteMask 会随蓝牙可用性等良性事件
+     * 变化，把它们算进指纹会让一次无关事件被当成“用户换了路由”，从而把刚接通的 AI
+     * 通话交还人工（Task 11G 1）。
+     */
+    @Suppress("UNUSED_PARAMETER")
+    fun audioFingerprint(route: Int, isMuted: Boolean, supportedRouteMask: Int): String =
+        "audio:" + route
 
     fun ofEndpoint(endpoint: CallEndpoint?): String? {
         if (endpoint == null) return null

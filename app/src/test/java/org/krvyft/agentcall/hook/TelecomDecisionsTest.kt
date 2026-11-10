@@ -2,6 +2,7 @@ package org.krvyft.agentcall.hook
 
 import android.telecom.Call
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Test
 import org.krvyft.agentcall.core.model.CallState
@@ -64,6 +65,29 @@ class TelecomDecisionsTest {
         )
         assertEquals(1, CallCounts.activeCalls(listOf(Call.STATE_RINGING)))
         assertEquals(2, CallCounts.activeCalls(listOf(Call.STATE_ACTIVE, Call.STATE_HOLDING)))
+    }
+
+    // ------------------------------------------------------------------ 路由指纹
+
+    @Test
+    fun audioFingerprintOnlyTracksTheActiveRoute() {
+        // Task 11G 1：静音开关与 supportedRouteMask 会随蓝牙可用性等良性事件变化，
+        // 不能算进“用户换了路由”的指纹，否则刚接通的 AI 通话会被误交还。
+        val baseline = RouteFingerprint.audioFingerprint(route = 2, isMuted = false, supportedRouteMask = 0b1111)
+        assertEquals(
+            "a mute-only change must not change the route fingerprint",
+            baseline,
+            RouteFingerprint.audioFingerprint(route = 2, isMuted = true, supportedRouteMask = 0b1111),
+        )
+        assertEquals(
+            "a supported-route-mask change must not change the route fingerprint",
+            baseline,
+            RouteFingerprint.audioFingerprint(route = 2, isMuted = false, supportedRouteMask = 0b0001),
+        )
+        assertFalse(
+            "a real active-route change must change the fingerprint",
+            baseline == RouteFingerprint.audioFingerprint(route = 4, isMuted = false, supportedRouteMask = 0b1111),
+        )
     }
 
     // ------------------------------------------------------------------ 来源认领
