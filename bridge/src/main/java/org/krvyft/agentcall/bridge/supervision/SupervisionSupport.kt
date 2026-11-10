@@ -44,7 +44,29 @@ data class SupervisionPersistedState(
     val updatedAtMs: Long,
     /** 写入时的 boot_id；用来区分“同一开机内重启”与“重启过设备”，null 时退回 elapsedRealtime 比较。 */
     val bootId: String? = null,
+    /**
+     * 粘性所有权标记（修复轮 2 / 新增重要缺陷 2）：本监督端取得过通话所有权，且尚未
+     * 确认断开/未接听/交还。
+     *
+     * 必须与 [ownedSession] 分开持久化：[org.krvyft.agentcall.bridge.supervision.Supervisor.block]
+     * 、进程关闭与重启后的新进程都会把 [ownedSession] 写成 null，但泄漏的音频工作进程
+     * 可能仍持有那通电话与麦克风隔离。只有确认非所有权才允许清除。
+     */
+    val ownedCallMayBeLive: Boolean = false,
 )
+
+/**
+ * 持久状态是否来自当前这次开机。优先用 boot_id 精确比较；拿不到 boot_id 时退回
+ * “单调时钟未回退”的保守近似（同一开机内重启 elapsedRealtime 不会回退）。
+ */
+internal fun sameBootAsCurrent(
+    state: SupervisionPersistedState,
+    currentBootId: String?,
+    nowMs: Long,
+): Boolean = when {
+    state.bootId != null && currentBootId != null -> state.bootId == currentBootId
+    else -> nowMs >= state.updatedAtMs
+}
 
 /** 状态存储端口；生产实现是 [SupervisionStateStore]，测试注入假实现。 */
 interface SupervisionStateStorePort {
@@ -138,6 +160,7 @@ class SupervisionStateStore(
             if (state.lastFault == null) add("lastFault", null) else addProperty("lastFault", state.lastFault)
             addProperty("updatedAtMs", state.updatedAtMs)
             if (state.bootId == null) add("bootId", null) else addProperty("bootId", state.bootId)
+            addProperty("ownedCallMayBeLive", state.ownedCallMayBeLive)
         }
         atomicWrite(File(rootDirectory, FILE_NAME), json.toString().toByteArray(StandardCharsets.UTF_8))
     }
@@ -173,14 +196,23 @@ class SupervisionStateStore(
             )
             else -> throw SupervisionStateException(SupervisionStateErrorCode.CORRUPT, "ownedSession is invalid")
         }
+        val microphoneIsolated = boolean(json, "microphoneIsolated")
+        // schema 1 的文件没有粘性标记：按“可能仍拥有通话”的保守值推断（有旧所有权或
+        // 旧隔离意图），绝不因为字段缺失就把可能泄漏的通话当成已结束。
+        val ownedCallMayBeLive = if (schemaValue >= SCHEMA_OWNED_CALL_MAY_BE_LIVE) {
+            boolean(json, "ownedCallMayBeLive")
+        } else {
+            ownedSession != null || microphoneIsolated
+        }
         return SupervisionPersistedState(
             phase = phase,
             ownedSession = ownedSession,
-            microphoneIsolated = boolean(json, "microphoneIsolated"),
+            microphoneIsolated = microphoneIsolated,
             blockedReason = optionalString(json, "blockedReason"),
             lastFault = optionalString(json, "lastFault"),
             updatedAtMs = long(json, "updatedAtMs"),
             bootId = optionalString(json, "bootId"),
+            ownedCallMayBeLive = ownedCallMayBeLive,
         )
     }
 
@@ -255,7 +287,12 @@ class SupervisionStateStore(
     }
 
     companion object {
-        const val SCHEMA_VERSION: Int = 1
+        /** schema 2 增加独立的粘性所有权标记（ownedCallMayBeLive）。 */
+        const val SCHEMA_VERSION: Int = 2
+
+        /** 从这一版 schema 起 ownedCallMayBeLive 是必填字段；更早的版本按保守值推断。 */
+        private const val SCHEMA_OWNED_CALL_MAY_BE_LIVE: Double = 2.0
+
         const val FILE_NAME: String = "supervisor-state.json"
     }
 }
@@ -329,6 +366,8 @@ class SupervisorBootRecovery(
     private val block: (String) -> Unit,
     private val clock: MonotonicClock,
     private val bootId: () -> String? = { null },
+    /** 两次恢复尝试之间的等待；测试注入空实现以避免真实等待。 */
+    private val pause: suspend () -> Unit = { delay(RESTORE_RETRY_DELAY_MS) },
 ) {
 
     suspend fun recover(): BootRecoveryOutcome {
@@ -343,19 +382,42 @@ class SupervisorBootRecovery(
         // “elapsedRealtime 未回退”的保守近似。
         val sameBootState = (loaded as? LoadResult.Loaded)?.state
         val currentBootId = bootId()
-        val sameBoot = sameBootState != null && when {
-            sameBootState.bootId != null && currentBootId != null -> sameBootState.bootId == currentBootId
-            else -> clock.nowMs() >= sameBootState.updatedAtMs
-        }
-        if (sameBoot && sameBootState.ownedSession != null) {
+        val sameBoot = sameBootState != null &&
+            sameBootAsCurrent(sameBootState, currentBootId, clock.nowMs())
+        if (sameBoot && (sameBootState.ownedSession != null || sameBootState.ownedCallMayBeLive)) {
             block(BLOCK_RESTART_WITH_OWNED_CALL)
+            // block() 只写监督端自己的内存状态；重启用新进程尚未取得所有权，会把粘性标记
+            // 写成 false。这里显式写成 true：下一次重启读到的 ownedSession 可能已被
+            // block() 置空，只有这个标记还能阻止开麦。
+            try {
+                stateStore.save(
+                    sameBootState.copy(
+                        phase = SupervisorPhase.BLOCKED,
+                        blockedReason = BLOCK_RESTART_WITH_OWNED_CALL,
+                        ownedCallMayBeLive = true,
+                        updatedAtMs = clock.nowMs(),
+                        bootId = currentBootId ?: sameBootState.bootId,
+                    ),
+                )
+            } catch (t: Throwable) {
+                block(BLOCK_STATE_WRITE_FAILED)
+            }
             return BootRecoveryOutcome.BLOCKED
         }
 
-        val restored = try {
-            audio.restoreMicrophone()
-        } catch (t: Throwable) {
-            false
+        // 音频工作进程是另一个 app_process，桥接启动恢复时它可能还没绑定角色通道：
+        // 一次“不可达”就永久 BLOCKED 会让模块重启后一直不可用，因此有界重试；
+        // 次数用尽仍然 fail closed（保持隔离并阻止新会话）。
+        var restored = false
+        var attempts = 0
+        while (!restored && attempts < DEFAULT_RESTORE_ATTEMPTS) {
+            if (attempts > 0) pause()
+            attempts++
+            restored = try {
+                audio.restoreMicrophone()
+            } catch (t: Throwable) {
+                false
+            }
         }
         val stillIsolated = try {
             audio.verifyIsolation()
@@ -390,6 +452,7 @@ class SupervisorBootRecovery(
                     lastFault = null,
                     updatedAtMs = clock.nowMs(),
                     bootId = currentBootId,
+                    ownedCallMayBeLive = false,
                 ),
             )
         } catch (t: Throwable) {
@@ -405,6 +468,12 @@ class SupervisorBootRecovery(
     }
 
     companion object {
+        /** 启动恢复尝试次数上限；音频工作进程晚于桥接启动时仍能恢复，但次数有界。 */
+        const val DEFAULT_RESTORE_ATTEMPTS: Int = 3
+
+        /** 两次恢复尝试之间的等待（毫秒）。 */
+        const val RESTORE_RETRY_DELAY_MS: Long = 500L
+
         const val BLOCK_RESTORE_FAILED: String = "microphone_restore_failed"
         const val BLOCK_STILL_ISOLATED: String = "microphone_still_isolated"
         const val BLOCK_STATE_CORRUPT: String = "supervision_state_corrupt"
@@ -479,6 +548,12 @@ interface SupervisionPlatform {
 
     /** 当前 boot_id；读不到返回 null（启动恢复退回 elapsedRealtime 近似）。 */
     fun bootId(): String? = null
+
+    /**
+     * 真实通话状态来源。生产实现必须是 Hook 快照收件箱（[SnapshotCallStateProbe]），
+     * 否则“接听结果不明确”的核验路径在生产上是死代码。无法核验返回 null。
+     */
+    fun callState(): CallStateProbe = CallStateProbe { null }
 }
 
 /** 生产图：监督状态机 + 启动恢复 + 周期轮询。 */
@@ -508,6 +583,10 @@ object SupervisorProductionGraph {
             authorization = platform.authorization(),
             stateSink = { state -> store.save(state) },
             bootId = platform::bootId,
+            // 粘性所有权必须从持久状态恢复：block() 之后的第二次同一开机重启，磁盘上的
+            // ownedSession 已经是 null，只有这个标记还能阻止开麦。
+            initialOwnershipMayBeLive = persistedOwnershipMayBeLive(store, clock, platform.bootId()),
+            callState = platform.callState(),
         )
         val recovery = SupervisorBootRecovery(audio, store, supervisor::block, clock, platform::bootId)
         val loop = SupervisionLoop(
@@ -515,5 +594,23 @@ object SupervisorProductionGraph {
             clock = clock,
         )
         return SupervisionGraph(supervisor, recovery, loop)
+    }
+
+    /**
+     * 构建期从持久状态恢复粘性所有权标记。读不到/损坏时按 false 处理：启动恢复随后会
+     * 因为加载失败而 BLOCKED，不会开麦。
+     */
+    private fun persistedOwnershipMayBeLive(
+        store: SupervisionStateStorePort,
+        clock: MonotonicClock,
+        currentBootId: String?,
+    ): Boolean {
+        val state = try {
+            store.load()
+        } catch (t: Throwable) {
+            return false
+        } ?: return false
+        if (state.ownedCallMayBeLive) return true
+        return sameBootAsCurrent(state, currentBootId, clock.nowMs()) && state.ownedSession != null
     }
 }

@@ -26,6 +26,7 @@ import org.krvyft.agentcall.bridge.ipc.PeerVerifier
 import org.krvyft.agentcall.bridge.ipc.RootFramework
 import org.krvyft.agentcall.bridge.ipc.RpcHandler
 import org.krvyft.agentcall.bridge.supervision.AutoAnswerAuthorization
+import org.krvyft.agentcall.bridge.supervision.CallStateProbe
 import org.krvyft.agentcall.bridge.supervision.EmergencyCallControl
 import org.krvyft.agentcall.bridge.supervision.HookCallInbox
 import org.krvyft.agentcall.bridge.supervision.HookCommandCallControl
@@ -263,6 +264,8 @@ internal object BridgeRuntime {
                 override fun authorization() = authorization
                 override fun stateStore() = stateStore
                 override fun bootId(): String? = AndroidBootId.current()
+                // 接听结果不明确时必须能核验真实状态：生产来源是 Hook 快照收件箱。
+                override fun callState(): CallStateProbe = SnapshotCallStateProbe(inbox)
             },
         )
     }

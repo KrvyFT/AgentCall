@@ -193,7 +193,17 @@ class HookCommandCallControl(
     }
 
     companion object {
-        const val DEFAULT_TIMEOUT_MS: Long = 2_000L
+        /**
+         * 等待 Hook 结果的硬上限，必须覆盖 Hook 的取命令间隔。
+         *
+         * Hook 只在它的下一次心跳响应里取走排队的命令（Task 4 线格式），心跳周期是
+         * HookTransport.HEARTBEAT_INTERVAL_MS = 2000 ms：最坏情况下命令要等满一个
+         * 2000 ms 周期才会被取走执行，再加一次结果上行的余量。上限取 4000 ms：
+         * - > 2000 ms：不会每个 Answer 都在命令被取走前超时；
+         * - <= FAILURE_HANDOFF_WINDOW_MS / 2（10000 ms / 2）：接听结果最迟 4 s 内确定，
+         *   监督端仍有完整的人工接管窗口做核验/接管，等待本身不会把窗口吃掉。
+         */
+        const val DEFAULT_TIMEOUT_MS: Long = 4_000L
         const val ERROR_QUEUE: String = "hook_command_queue_full"
         const val ERROR_TIMEOUT: String = "hook_command_timeout"
     }

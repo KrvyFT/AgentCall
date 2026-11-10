@@ -19,6 +19,7 @@ import org.krvyft.agentcall.bridge.audio.ProcessFaultDecision
 import org.krvyft.agentcall.bridge.audio.SupervisedAudio
 import org.krvyft.agentcall.core.model.AudioFormatSpec
 import org.krvyft.agentcall.core.model.CallCommand
+import org.krvyft.agentcall.core.model.CallState
 import org.krvyft.agentcall.core.model.CommandResult
 import org.krvyft.agentcall.core.model.PcmAudio
 import org.krvyft.agentcall.core.model.PcmChunk
@@ -164,7 +165,13 @@ class SupervisorBootRecoveryTest {
     fun restoreFailureBlocksNewSessions() = runBlocking {
         val audio = SupportAudio().apply { restoreResult = false }
         var blocked: String? = null
-        val recovery = SupervisorBootRecovery(audio, FakeStateStore(null), { blocked = it }, SupportClock())
+        val recovery = SupervisorBootRecovery(
+            audio,
+            FakeStateStore(null),
+            { blocked = it },
+            SupportClock(),
+            pause = {},
+        )
 
         assertEquals(BootRecoveryOutcome.BLOCKED, recovery.recover())
         assertEquals(SupervisorBootRecovery.BLOCK_RESTORE_FAILED, blocked)
@@ -174,10 +181,58 @@ class SupervisorBootRecoveryTest {
     fun stillIsolatedAfterRestoreBlocksNewSessions() = runBlocking {
         val audio = SupportAudio().apply { systemIsolated = true; restoreEffective = false }
         var blocked: String? = null
-        val recovery = SupervisorBootRecovery(audio, FakeStateStore(null), { blocked = it }, SupportClock())
+        val recovery = SupervisorBootRecovery(
+            audio,
+            FakeStateStore(null),
+            { blocked = it },
+            SupportClock(),
+            pause = {},
+        )
 
         assertEquals(BootRecoveryOutcome.BLOCKED, recovery.recover())
         assertEquals(SupervisorBootRecovery.BLOCK_STILL_ISOLATED, blocked)
+    }
+
+    /**
+     * 启动恢复必须有界重试：音频工作进程是另一个 app_process，桥接启动恢复时它可能
+     * 还没绑定角色通道；一次“不可达”就永久 BLOCKED 会让模块重启后一直不可用。
+     */
+    @Test
+    fun bootRecoveryRetriesUntilTheAudioWorkerIsUp() = runBlocking {
+        val audio = SupportAudio().apply { restoreFailuresRemaining = 2 }
+        var blocked: String? = null
+        val recovery = SupervisorBootRecovery(
+            audio,
+            FakeStateStore(null),
+            { blocked = it },
+            SupportClock(),
+            pause = {},
+        )
+
+        assertEquals(BootRecoveryOutcome.CLEAN, recovery.recover())
+        assertEquals("工作进程晚到时必须重试恢复而不是直接放弃", 3, audio.restoreCalls)
+        assertNull(blocked)
+    }
+
+    @Test
+    fun bootRecoveryGivesUpAfterTheBoundedAttempts() = runBlocking {
+        val audio = SupportAudio().apply { restoreFailuresRemaining = 99 }
+        var blocked: String? = null
+        val recovery = SupervisorBootRecovery(
+            audio,
+            FakeStateStore(null),
+            { blocked = it },
+            SupportClock(),
+            pause = {},
+        )
+
+        assertEquals(BootRecoveryOutcome.BLOCKED, recovery.recover())
+        assertEquals(
+            "重试必须有界，失败后仍然 fail closed",
+            SupervisorBootRecovery.DEFAULT_RESTORE_ATTEMPTS,
+            audio.restoreCalls,
+        )
+        assertEquals(SupervisorBootRecovery.BLOCK_RESTORE_FAILED, blocked)
     }
 
     @Test
@@ -250,7 +305,7 @@ class SupervisorBootRecoveryTest {
 
             override fun save(state: SupervisionPersistedState) = Unit
         }
-        val recovery = SupervisorBootRecovery(audio, store, { blocked = it }, SupportClock())
+        val recovery = SupervisorBootRecovery(audio, store, { blocked = it }, SupportClock(), pause = {})
 
         assertEquals(BootRecoveryOutcome.BLOCKED, recovery.recover())
         assertEquals(1, audio.restoreCalls)
@@ -332,6 +387,8 @@ class SupervisorProductionGraphTest {
         val emergency: EmergencyCallControl,
         val authorization: AutoAnswerAuthorization,
         val store: FakeStateStore = FakeStateStore(null),
+        val bootIdValue: String? = null,
+        val probe: CallStateProbe = CallStateProbe { null },
     ) : SupervisionPlatform {
         override fun clock(): MonotonicClock = clock
         override fun supervisedAudio(): SupervisedAudio = audio
@@ -339,19 +396,23 @@ class SupervisorProductionGraphTest {
         override fun emergency(): EmergencyCallControl = emergency
         override fun authorization(): AutoAnswerAuthorization = authorization
         override fun stateStore(): SupervisionStateStorePort = store
+        override fun bootId(): String? = bootIdValue
+        override fun callState(): CallStateProbe = probe
     }
+
+    private fun verifiedEmergency(): EmergencyCallControl = EmergencyCallControl(
+        TerminationPermission { true },
+        object : CallIdentityVerifier {
+            override fun isAvailable(): Boolean = true
+            override suspend fun verify(id: SessionId): VerifiedCallIdentity? =
+                VerifiedCallIdentity(id, "telecom-1")
+        },
+        PrivilegedTermination { CommandResult.Accepted },
+    )
 
     private fun platform(authorized: Boolean = true): FakePlatform =
         FakePlatform(
-            emergency = EmergencyCallControl(
-                TerminationPermission { true },
-                object : CallIdentityVerifier {
-                    override fun isAvailable(): Boolean = true
-                    override suspend fun verify(id: SessionId): VerifiedCallIdentity? =
-                        VerifiedCallIdentity(id, "telecom-1")
-                },
-                PrivilegedTermination { CommandResult.Accepted },
-            ),
+            emergency = verifiedEmergency(),
             authorization = AutoAnswerAuthorization { authorized },
         )
 
@@ -402,6 +463,126 @@ class SupervisorProductionGraphTest {
         assertEquals("未授权时不得隔离麦克风或取得租约", 0, platform.audio.isolateCalls)
     }
 
+    /**
+     * 最小缺陷：生产图必须注入真实的 [CallStateProbe]（Hook 快照收件箱），否则
+     * “接听结果不明确”只能永远按不可核验处理，已有核验路径在生产上是死代码。
+     */
+    @Test
+    fun productionGraphInjectsTheHookCallStateProbeForAmbiguousAnswers() = runBlocking {
+        val platform = platform()
+        platform.calls.result = CommandResult.Failed("hook_command_timeout", "no result from hook")
+        val graph = SupervisorProductionGraph.build(
+            FakePlatform(
+                clock = platform.clock,
+                audio = platform.audio,
+                calls = platform.calls,
+                emergency = platform.emergency,
+                authorization = platform.authorization,
+                store = platform.store,
+                probe = CallStateProbe { CallState.DISCONNECTED },
+            ),
+        )
+        graph.recovery.recover()
+        graph.supervisor.start()
+        platform.heartbeat(graph.supervisor, session)
+
+        val result = graph.supervisor.prepareAnswer(session)
+
+        assertTrue(result is CommandResult.Failed)
+        assertFalse("确认已断开后必须恢复麦克风，而不是当成不可核验", platform.audio.microphoneIsolated)
+        assertEquals("启动恢复 1 次 + 明确未接听 1 次", 2, platform.audio.restoreCalls)
+    }
+
+    /**
+     * 最小缺陷：重启预算必须由生产路径驱动。音频工作进程不可达时
+     * [SupervisedAudio.takeProcessFault] 会带出故障，监督端每轮 poll 计入预算，
+     * 耗尽即故障终止（而不是只在测试里调用 onProcessFault）。
+     */
+    @Test
+    fun audioWorkerFaultsFromTheProductionAudioPortExhaustTheRestartBudget() = runBlocking {
+        val platform = platform()
+        val graph = SupervisorProductionGraph.build(platform)
+        graph.recovery.recover()
+        graph.supervisor.start()
+        platform.heartbeat(graph.supervisor, session)
+        assertEquals(CommandResult.Accepted, graph.supervisor.prepareAnswer(session))
+
+        repeat(RestartBudget.DEFAULT_MAX_RESTARTS) {
+            platform.audio.faults.addLast("audio_worker_unreachable")
+            assertTrue(
+                "预算内的音频工作进程故障只允许重启，不得终止通话",
+                graph.loop.pollOnce().none { it is SupervisorAction.TerminateCall },
+            )
+        }
+        platform.audio.faults.addLast("audio_worker_unreachable")
+        val actions = graph.loop.pollOnce()
+
+        assertTrue(
+            "重启预算耗尽必须由生产轮询触发故障终止",
+            actions.any { it is SupervisorAction.TerminateCall },
+        )
+        assertTrue("终止未确认前不得恢复麦克风", platform.audio.microphoneIsolated)
+    }
+
+    /**
+     * 新增重要缺陷 2：粘性同一开机守卫。第一次重启时 block() 会把 ownedSession 写成
+     * null（并缓存 microphoneIsolated=false），如果所有权标记不独立持久化，第二次重启
+     * 就会看到“无所有权”而恢复麦克风——而泄漏的音频工作进程可能仍持有这通电话。
+     */
+    @Test
+    fun twoConsecutiveSameBootRestartsNeverRestoreTheMicrophone() = runBlocking {
+        val boot = "boot-a"
+        val leaked = SessionId("epoch-1", "leaked-call")
+        val store = FakeStateStore(
+            SupervisionPersistedState(
+                phase = SupervisorPhase.ACTIVE,
+                ownedSession = leaked,
+                microphoneIsolated = true,
+                blockedReason = null,
+                lastFault = null,
+                updatedAtMs = 1_000,
+                bootId = boot,
+            ),
+        )
+
+        val firstAudio = SupportAudio().apply { systemIsolated = true }
+        val first = SupervisorProductionGraph.build(
+            FakePlatform(
+                audio = firstAudio,
+                emergency = verifiedEmergency(),
+                authorization = AutoAnswerAuthorization { true },
+                store = store,
+                bootIdValue = boot,
+            ),
+        )
+        assertEquals(BootRecoveryOutcome.BLOCKED, first.recovery.recover())
+        assertEquals(
+            "同一开机内第一次重启不得解除可能仍活着的 AI 通话隔离",
+            0,
+            firstAudio.restoreCalls,
+        )
+        assertTrue("必须持久化独立于 ownedSession 的粘性标记", store.load()!!.ownedCallMayBeLive)
+
+        // 第二次重启：block() 已把 ownedSession 置空，但粘性标记必须仍然阻止开麦。
+        val secondAudio = SupportAudio().apply { systemIsolated = true }
+        val second = SupervisorProductionGraph.build(
+            FakePlatform(
+                audio = secondAudio,
+                emergency = verifiedEmergency(),
+                authorization = AutoAnswerAuthorization { true },
+                store = store,
+                bootIdValue = boot,
+            ),
+        )
+        assertEquals(BootRecoveryOutcome.BLOCKED, second.recovery.recover())
+        assertEquals(
+            "第二次重启同样不得把麦克风打开给可能还活着的 AI 通话",
+            0,
+            secondAudio.restoreCalls,
+        )
+        assertTrue(store.load()!!.ownedCallMayBeLive)
+    }
+
     private fun FakePlatform.heartbeat(supervisor: Supervisor, id: SessionId) {
         supervisor.heartbeat(id, PeerRole.APP, clock.nowMs())
         supervisor.heartbeat(id, PeerRole.HOOK, clock.nowMs())
@@ -439,6 +620,10 @@ private class SupportAudio : SupervisedAudio {
     var stopCalls = 0
     var openCalls = 0
     var systemIsolated = false
+    var restoreFailuresRemaining = 0
+    val faults = ArrayDeque<String>()
+
+    override fun takeProcessFault(): String? = faults.removeFirstOrNull()
 
     override val microphoneIsolated: Boolean
         get() = systemIsolated
@@ -469,6 +654,10 @@ private class SupportAudio : SupervisedAudio {
 
     override suspend fun restoreMicrophone(): Boolean {
         restoreCalls++
+        if (restoreFailuresRemaining > 0) {
+            restoreFailuresRemaining--
+            return false
+        }
         if (restoreResult && restoreEffective) systemIsolated = false
         return restoreResult
     }
@@ -476,9 +665,10 @@ private class SupportAudio : SupervisedAudio {
 
 private class SupportCalls : CallControl {
     val commands = mutableListOf<Pair<SessionId, CallCommand>>()
+    var result: CommandResult = CommandResult.Accepted
 
     override suspend fun send(id: SessionId, command: CallCommand): CommandResult {
         commands += id to command
-        return CommandResult.Accepted
+        return result
     }
 }

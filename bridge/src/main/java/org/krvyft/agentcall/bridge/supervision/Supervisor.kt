@@ -152,6 +152,8 @@ class Supervisor(
     private val callState: CallStateProbe = CallStateProbe { null },
     private val stateSink: (SupervisionPersistedState) -> Unit = {},
     private val bootId: () -> String? = { null },
+    /** 构建时从持久状态恢复的粘性所有权标记（生产装配点负责读取，见 [SupervisorProductionGraph]）。 */
+    initialOwnershipMayBeLive: Boolean = false,
     maxRestarts: Int = RestartBudget.DEFAULT_MAX_RESTARTS,
     restartWindowMs: Long = RestartBudget.DEFAULT_WINDOW_MS,
 ) : Closeable {
@@ -179,6 +181,16 @@ class Supervisor(
     private var handoffDeadlineMs: Long? = null
     private var blockedReason: String? = null
     private var lastFault: String? = null
+
+    /**
+     * 粘性所有权标记（修复轮 2 / 新增重要缺陷 2）。
+     *
+     * “本监督端曾经取得过通话所有权，且尚未确认断开/未接听/交还”。它必须与
+     * [ownedSession] 分开持久化：block()、进程关闭、以及重启后的新进程都会把
+     * [ownedSession] 写成 null，但可能仍有泄漏的音频工作进程持有那通电话和麦克风隔离。
+     * 只有确认非所有权（断开确认、确认未接听、成功交还）才允许清除。
+     */
+    private var ownershipMayBeLive: Boolean = initialOwnershipMayBeLive
 
     /**
      * 每个心跳角色最近一次按会话记录的存活时间（LRU 有界）。
@@ -296,6 +308,7 @@ class Supervisor(
 
         synchronized(stateMonitor) {
             ownedSession = id
+            ownershipMayBeLive = true
             phase = SupervisorPhase.ARMED
             handoffDeadlineMs = null
             lastFault = null
@@ -360,6 +373,8 @@ class Supervisor(
         }
         synchronized(stateMonitor) {
             ownedSession = null
+            // 确认未接听（Rejected / RINGING / DISCONNECTED）是“非所有权”证据。
+            ownershipMayBeLive = false
             handoffDeadlineMs = null
             if (restored) {
                 phase = SupervisorPhase.IDLE
@@ -479,6 +494,8 @@ class Supervisor(
         }
         synchronized(stateMonitor) {
             ownedSession = null
+            // 只有确认交还成功（麦克风已恢复并读回）才是“非所有权”证据。
+            if (restored) ownershipMayBeLive = false
             handoffDeadlineMs = null
             phase = if (restored) SupervisorPhase.IDLE else SupervisorPhase.BLOCKED
             if (!restored) blockedReason = BLOCKER_RESTORE_FAILED
@@ -507,6 +524,8 @@ class Supervisor(
         }
         synchronized(stateMonitor) {
             ownedSession = null
+            // 断开是已核验的“非所有权”证据：即使恢复失败也清除标记（通话确实没了）。
+            ownershipMayBeLive = false
             handoffDeadlineMs = null
             phase = if (restored) SupervisorPhase.ENDED else SupervisorPhase.BLOCKED
             if (!restored) blockedReason = BLOCKER_RESTORE_FAILED
@@ -592,6 +611,13 @@ class Supervisor(
     suspend fun poll(nowMs: Long = clock.nowMs()): List<SupervisorAction> = transitions.withLock {
         val actions = mutableListOf<SupervisorAction>()
         drainPendingInto(actions)
+        // 音频工作进程故障的生产来源：每轮取走一条并计入本监督端的重启预算。
+        var audioFault = takeAudioFault()
+        while (audioFault != null) {
+            val fault = onProcessFaultLocked(BridgeProcessRole.AUDIO_WORKER, audioFault, nowMs)
+            actions += fault.second
+            audioFault = takeAudioFault()
+        }
         val handled = mutableSetOf<SessionId>()
 
         val handoff = synchronized(stateMonitor) {
@@ -665,18 +691,38 @@ class Supervisor(
         code: String,
         nowMs: Long = clock.nowMs(),
     ): ProcessFaultDecision = transitions.withLock {
+        onProcessFaultLocked(role, code, nowMs).first
+    }
+
+    /** 取走一条音频工作进程故障；取不到或端口异常返回 null（不能把轮询打断）。 */
+    private fun takeAudioFault(): String? = try {
+        audio.takeProcessFault()
+    } catch (t: Throwable) {
+        null
+    }
+
+    /**
+     * 已持有 [transitions] 时的故障裁决。返回裁决与被触发的终止动作，供
+     * [poll] 把生产路径的故障直接变成监督动作；[onProcessFault] 是它的挂起入口。
+     */
+    private suspend fun onProcessFaultLocked(
+        role: BridgeProcessRole,
+        code: String,
+        nowMs: Long,
+    ): Pair<ProcessFaultDecision, List<SupervisorAction>> {
         if (role != BridgeProcessRole.AUDIO_WORKER || this.role != BridgeProcessRole.SUPERVISOR) {
-            return@withLock ProcessFaultDecision.NotManaged
+            return ProcessFaultDecision.NotManaged to emptyList()
         }
         val decision = restartBudget.record(nowMs)
         synchronized(stateMonitor) { lastFault = code }
-        if (decision is ProcessFaultDecision.RestartExhausted) {
+        val actions = if (decision is ProcessFaultDecision.RestartExhausted) {
             val owned = synchronized(stateMonitor) { ownedSession }
-            if (owned != null) {
-                terminateOwnedLocked(owned, "audio_restart_exhausted")
-            }
+            if (owned == null) emptyList() else terminateOwnedLocked(owned, "audio_restart_exhausted").actions
+        } else {
+            persist()
+            emptyList()
         }
-        decision
+        return decision to actions
     }
 
     fun snapshot(nowMs: Long = clock.nowMs()): SupervisorSnapshot {
@@ -761,6 +807,7 @@ class Supervisor(
                 lastFault = lastFault,
                 updatedAtMs = clock.nowMs(),
                 bootId = bootId(),
+                ownedCallMayBeLive = ownershipMayBeLive,
             )
         }
         try {

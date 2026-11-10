@@ -1,5 +1,9 @@
 package org.krvyft.agentcall.bridge.supervision
 
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -10,6 +14,7 @@ import org.krvyft.agentcall.core.model.CallState
 import org.krvyft.agentcall.core.model.CommandResult
 import org.krvyft.agentcall.core.model.RejectReason
 import org.krvyft.agentcall.core.model.SessionId
+import org.krvyft.agentcall.core.session.SessionLimits
 
 /**
  * 监督端与 Hook 命令/快照通道之间的桥接测试（C1：生产路径必须真的能把
@@ -133,6 +138,9 @@ class HookCommandCallControlTest {
 
     private val session = SessionId("epoch-1", "call-a")
 
+    /** 与 HookTransport.HEARTBEAT_INTERVAL_MS 对齐的取命令间隔。 */
+    private val HOOK_PICKUP_MS: Long = 2_000L
+
     @Test
     fun queueSaturationIsAboundedFailure() = runBlocking {
         val control = HookCommandCallControl(
@@ -174,6 +182,54 @@ class HookCommandCallControlTest {
 
         assertTrue(result is CommandResult.Failed)
         assertEquals(HookCommandCallControl.ERROR_TIMEOUT, (result as CommandResult.Failed).code)
+    }
+
+    /**
+     * 新增重要缺陷 3：Hook 只在 2000 ms 心跳响应里取命令。等待上限必须大于取命令间隔，
+     * 否则 Answer 每次都超时 → Failed → 人工接管窗口 → 10 秒后终止。
+     */
+    @Test
+    fun commandWaitCoversTheHookHeartbeatPickupInterval() {
+        val hookPickupMs = HOOK_PICKUP_MS
+        assertTrue(
+            "等待上限 " + HookCommandCallControl.DEFAULT_TIMEOUT_MS +
+                " ms 必须大于 Hook 的 " + hookPickupMs + " ms 心跳取命令间隔",
+            HookCommandCallControl.DEFAULT_TIMEOUT_MS > hookPickupMs,
+        )
+        assertTrue(
+            "接听决策必须明显短于 " + SessionLimits.FAILURE_HANDOFF_WINDOW_MS + " ms 人工接管窗口",
+            HookCommandCallControl.DEFAULT_TIMEOUT_MS <= SessionLimits.FAILURE_HANDOFF_WINDOW_MS / 2,
+        )
+    }
+
+    @Test
+    fun answerPickedUpOnTheNextHookHeartbeatStillCompletes() = runBlocking {
+        val inbox = HookCallInbox()
+        val enqueued = CompletableDeferred<SessionId>()
+        val control = HookCommandCallControl(
+            enqueue = { id, _ ->
+                enqueued.complete(id)
+                true
+            },
+            inbox = inbox,
+        )
+        // 假 Hook：命令进队列后要等一次心跳才取走并回报结果（真实上限 2000 ms）。
+        val hook = launch(Dispatchers.Default) {
+            val id = enqueued.await()
+            delay(HOOK_PICKUP_MS)
+            inbox.recordResult(id, CallCommand.Answer, CommandResult.Accepted)
+        }
+
+        val startedAt = System.nanoTime()
+        val result = control.send(session, CallCommand.Answer)
+        val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L
+        hook.join()
+
+        assertEquals("一次心跳延迟内的结果不能被当成超时", CommandResult.Accepted, result)
+        assertTrue(
+            "必须真的等过一次 " + HOOK_PICKUP_MS + " ms 取命令间隔（实际 " + elapsedMs + " ms）",
+            elapsedMs >= HOOK_PICKUP_MS - 100,
+        )
     }
 
     @Test

@@ -47,6 +47,7 @@ class SupervisorTest {
         permissionGranted: Boolean = true,
         identityAvailable: Boolean = true,
         authorized: Boolean = true,
+        stateSink: (SupervisionPersistedState) -> Unit = {},
     ) {
         val clock = FakeClock()
         val leases = LeaseRegistry()
@@ -69,6 +70,7 @@ class SupervisorTest {
             leases = leases,
             authorization = AutoAnswerAuthorization { authorized },
             role = BridgeProcessRole.SUPERVISOR,
+            stateSink = stateSink,
         )
 
         fun heartbeat() {
@@ -321,6 +323,38 @@ class SupervisorTest {
         assertEquals(ProcessFaultDecision.RestartExhausted(3), exhausted)
         assertTrue(f.calls.commands.any { it.second == CallCommand.Hangup })
         assertTrue(f.worker.microphoneIsolated)
+    }
+
+    /**
+     * 新增重要缺陷 2（监督端职责）：所有权标记必须独立于 ownedSession 持久化，
+     * block()/shutdown() 都不能把它清掉；只有确认断开/确认未接听/确认交还才允许清除。
+     */
+    @Test
+    fun ownershipMarkerIsStickyAcrossBlockAndShutdown() = runBlocking {
+        val states = mutableListOf<SupervisionPersistedState>()
+        val f = Fixture(stateSink = { states += it })
+        f.heartbeat()
+        assertEquals(CommandResult.Accepted, f.supervisor.prepareAnswer(session))
+        assertTrue("取得所有权后必须持久化“可能仍拥有通话”标记", states.last().ownedCallMayBeLive)
+
+        f.supervisor.block("test_block")
+        assertTrue("block() 不得清掉所有权标记", states.last().ownedCallMayBeLive)
+
+        f.supervisor.shutdown()
+        assertTrue("关闭进程同样不能假定通话已结束", states.last().ownedCallMayBeLive)
+    }
+
+    @Test
+    fun ownershipMarkerIsClearedOnlyByConfirmedDisconnect() = runBlocking {
+        val states = mutableListOf<SupervisionPersistedState>()
+        val f = Fixture(stateSink = { states += it })
+        f.heartbeat()
+        f.supervisor.prepareAnswer(session)
+        assertEquals(CommandResult.Accepted, f.supervisor.onCallActive(session, format))
+
+        f.supervisor.onCallDisconnected(session)
+
+        assertFalse("确认断开后必须清除所有权标记", states.last().ownedCallMayBeLive)
     }
 
     @Test
