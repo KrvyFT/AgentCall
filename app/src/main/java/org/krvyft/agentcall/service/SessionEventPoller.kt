@@ -127,6 +127,15 @@ class SessionEventPoller(
     private val onSupervisorHandback: (SessionId, SupervisorHandback) -> Unit = { id, _ ->
         publish(SessionEvent.Takeover(TakeoverReason.UNKNOWN, id))
     },
+    /**
+     * 桥接进程代次变化（uptime 回退 = 新进程）后的本地收尾（Task 7B3 FOLLOW-UP）。
+     *
+     * 旧进程所属会话的 `call_disconnected` 可能随进程一起消失；轮询器只报告“代次变了”，
+     * 由协调器把它变成一次**本地** SessionEnded（不挂断、不伪造 DISCONNECTED 快照），
+     * 从而允许新代次的响铃被接受。协调器没有会话时自然什么都不做。
+     * 每次代次变化只报告一次（uptime 已更新，后续轮询不再判定为重启）。
+     */
+    private val onBridgeRestarted: () -> Unit = {},
 ) {
 
     init {
@@ -237,8 +246,14 @@ class SessionEventPoller(
                 delay(nextBackoff())
                 continue
             }
-            if (restarted && lastSeq != 0L) {
-                clearBaseline("session_events_epoch_reset")
+            if (restarted) {
+                // 代次变化：旧进程的断开事实可能永远不会到达。先让协调器本地结束它仍拥有的
+                // 旧会话（否则新来电按“只有 IDLE/ENDED 才可替换”一直被忽略），再清空基线重读。
+                // 回调先于本轮投递，保证“结束旧会话”排在“新代次的 RINGING”之前。
+                reportBridgeRestart()
+                if (lastSeq != 0L) {
+                    clearBaseline("session_events_epoch_reset")
+                }
             }
             pollCounter.incrementAndGet()
             val result = try {
@@ -313,6 +328,23 @@ class SessionEventPoller(
                 if (restarted) logger("session_events_epoch_restarted")
                 restarted
             }
+        }
+    }
+
+    /**
+     * 把“桥接代次变化”这一事实交给协调器（由它本地结束仍拥有的会话）。
+     *
+     * 与事件投递一样，回调抛异常绝不能杀死轮询循环：记一条投递失败诊断后继续，
+     * 游标重新同步仍照常进行。
+     */
+    private fun reportBridgeRestart() {
+        try {
+            onBridgeRestarted()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Throwable) {
+            deliverFailureCounter.incrementAndGet()
+            reportDiagnostic(ERROR_DELIVER_FAILED)
         }
     }
 

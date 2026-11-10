@@ -33,6 +33,7 @@ import org.krvyft.agentcall.core.port.AudioSession
 import org.krvyft.agentcall.core.port.CallControl
 import org.krvyft.agentcall.core.port.ConversationPort
 import org.krvyft.agentcall.core.port.MonotonicClock
+import org.krvyft.agentcall.core.session.LeaseRegistry
 import org.krvyft.agentcall.core.session.SessionReducer
 import org.krvyft.agentcall.ipc.BridgeRead
 import org.krvyft.agentcall.ipc.EventsBatch
@@ -560,6 +561,177 @@ class SessionEventPollerTest {
         }
     }
 
+    // ------------------------------------- 桥接代次变化：本地结束旧会话（7B3 FOLLOW-UP）
+
+    /**
+     * 裁定（7B3 FOLLOW-UP）：桥接代次变化时，协调器仍拥有的会话必须**本地结束一次**
+     * （StopConversation → RevokeLease → RestoreMicrophone → ENDED，绝不发挂断，也不伪造
+     * DISCONNECTED 快照），随后新代次的 RINGING 才能被接受并按正常倒计时接听。
+     *
+     * 旧进程的 call_disconnected 会随进程一起消失；没有这次本地结束，会话会卡在
+     * ACTIVE_AI/ENDING 直到 180 s 上限，并把新来电一直挡在“不可替换”之外。
+     */
+    @Test
+    fun aBridgeRestartEndsTheOwnedSessionLocallyAndTheNextCallIsAnswered() = runTest {
+        val bridge = RestartingFakeBridge(uptimeMs = 10_000L)
+        bridge.record(ringing(0, id = session), source = "UNKNOWN")
+        val events = mutableListOf<String>()
+        val calls = FakeCallControl()
+        val audio = LoggingAudioBridge(events)
+        val conversation = LoggingConversation(events)
+        val revoker = LoggingRevoker(events)
+        val observer = RecordingObserver(events)
+        val leases = LeaseRegistry()
+        val coordinator = polledCoordinator(calls, audio, conversation, revoker, observer, leases)
+        coordinator.start()
+        val poller = TestScopePoller(
+            bridge,
+            coordinator::onEvent,
+            epochSource = bridge,
+            onBridgeRestarted = coordinator::onBridgeRestarted,
+        )
+        poller.start()
+        try {
+            runCurrent()
+            coordinator.onEvent(SessionEvent.ReadyChanged(true))
+            advance(3_100)
+            assertEquals(listOf(SentCommand(session, CallCommand.Answer)), calls.sent)
+
+            // 通话进入 ACTIVE：音频/会话打开、本地租约有效。
+            bridge.record(ringing(0, id = session, state = CallState.ACTIVE), source = "UNKNOWN")
+            advance(500)
+            assertEquals(SessionState.ACTIVE_AI, coordinator.state)
+            assertTrue("the AI call must hold the local lease", leases.isLive(session))
+            assertEquals(listOf("audio.opened:call-a", "conversation.started:call-a"), events)
+
+            // 桥接重启（uptime 回退）：旧进程的断开事实永远不会到达；新进程里已有一路新响铃。
+            bridge.restart(uptimeMs = 100L)
+            bridge.record(ringing(0, id = other), source = "UNKNOWN")
+            advance(500)
+
+            // 旧会话本地结束；同一次重新同步读出的新代次响铃随后被接受（旧会话不得被静默顶掉）。
+            assertEquals("the new generation's call must own the session", other, coordinator.activeSession)
+            assertEquals(
+                "StopConversation → RevokeLease(local) → RestoreMicrophone, never Hangup",
+                listOf(
+                    "audio.opened:call-a",
+                    "conversation.started:call-a",
+                    "conversation.cancelled:call-a",
+                    "audio.stopped:call-a",
+                    "restored:call-a",
+                ),
+                events,
+            )
+            assertFalse("the local end must release the local lease", leases.isLive(session))
+            assertTrue(
+                "the supervisor owns termination: no handover RPC may be sent",
+                revoker.revoked.isEmpty(),
+            )
+            assertTrue(
+                "a restart-ended call must never be hung up",
+                calls.sent.none { it.command == CallCommand.Hangup },
+            )
+            assertEquals(
+                "ENDED must be broadcast exactly once for the old session",
+                1,
+                observer.states.count { it.first == session && it.second == SessionState.ENDED },
+            )
+            assertEquals(listOf(session), observer.handedBack)
+            assertEquals(listOf(RevokeOutcome.NOT_OWNED), observer.outcomes)
+
+            // 新代次的 RINGING 必须被接受，并按正常倒计时接听（READY 是服务级事实，继承）。
+            assertEquals(SessionState.PREPARING, coordinator.state)
+            advance(3_100)
+            assertEquals(
+                "the new call is answered normally",
+                listOf(
+                    SentCommand(session, CallCommand.Answer),
+                    SentCommand(other, CallCommand.Answer),
+                ),
+                calls.sent,
+            )
+        } finally {
+            poller.stop()
+            coordinator.close()
+        }
+    }
+
+    /** 同一次重启可能跨多轮轮询被观测：代次信号只能上报一次。 */
+    @Test
+    fun aDetectedBridgeRestartIsReportedOnceAcrossPolls() = runTest {
+        val bridge = RestartingFakeBridge(uptimeMs = 10_000L)
+        bridge.record(ringing(0, id = session), source = "UNKNOWN")
+        var restarts = 0
+        val poller = TestScopePoller(
+            bridge,
+            {},
+            epochSource = bridge,
+            onBridgeRestarted = { restarts += 1 },
+        )
+        poller.start()
+        try {
+            runCurrent()
+            assertEquals("an unchanged generation must not signal a restart", 0, restarts)
+
+            bridge.restart(uptimeMs = 100L)
+            advance(500)
+            assertEquals("the generation change must be reported", 1, restarts)
+
+            advance(5_000)
+            assertEquals("later polls of the same generation must not report it again", 1, restarts)
+        } finally {
+            poller.stop()
+        }
+    }
+
+    /**
+     * 协调器没有会话时，代次变化是空操作，但**游标重新同步照常发生**：新进程的事件环
+     * 必须从 0 重读，新代次的响铃才能被投递。
+     */
+    @Test
+    fun aBridgeRestartWithoutAnOwnedSessionStillResyncsTheCursor() = runTest {
+        val bridge = RestartingFakeBridge(uptimeMs = 10_000L)
+        bridge.record(supervisor(0, "call_disconnected", null), source = "SUPERVISOR")
+        val events = mutableListOf<String>()
+        val calls = FakeCallControl()
+        val audio = LoggingAudioBridge(events)
+        val conversation = LoggingConversation(events)
+        val revoker = LoggingRevoker(events)
+        val observer = RecordingObserver(events)
+        val coordinator = polledCoordinator(calls, audio, conversation, revoker, observer, LeaseRegistry())
+        coordinator.start()
+        val poller = TestScopePoller(
+            bridge,
+            coordinator::onEvent,
+            epochSource = bridge,
+            onBridgeRestarted = coordinator::onBridgeRestarted,
+        )
+        poller.start()
+        try {
+            runCurrent()
+            assertNull("a disconnect fact without a session owns nothing", coordinator.activeSession)
+            assertEquals(1L, poller.lastSeq)
+
+            bridge.restart(uptimeMs = 100L)
+            bridge.record(ringing(0, id = other), source = "UNKNOWN")
+            advance(500)
+
+            assertTrue(
+                "no owned session: nothing may be ended",
+                observer.states.none { it.second == SessionState.ENDED },
+            )
+            assertTrue("no owned session: no handback may be reported", observer.handedBack.isEmpty())
+            assertTrue("no owned session: no audio/conversation/revoke may happen", events.isEmpty())
+            assertTrue("no owned session: no command may be sent", calls.sent.isEmpty())
+            assertEquals("the restart must still resync the cursor", 0L, bridge.cursors.last())
+            assertEquals(1L, poller.baselineResetCount)
+            assertEquals("the new generation's first event must be delivered", other, coordinator.activeSession)
+        } finally {
+            poller.stop()
+            coordinator.close()
+        }
+    }
+
     // ------------------------------------------- 批次容错/诊断（minors）
 
     /** stop() 必须取消在途批次：本批剩余事件绝不能在服务停止后再投递。 */
@@ -677,6 +849,7 @@ class SessionEventPollerTest {
         onDiagnostic: (String) -> Unit = {},
         onRecovered: () -> Unit = {},
         onSupervisorHandback: ((SessionId, SupervisorHandback) -> Unit)? = null,
+        onBridgeRestarted: () -> Unit = {},
     ): SessionEventPoller = SessionEventPoller(
         source = source,
         publish = publish,
@@ -694,6 +867,7 @@ class SessionEventPollerTest {
         onSupervisorHandback = onSupervisorHandback ?: { id, _ ->
             publish(SessionEvent.Takeover(TakeoverReason.UNKNOWN, id))
         },
+        onBridgeRestarted = onBridgeRestarted,
     )
 
     /** 模拟“每进程一份”的事件环：重启后 uptime 回退、seq 从 1 重新开始。 */
@@ -824,6 +998,88 @@ class SessionEventPollerTest {
     private object NoopConversation : ConversationPort {
         override suspend fun run(id: SessionId, audio: AudioSession, config: AgentConfig) {
             awaitCancellation()
+        }
+    }
+
+    /** 与生产一致的装配：轮询器把代次变化交给协调器的本地结束入口。 */
+    private fun TestScope.polledCoordinator(
+        calls: CallControl,
+        audio: AudioBridge,
+        conversation: ConversationPort,
+        revoker: OwnershipRevoker,
+        observer: SessionObserver,
+        leases: LeaseRegistry = LeaseRegistry(),
+    ): SessionCoordinator = SessionCoordinator(
+        config = config,
+        calls = calls,
+        audio = audio,
+        conversation = conversation,
+        clock = MonotonicClock { testScheduler.currentTime },
+        leases = leases,
+        revoker = revoker,
+        observer = observer,
+        dispatcher = StandardTestDispatcher(testScheduler),
+        tickIntervalMs = 1_000,
+    )
+
+    private class LoggingAudioBridge(private val events: MutableList<String>) : AudioBridge {
+        override suspend fun open(id: SessionId, format: AudioFormatSpec): AudioSession {
+            events += "audio.opened:" + id.callId
+            return LoggingAudioSession(id, events)
+        }
+    }
+
+    private class LoggingAudioSession(
+        private val session: SessionId,
+        private val events: MutableList<String>,
+    ) : AudioSession {
+        override val downlink: Flow<PcmChunk> = emptyFlow()
+
+        override suspend fun writeUplink(audio: PcmAudio) = Unit
+
+        override suspend fun stop() {
+            events += "audio.stopped:" + session.callId
+        }
+    }
+
+    private class LoggingConversation(private val events: MutableList<String>) : ConversationPort {
+        override suspend fun run(id: SessionId, audio: AudioSession, config: AgentConfig) {
+            events += "conversation.started:" + id.callId
+            try {
+                awaitCancellation()
+            } finally {
+                events += "conversation.cancelled:" + id.callId
+            }
+        }
+    }
+
+    private class LoggingRevoker(private val events: MutableList<String>) : OwnershipRevoker {
+        val revoked = mutableListOf<SessionId>()
+
+        override suspend fun revoke(id: SessionId): RevokeOutcome {
+            revoked += id
+            events += "revoked:" + id.callId
+            return RevokeOutcome.CONFIRMED
+        }
+    }
+
+    private class RecordingObserver(private val events: MutableList<String>) : SessionObserver() {
+        val states = mutableListOf<Pair<SessionId, SessionState>>()
+        val handedBack = mutableListOf<SessionId>()
+        val outcomes = mutableListOf<RevokeOutcome>()
+
+        override fun onStateChanged(id: SessionId, state: SessionState) {
+            states += id to state
+        }
+
+        override fun onHandedBack(id: SessionId, outcome: RevokeOutcome) {
+            handedBack += id
+            outcomes += outcome
+            events += if (outcome == RevokeOutcome.CONFIRMED || outcome == RevokeOutcome.NOT_OWNED) {
+                "restored:" + id.callId
+            } else {
+                "unconfirmed:" + id.callId
+            }
         }
     }
 

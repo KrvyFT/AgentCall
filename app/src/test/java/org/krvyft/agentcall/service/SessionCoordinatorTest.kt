@@ -937,6 +937,100 @@ class SessionCoordinatorTest {
         }
     }
 
+    // ------------------------------------- 桥接代次变化：本地结束（7B3 FOLLOW-UP）
+
+    /**
+     * 裁定（7B3 FOLLOW-UP）：桥接重启（代次变化）时，仍归协调器的会话必须**本地结束一次**
+     * ——复用 SessionEnded 语义（StopConversation → RevokeLease → RestoreMicrophone →
+     * ENDED），绝不发挂断、绝不向 bridge 发 handover、绝不伪造 DISCONNECTED 快照。
+     * 同一次重启被多轮轮询观测到（重复通知）时，只允许结束一次。
+     */
+    @Test
+    fun repeatedBridgeRestartSignalsEndTheOwnedCallOnlyOnceWithoutHangup() = runTest {
+        val events = mutableListOf<String>()
+        val calls = FakeCallControl()
+        val audio = FakeAudioBridge(events)
+        val conversation = FakeConversation(events)
+        val revoker = FakeRevoker(events)
+        val observer = RecordingObserver(events)
+        val leases = LeaseRegistry()
+        val coordinator = coordinator(calls, audio, conversation, revoker, observer, leases = leases)
+        coordinator.start()
+        try {
+            activeAi(coordinator)
+            assertTrue(leases.isLive(sessionA))
+
+            // 多轮轮询可能重复报告同一次代次变化：只有第一份通知生效。
+            coordinator.onBridgeRestarted()
+            coordinator.onBridgeRestarted()
+            coordinator.onBridgeRestarted()
+            advance(100)
+
+            assertEquals(
+                "local end: stop conversation → revoke (local) → restore, never Hangup",
+                listOf(
+                    "audio.opened:call-a",
+                    "conversation.started:call-a",
+                    "conversation.cancelled:call-a",
+                    "audio.stopped:call-a",
+                    "restored:call-a",
+                ),
+                events,
+            )
+            assertNull("the stale session must be retired", coordinator.activeSession)
+            assertFalse("the local end must release the lease", leases.isLive(sessionA))
+            assertEquals(
+                "ENDED must be broadcast exactly once",
+                1,
+                observer.states.count { it.first == sessionA && it.second == SessionState.ENDED },
+            )
+            assertEquals(listOf(sessionA), observer.handedBack)
+            assertEquals(listOf(RevokeOutcome.NOT_OWNED), observer.outcomes)
+            assertTrue(
+                "a bridge restart must never hang up the call",
+                calls.sent.none { it.command == CallCommand.Hangup },
+            )
+            assertTrue(
+                "the supervisor owns termination: no handover RPC may be sent",
+                revoker.revoked.isEmpty(),
+            )
+            assertTrue(
+                "the local end must be diagnosed, got " + observer.diagnostics,
+                "bridge_restart_session_ended" in observer.diagnostics,
+            )
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    /** 协调器没有会话时，代次变化是空操作：不产生状态、音频、命令或租约副作用。 */
+    @Test
+    fun aBridgeRestartWithoutAnOwnedSessionDoesNothing() = runTest {
+        val events = mutableListOf<String>()
+        val calls = FakeCallControl()
+        val observer = RecordingObserver(events)
+        val coordinator = coordinator(
+            calls,
+            FakeAudioBridge(events),
+            FakeConversation(events),
+            FakeRevoker(events),
+            observer,
+        )
+        coordinator.start()
+        try {
+            coordinator.onBridgeRestarted()
+            advance(100)
+
+            assertNull(coordinator.activeSession)
+            assertTrue("no owned session: no state may be broadcast", observer.states.isEmpty())
+            assertTrue("no owned session: no audio/conversation/revoke may happen", events.isEmpty())
+            assertTrue("no owned session: no command may be sent", calls.sent.isEmpty())
+            assertTrue("no owned session: nothing to diagnose", observer.diagnostics.isEmpty())
+        } finally {
+            coordinator.close()
+        }
+    }
+
     /** 让协调器进入 A 的 ACTIVE_AI（音频/会话已开）。 */
     private suspend fun TestScope.activeAi(coordinator: SessionCoordinator) {
         coordinator.onEvent(SessionEvent.StateChanged(ringing(sessionA)))

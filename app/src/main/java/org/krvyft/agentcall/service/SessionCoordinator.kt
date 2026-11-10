@@ -238,6 +238,24 @@ class SessionCoordinator(
     }
 
     /**
+     * 桥接进程代次变化（uptime 回退 = 新进程；Task 7B3 FOLLOW-UP 的裁定）。
+     *
+     * 桥接重启后，旧进程里那通电话的 `call_disconnected` 可能永远不会到达：会话会卡在
+     * ACTIVE_AI/ENDING 直到 180 s 上限，而新来电又因“只有 IDLE/ENDED 才可替换”一直被忽略。
+     * 代次变化是唯一可靠的“旧会话已不属于当前事实源”信号，因此把它结束为一次**本地**
+     * [SessionEvent.SessionEnded]：StopConversation → RevokeLease → RestoreMicrophone →
+     * ENDED，绝不发挂断、绝不向 bridge 发 handover、绝不伪造 DISCONNECTED 快照；隔离与
+     * 工作线程事实仍由监督端拥有，这里不触碰。
+     *
+     * 这是一条按序输入：轮询器在投递新代次事件**之前**发出它，因此消费者处理它时仍拥有的
+     * 会话只可能是旧代次的会话（即使旧响铃还在队列里没被处理，也排在它前面）。同一代次被
+     * 重复报告时，第一次已经退役会话，后续自然空操作；没有会话/已关闭时什么都不做。
+     */
+    fun onBridgeRestarted() {
+        addInput(Input.BridgeRestart)
+    }
+
+    /**
      * 取消消费者、当前会话子 Job 与所有后台协程；停止当前音频会话、撤销本地租约。
      * 重复调用安全，关闭后 [start]/[onEvent] 不再生效。
      */
@@ -315,6 +333,16 @@ class SessionCoordinator(
         ) : Input {
             override val safetyRelevant: Boolean get() = true
         }
+
+        /**
+         * 桥接进程代次变化（Task 7B3 FOLLOW-UP）：本地结束处理时仍归协调器的旧会话。
+         *
+         * 走无界优先通道（丢一条会让会话卡到 180 s 上限）；与其它输入同序，因此新代次的
+         * RINGING 一定排在它后面。
+         */
+        data object BridgeRestart : Input {
+            override val safetyRelevant: Boolean get() = true
+        }
     }
 
     private fun addInput(input: Input) {
@@ -353,6 +381,7 @@ class SessionCoordinator(
             is Input.CommandFinished -> handleCommandResult(input)
             is Input.ConfigChanged -> handleConfigChanged(input.config)
             is Input.HandbackFact -> handleHandbackFact(input)
+            Input.BridgeRestart -> handleBridgeRestart()
             Input.ApiFailed -> {
                 val runtime = current ?: return
                 val effects = runtime.reducer.onApiFailure()
@@ -482,6 +511,17 @@ class SessionCoordinator(
             return
         }
         reduceAndApply(runtime, SessionEvent.SessionEnded(sessionId), handbackViaServer = false)
+    }
+
+    /**
+     * 桥接重启后的本地结束：对**处理时**仍拥有的会话复用 SessionEnded 语义。
+     *
+     * 重复/迟到的事实（会话已结束）是空操作：既不能结束之后的会话，也不能重复广播 ENDED。
+     */
+    private suspend fun handleBridgeRestart() {
+        val runtime = current ?: return
+        reduceAndApply(runtime, SessionEvent.SessionEnded(runtime.session), handbackViaServer = false)
+        observer.onDiagnostic("bridge_restart_session_ended", runtime.session)
     }
 
     private suspend fun startRuntime(snapshot: CallSnapshot) {

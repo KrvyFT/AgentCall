@@ -336,6 +336,11 @@ class AgentCallService : Service() {
                 // 监督端交还事实绑定会话：由协调器裁决撤销路径与可见结论。
                 sessionCoordinator.onSupervisorHandback(id, outcome)
             },
+            onBridgeRestarted = {
+                // 桥接代次变化：旧进程的断开事实可能已随进程消失，让协调器本地结束仍拥有的
+                // 会话（否则新来电会被“只有 IDLE/ENDED 才可替换”一直挡住）。
+                sessionCoordinator.onBridgeRestarted()
+            },
             logger = ::log,
         )
         eventsPoller.start()
