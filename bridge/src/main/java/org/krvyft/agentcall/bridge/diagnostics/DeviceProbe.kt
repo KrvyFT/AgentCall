@@ -11,6 +11,10 @@ import org.krvyft.agentcall.core.model.EnvironmentKey
 
 /**
  * 只读平台事实，便于在没有设备时隔离 Android API 与诊断逻辑。
+ *
+ * SIM/承载/路由三项默认是显式 [UNKNOWN]：平台只有在确实能读到事实时才返回字符串，
+ * 绝不按“通常值”猜测。B2 允许真机通过 TelephonyManager 提供 SIM 运营商；通话承载与
+ * 路由必须来自通话上下文，拿不到就保持 UNKNOWN（CalibrationPolicy 会因此 fail closed）。
  */
 interface PlatformFacts {
     fun apiLevel(): Int
@@ -18,6 +22,17 @@ interface PlatformFacts {
     fun kernelVersion(): String
     fun frameworkVersion(): String
     fun audioPolicyDigest(): String
+
+    fun simCarrier(): String = UNKNOWN
+
+    fun transport(): String = UNKNOWN
+
+    fun route(): String = UNKNOWN
+
+    companion object {
+        /** 显式未知占位，与 [org.krvyft.agentcall.core.policy.CalibrationPolicy.UNKNOWN_VALUE] 一致。 */
+        const val UNKNOWN: String = "UNKNOWN"
+    }
 }
 
 /** [PlatformFacts] 的真实 Android 实现：全部来自系统属性/文件，不伪造能力。 */
@@ -37,6 +52,27 @@ class AndroidPlatformFacts : PlatformFacts {
     } catch (t: Throwable) {
         // 特权进程不加载 Xposed：未安装/不在作用域都必须如实报告未知。
         UNKNOWN
+    }
+
+    /**
+     * SIM 运营商名（B2）：只读 TelephonyManager 的公开运营商名，读不到返回 UNKNOWN。
+     * 不使用网络运营商冒充 SIM 运营商；两者都空时保持 UNKNOWN。
+     */
+    override fun simCarrier(): String = try {
+        val manager = systemTelephonyManager() ?: return UNKNOWN
+        val sim = manager.simOperatorName?.trim().orEmpty()
+        if (sim.isNotEmpty()) sim else UNKNOWN
+    } catch (t: Throwable) {
+        UNKNOWN
+    }
+
+    private fun systemTelephonyManager(): android.telephony.TelephonyManager? = try {
+        val activityThreadClass = Class.forName("android.app.ActivityThread")
+        val activityThread = activityThreadClass.getMethod("systemMain").invoke(null)
+        val systemContext = activityThreadClass.getMethod("getSystemContext").invoke(activityThread) as android.content.Context
+        systemContext.getSystemService(android.content.Context.TELEPHONY_SERVICE) as? android.telephony.TelephonyManager
+    } catch (t: Throwable) {
+        null
     }
 
     override fun audioPolicyDigest(): String {
@@ -125,9 +161,10 @@ class DeviceProbe(
             frameworkVersion = platform.frameworkVersion(),
             bridgeVersion = bridgeVersion,
             audioPolicyDigest = platform.audioPolicyDigest(),
-            simCarrier = UNKNOWN,
-            transport = UNKNOWN,
-            route = UNKNOWN,
+            // B2：平台能给出事实就上报，给不出就保持显式 UNKNOWN（绝不猜）。
+            simCarrier = platform.simCarrier(),
+            transport = platform.transport(),
+            route = platform.route(),
         )
         val hiddenApi = if (visibleMethods.isEmpty()) {
             "NONE"

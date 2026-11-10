@@ -14,9 +14,9 @@ import org.krvyft.agentcall.core.model.RpcRequest
  *
  * | 角色 | 允许的方法 |
  * | --- | --- |
- * | APP | session.request、session.heartbeat、session.command、session.events、status、diagnose、config.read、config.secret.read、audio.channel、handover |
+ * | APP | session.request、session.heartbeat、session.command、session.events、status、diagnose、config.read、config.secret.read、audio.channel、handover、calibration.read（只读） |
  * | HOOK | hook.snapshot、hook.heartbeat、call.command.result |
- * | CLI_ROOT | status、config.read、config.write、pair、diagnose、shutdown |
+ * | CLI_ROOT | status、config.read、config.write、pair、diagnose、shutdown、calibration.read、calibration.record |
  *
  * `session.heartbeat` 只表达“APP 仍在看着这通电话”，是存在性信号，不会触发接听或改变
  * 监督阶段；`session.command` 只允许经 HOOK 执行的受限命令（answer/hangup），由 bridge
@@ -57,6 +57,23 @@ object RolePolicy {
      */
     const val METHOD_SESSION_EVENTS: String = "session.events"
 
+    /**
+     * 校准状态只读视图（B2）：当前环境、证据步骤、未满足项。
+     *
+     * APP 与 root CLI 都可读；**没有任何密钥/号码字段**。写入能力只在
+     * [METHOD_CALIBRATION_RECORD]，且只属于 root CLI。
+     */
+    const val METHOD_CALIBRATION_READ: String = "calibration.read"
+
+    /**
+     * 校准证据写入（B2）：root 操作员为**当前服务端环境**背书五项人工测试事实。
+     *
+     * 证据环境与时间戳由桥接进程从 DeviceProbe/CalibrationStore 生成，请求里的环境字段
+     * 只用于“与当前环境一致”的核验（不一致/未知一律拒绝），绝不作为证据内容。
+     * APP 与 HOOK 都不能调用。
+     */
+    const val METHOD_CALIBRATION_RECORD: String = "calibration.record"
+
     const val METHOD_STATUS: String = "status"
     const val METHOD_CONFIG_WRITE: String = "config.write"
     const val METHOD_PAIR: String = "pair"
@@ -80,6 +97,8 @@ object RolePolicy {
             METHOD_STATUS,
             METHOD_DIAGNOSE,
             METHOD_SESSION_EVENTS,
+            // B2：校准状态只读；记录（写）仍然只属于 CLI_ROOT。
+            METHOD_CALIBRATION_READ,
         ),
         PeerRole.HOOK to setOf(
             METHOD_HOOK_SNAPSHOT,
@@ -93,6 +112,9 @@ object RolePolicy {
             METHOD_PAIR,
             METHOD_DIAGNOSE,
             METHOD_SHUTDOWN,
+            // B2：root 操作员读取校准视图并记录人工测试事实（服务端生成环境与时间戳）。
+            METHOD_CALIBRATION_READ,
+            METHOD_CALIBRATION_RECORD,
         ),
     )
 

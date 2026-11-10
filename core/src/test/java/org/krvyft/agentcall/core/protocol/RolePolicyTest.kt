@@ -160,6 +160,7 @@ class RolePolicyTest {
                 RolePolicy.METHOD_STATUS,
                 RolePolicy.METHOD_DIAGNOSE,
                 RolePolicy.METHOD_SESSION_EVENTS,
+                RolePolicy.METHOD_CALIBRATION_READ,
             ),
             RolePolicy.methodsFor(PeerRole.APP),
         )
@@ -179,6 +180,8 @@ class RolePolicyTest {
                 RolePolicy.METHOD_PAIR,
                 RolePolicy.METHOD_DIAGNOSE,
                 RolePolicy.METHOD_SHUTDOWN,
+                RolePolicy.METHOD_CALIBRATION_READ,
+                RolePolicy.METHOD_CALIBRATION_RECORD,
             ),
             RolePolicy.methodsFor(PeerRole.CLI_ROOT),
         )
@@ -280,6 +283,30 @@ class RolePolicyTest {
 
         // 事件流不带会话，但既有会话方法仍然必须带会话。
         assertFalse(RolePolicy.authorize(appPeer(), request(RolePolicy.METHOD_SESSION_REQUEST)))
+    }
+
+    /**
+     * B2：校准读取对 APP 只读开放（真实 APK 必须能显示校准状态），记录只属于 root CLI。
+     * APP/HOOK 都不能为五项人工测试背书，更不能借用 status/diagnose 的读取权限写入。
+     */
+    @Test
+    fun calibrationReadIsReadOnlyForAppAndRecordIsRootOnly() {
+        assertTrue(RolePolicy.authorize(appPeer(), request(RolePolicy.METHOD_CALIBRATION_READ)))
+        assertTrue(RolePolicy.authorize(rootPeer(), request(RolePolicy.METHOD_CALIBRATION_READ)))
+        assertFalse(RolePolicy.authorize(hookPeer(), request(RolePolicy.METHOD_CALIBRATION_READ)))
+
+        assertTrue(RolePolicy.authorize(rootPeer(), request(RolePolicy.METHOD_CALIBRATION_RECORD)))
+        assertFalse(RolePolicy.authorize(appPeer(), request(RolePolicy.METHOD_CALIBRATION_RECORD)))
+        assertFalse(RolePolicy.authorize(hookPeer(), request(RolePolicy.METHOD_CALIBRATION_RECORD, payload = "{}")))
+        // 伪造“uid 0 + APP 角色”不能取得记录能力：角色必须与内核凭据一致。
+        assertFalse(
+            RolePolicy.authorize(
+                PeerIdentity(0, PeerRole.APP, "org.krvyft.agentcall", appSignature),
+                request(RolePolicy.METHOD_CALIBRATION_RECORD),
+            ),
+        )
+        // 非 0 uid 不能自称 CLI_ROOT 记录。
+        assertFalse(RolePolicy.authorize(rootPeer(uid = 2_000), request(RolePolicy.METHOD_CALIBRATION_RECORD)))
     }
 
     @Test

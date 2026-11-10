@@ -1,7 +1,9 @@
 package org.krvyft.agentcall.bridge
 
+import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
+import com.google.gson.JsonPrimitive
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.CountDownLatch
@@ -17,7 +19,9 @@ import org.krvyft.agentcall.bridge.audio.PcmOpenResult
 import org.krvyft.agentcall.bridge.audio.PcmSessionOwner
 import org.krvyft.agentcall.bridge.audio.PcmWorkerLinkFactory
 import org.krvyft.agentcall.bridge.audio.RemoteSupervisedAudio
+import org.krvyft.agentcall.bridge.config.CalibrationStep
 import org.krvyft.agentcall.bridge.config.CalibrationStore
+import org.krvyft.agentcall.bridge.config.CalibrationStoreException
 import org.krvyft.agentcall.bridge.config.ConfigErrorCode
 import org.krvyft.agentcall.bridge.config.ConfigStore
 import org.krvyft.agentcall.bridge.config.ConfigStoreException
@@ -52,6 +56,7 @@ import org.krvyft.agentcall.bridge.supervision.SupervisorRpcPort
 import org.krvyft.agentcall.bridge.supervision.TakeoverOutcome
 import org.krvyft.agentcall.bridge.supervision.TerminationPermission
 import org.krvyft.agentcall.bridge.supervision.UnverifiedCallIdentityVerifier
+import org.krvyft.agentcall.core.model.CalibrationEvidence
 import org.krvyft.agentcall.core.model.CallCommand
 import org.krvyft.agentcall.core.model.CallState
 import org.krvyft.agentcall.core.model.CommandResult
@@ -64,6 +69,8 @@ import org.krvyft.agentcall.core.model.RpcError
 import org.krvyft.agentcall.core.model.RpcRequest
 import org.krvyft.agentcall.core.model.RpcResponse
 import org.krvyft.agentcall.core.model.SessionId
+import org.krvyft.agentcall.core.policy.CalibrationBlocker
+import org.krvyft.agentcall.core.policy.CalibrationPolicy
 import org.krvyft.agentcall.core.protocol.RolePolicy
 import org.krvyft.agentcall.core.protocol.RpcCodec
 import org.krvyft.agentcall.core.port.MonotonicClock
@@ -225,6 +232,7 @@ internal object BridgeRuntime {
             dialerDefaultRole = dialerDefaultRole,
             audioPcm = pcmRelay,
             sessionEvents = sessionEvents,
+            calibration = calibration,
         )
 
         // PCM 通道由 ControlServer 独立 bind（PCM lane）；音频工作角色负责真实 PCM
@@ -455,6 +463,11 @@ internal class ControlDispatcher(
      * [APP_COMMAND_TIMEOUT_MS]（4000 ms）；显式参数只用于测试缩短等待。
      */
     private val commandTimeoutMs: Long = APP_COMMAND_TIMEOUT_MS,
+    /**
+     * 校准证据存储（B2）。默认 null = 未接线：calibration.read/record 返回
+     * [ERROR_CALIBRATION_UNAVAILABLE]，绝不假装已验证。生产装配注入真实实例。
+     */
+    private val calibration: CalibrationStore? = null,
 ) : RpcHandler {
 
     /**
@@ -489,10 +502,15 @@ internal class ControlDispatcher(
             -> hookCommandLines(request)
             RolePolicy.METHOD_CALL_COMMAND_RESULT -> hookCommandResult(request)
             RolePolicy.METHOD_AUDIO_CHANNEL -> audioChannel(request, peer)
+            RolePolicy.METHOD_CALIBRATION_READ -> calibrationRead(request)
+            RolePolicy.METHOD_CALIBRATION_RECORD -> calibrationRecord(request)
             else -> failure(request, "method_not_implemented", "method is not in the fixed command table")
         }
     } catch (error: ConfigStoreException) {
         // ConfigStoreException.message 只含公开字段与错误码。
+        failure(request, error.code, error.message ?: error.code)
+    } catch (error: CalibrationStoreException) {
+        // 校准文件损坏/更新 schema/磁盘失败：机器码 + 固定短消息，不含路径。
         failure(request, error.code, error.message ?: error.code)
     } catch (t: Exception) {
         // 其它异常的文本可能含路径：只回类名。
@@ -635,6 +653,139 @@ internal class ControlDispatcher(
         }
     }
 
+    // ------------------------------------------------------------------ 校准（B2）
+
+    /**
+     * calibration.read：只读校准视图。
+     *
+     * 当前环境每次由 [DeviceProbe] 重新采集（不缓存猜测值）；证据来自 [CalibrationStore]。
+     * 负载只有环境字段、五项布尔事实、服务端时间戳与 [CalibrationPolicy] 的未满足项，
+     * 绝不含密钥、号码或配置内容。
+     */
+    private fun calibrationRead(request: RpcRequest): RpcResponse {
+        val store = calibration
+            ?: return failure(request, ERROR_CALIBRATION_UNAVAILABLE, "calibration store is not wired")
+        val environment = probe.inspect().environment
+        val evidence = try {
+            store.load()
+        } catch (error: CalibrationStoreException) {
+            return failure(request, error.code, error.message ?: error.code)
+        }
+        return ok(request, encodeCalibrationView(environment, evidence))
+    }
+
+    /**
+     * calibration.record：root 操作员为**当前服务端环境**背书五项人工测试事实。
+     *
+     * 请求只能提供五项布尔与可选的“预期环境”（仅用于一致性核验）。证据环境与时间戳
+     * 一律由桥接进程生成：环境取自 [DeviceProbe]，时间戳由 [CalibrationStore] 的时钟写入。
+     * 未知/不一致环境、缺失步骤一律拒绝；APP/HOOK 在 [RolePolicy] 层就已被拒绝。
+     */
+    private fun calibrationRecord(request: RpcRequest): RpcResponse {
+        val store = calibration
+            ?: return failure(request, ERROR_CALIBRATION_UNAVAILABLE, "calibration store is not wired")
+        val decoded = decodeCalibrationRecord(request.payload)
+            ?: return failure(
+                request,
+                ERROR_PAYLOAD_INVALID,
+                "calibration.record payload must carry exactly the five boolean manual-test steps",
+            )
+        val current = probe.inspect().environment
+        if (!isCompleteEnvironment(current)) {
+            return failure(
+                request,
+                ERROR_CALIBRATION_ENV_UNKNOWN,
+                "current environment has unknown facts; calibration must not be bound to it",
+            )
+        }
+        val expected = decoded.expectedEnvironment
+        if (expected != null) {
+            if (!isCompleteEnvironment(expected)) {
+                return failure(
+                    request,
+                    ERROR_CALIBRATION_ENV_UNKNOWN,
+                    "expected environment has unknown facts",
+                )
+            }
+            if (expected != current) {
+                return failure(
+                    request,
+                    ERROR_CALIBRATION_ENV_MISMATCH,
+                    "expected environment does not match the current device environment",
+                )
+            }
+        }
+        var evidence: CalibrationEvidence? = null
+        for ((step, passed) in decoded.steps) {
+            evidence = store.record(step, passed, current)
+        }
+        return ok(request, encodeCalibrationRecordResult(evidence!!, current))
+    }
+
+    /** 当前环境能否作为校准绑定的可复现事实（任何字段 UNKNOWN/空白都不行）。 */
+    private fun isCompleteEnvironment(environment: EnvironmentKey): Boolean =
+        CalibrationBlocker.ENVIRONMENT_INCOMPLETE !in
+            CalibrationPolicy.blockers(environment, CalibrationEvidence(environment = environment))
+
+    private fun encodeCalibrationView(
+        environment: EnvironmentKey,
+        evidence: CalibrationEvidence?,
+    ): String {
+        val blank = CalibrationEvidence(environment = environment)
+        val blockers = CalibrationPolicy.blockers(environment, evidence ?: blank)
+        val json = JsonObject()
+        json.addProperty("supportedApiLevel", CalibrationPolicy.SUPPORTED_API_LEVEL)
+        json.add("environment", encodeEnvironmentKey(environment))
+        json.addProperty("environmentComplete", isCompleteEnvironment(environment))
+        json.addProperty("verified", evidence != null && CalibrationPolicy.canAutoAnswer(environment, evidence))
+        json.add("blockers", JsonArray().apply { blockers.forEach { add(JsonPrimitive(it.name)) } })
+        json.addProperty("environmentMatchesEvidence", evidence != null && evidence.environment == environment)
+        if (evidence == null) {
+            json.add("evidenceEnvironment", com.google.gson.JsonNull.INSTANCE)
+        } else {
+            json.add("evidenceEnvironment", encodeEnvironmentKey(evidence.environment))
+        }
+        json.add("steps", encodeCalibrationSteps(evidence))
+        json.addProperty("calibratedAtMs", evidence?.calibratedAtMs ?: 0L)
+        return json.toString()
+    }
+
+    private fun encodeCalibrationRecordResult(
+        evidence: CalibrationEvidence,
+        environment: EnvironmentKey,
+    ): String {
+        val blockers = CalibrationPolicy.blockers(environment, evidence)
+        val json = JsonObject()
+        json.addProperty("recorded", true)
+        json.add("environment", encodeEnvironmentKey(environment))
+        json.add("steps", encodeCalibrationSteps(evidence))
+        json.addProperty("verified", CalibrationPolicy.canAutoAnswer(environment, evidence))
+        json.add("blockers", JsonArray().apply { blockers.forEach { add(JsonPrimitive(it.name)) } })
+        json.addProperty("calibratedAtMs", evidence.calibratedAtMs)
+        return json.toString()
+    }
+
+    private fun encodeCalibrationSteps(evidence: CalibrationEvidence?): JsonObject = JsonObject().apply {
+        addProperty("downlinkRecognized", evidence?.downlinkRecognized ?: false)
+        addProperty("peerHeardSpeech", evidence?.peerHeardSpeech ?: false)
+        addProperty("microphoneIsolated", evidence?.microphoneIsolated ?: false)
+        addProperty("manualRestoreVerified", evidence?.manualRestoreVerified ?: false)
+        addProperty("processFailureVerified", evidence?.processFailureVerified ?: false)
+    }
+
+    private fun encodeEnvironmentKey(environment: EnvironmentKey): JsonObject = JsonObject().apply {
+        addProperty("apiLevel", environment.apiLevel)
+        addProperty("romFingerprint", environment.romFingerprint)
+        addProperty("kernelVersion", environment.kernelVersion)
+        addProperty("dialerPackageVersion", environment.dialerPackageVersion)
+        addProperty("frameworkVersion", environment.frameworkVersion)
+        addProperty("bridgeVersion", environment.bridgeVersion)
+        addProperty("audioPolicyDigest", environment.audioPolicyDigest)
+        addProperty("simCarrier", environment.simCarrier)
+        addProperty("transport", environment.transport)
+        addProperty("route", environment.route)
+    }
+
     /** handover：APP 报告人工接管；监督端先撤销所有权再恢复麦克风。 */
     private fun handover(request: RpcRequest): RpcResponse {
         val session = request.sessionId
@@ -707,6 +858,78 @@ internal class ControlDispatcher(
         if (!asDouble.isFinite() || asDouble != asLong.toDouble()) return SinceSeqDecode.Invalid
         if (asLong < 0L) return SinceSeqDecode.Invalid
         return SinceSeqDecode.Cursor(asLong)
+    }
+
+    /** calibration.record 的结构化解码结果；null/异常一律整体拒绝。 */
+    private data class CalibrationRecordPayload(
+        val steps: Map<CalibrationStep, Boolean>,
+        val expectedEnvironment: EnvironmentKey?,
+    )
+
+    /**
+     * 解析 calibration.record 负载：只允许 steps（五项、全部布尔）与可选的
+     * expectedEnvironment（十个环境字段）。多键/缺键/错误类型都整体拒绝。
+     */
+    private fun decodeCalibrationRecord(payload: String): CalibrationRecordPayload? {
+        if (payload.isEmpty() || payload.length > MAX_CALIBRATION_PAYLOAD_CHARS) return null
+        val parsed = runCatching { JsonParser.parseString(payload) }.getOrNull() ?: return null
+        if (!parsed.isJsonObject) return null
+        val json = parsed.asJsonObject
+        if (!json.keySet().all { it == CALIBRATION_STEPS_KEY || it == CALIBRATION_ENVIRONMENT_FIELD }) return null
+        val stepsJson = json.get(CALIBRATION_STEPS_KEY)
+            ?.takeIf { it.isJsonObject }
+            ?.asJsonObject
+            ?: return null
+        if (stepsJson.keySet() != CALIBRATION_STEP_KEYS.keys) return null
+        val steps = LinkedHashMap<CalibrationStep, Boolean>()
+        for ((key, step) in CALIBRATION_STEP_KEYS) {
+            val element = stepsJson.get(key) ?: return null
+            if (!element.isJsonPrimitive || !element.asJsonPrimitive.isBoolean) return null
+            steps[step] = element.asBoolean
+        }
+        val expectedElement = json.get(CALIBRATION_ENVIRONMENT_FIELD)
+        val expected = if (expectedElement == null) {
+            null
+        } else {
+            if (!expectedElement.isJsonObject) return null
+            decodeEnvironmentKey(expectedElement.asJsonObject) ?: return null
+        }
+        return CalibrationRecordPayload(steps, expected)
+    }
+
+    /** 只接受恰好十个环境字段；字符串有长度上限，API 等级必须是整数。 */
+    private fun decodeEnvironmentKey(json: JsonObject): EnvironmentKey? {
+        if (json.keySet() != CALIBRATION_ENVIRONMENT_KEYS) return null
+        val apiLevel = calibrationInt(json, "apiLevel") ?: return null
+        return EnvironmentKey(
+            apiLevel = apiLevel,
+            romFingerprint = calibrationString(json, "romFingerprint") ?: return null,
+            kernelVersion = calibrationString(json, "kernelVersion") ?: return null,
+            dialerPackageVersion = calibrationString(json, "dialerPackageVersion") ?: return null,
+            frameworkVersion = calibrationString(json, "frameworkVersion") ?: return null,
+            bridgeVersion = calibrationString(json, "bridgeVersion") ?: return null,
+            audioPolicyDigest = calibrationString(json, "audioPolicyDigest") ?: return null,
+            simCarrier = calibrationString(json, "simCarrier") ?: return null,
+            transport = calibrationString(json, "transport") ?: return null,
+            route = calibrationString(json, "route") ?: return null,
+        )
+    }
+
+    private fun calibrationString(json: JsonObject, name: String): String? {
+        val element = json.get(name) ?: return null
+        if (!element.isJsonPrimitive || !element.asJsonPrimitive.isString) return null
+        val value = element.asString
+        if (value.length > MAX_CALIBRATION_ENV_CHARS) return null
+        return value
+    }
+
+    private fun calibrationInt(json: JsonObject, name: String): Int? {
+        val element = json.get(name) ?: return null
+        if (!element.isJsonPrimitive || !element.asJsonPrimitive.isNumber) return null
+        val value = element.asDouble
+        if (!value.isFinite() || value != Math.floor(value)) return null
+        if (value < Int.MIN_VALUE.toDouble() || value > Int.MAX_VALUE.toDouble()) return null
+        return value.toInt()
     }
 
     /** "结果归属"拒绝码：Answer 与 Hangup 各自机器可读，7B 可据此区分重试策略。 */
@@ -1014,6 +1237,45 @@ internal class ControlDispatcher(
 
         /** 命令没能进入 HOOK 队列（会话非法或队列饱和）：有界失败，绝不假装已下发。 */
         const val ERROR_COMMAND_NOT_QUEUED: String = "command_not_queued"
+
+        /** 校准存储未接线（默认构造点）：读取/记录都明确失败，绝不假装已验证。 */
+        const val ERROR_CALIBRATION_UNAVAILABLE: String = "calibration_unavailable"
+
+        /** 当前环境含 UNKNOWN/空字段：不能作为可复现的校准绑定。 */
+        const val ERROR_CALIBRATION_ENV_UNKNOWN: String = "calibration_environment_unknown"
+
+        /** 请求携带的预期环境与当前设备环境不一致（陈旧/别的设备）。 */
+        const val ERROR_CALIBRATION_ENV_MISMATCH: String = "calibration_environment_mismatch"
+
+        const val MAX_CALIBRATION_PAYLOAD_CHARS: Int = 8 * 1024
+
+        const val MAX_CALIBRATION_ENV_CHARS: Int = 512
+
+        const val CALIBRATION_STEPS_KEY: String = "steps"
+
+        const val CALIBRATION_ENVIRONMENT_FIELD: String = "expectedEnvironment"
+
+        /** 线格式步骤名 → 存储步骤；顺序固定，写入后得到完整证据。 */
+        val CALIBRATION_STEP_KEYS: Map<String, CalibrationStep> = linkedMapOf(
+            "downlinkRecognized" to CalibrationStep.DOWNLINK_RECOGNIZED,
+            "peerHeardSpeech" to CalibrationStep.PEER_HEARD_SPEECH,
+            "microphoneIsolated" to CalibrationStep.MICROPHONE_ISOLATED,
+            "manualRestoreVerified" to CalibrationStep.MANUAL_RESTORE,
+            "processFailureVerified" to CalibrationStep.PROCESS_FAILURE,
+        )
+
+        val CALIBRATION_ENVIRONMENT_KEYS: Set<String> = setOf(
+            "apiLevel",
+            "romFingerprint",
+            "kernelVersion",
+            "dialerPackageVersion",
+            "frameworkVersion",
+            "bridgeVersion",
+            "audioPolicyDigest",
+            "simCarrier",
+            "transport",
+            "route",
+        )
 
         /** 4000 ms 内没有 HOOK 回报结果：结果不明确，fail closed。 */
         const val ERROR_COMMAND_TIMEOUT: String = "command_timeout"
