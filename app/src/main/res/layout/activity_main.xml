@@ -28,42 +28,42 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="16dp"
-            android:text="@string/main_status_root_prefix" />
+            />
 
         <TextView
             android:id="@+id/status_hook"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
-            android:text="@string/main_status_hook_prefix" />
+            />
 
         <TextView
             android:id="@+id/status_service"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
-            android:text="@string/main_status_service_prefix" />
+            />
 
         <TextView
             android:id="@+id/status_calibration"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
-            android:text="@string/main_status_calibration_prefix" />
+            />
 
         <TextView
             android:id="@+id/status_config"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
-            android:text="@string/main_status_config_prefix" />
+            />
 
         <TextView
             android:id="@+id/status_session"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
-            android:text="@string/main_status_session_prefix" />
+            />
 
         <TextView
             android:id="@+id/text_blockers"
@@ -115,6 +115,35 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:text="@string/main_button_takeover" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="24dp"
+            android:text="@string/connection_title"
+            android:textSize="18sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:text="@string/connection_note"
+            android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/button_connection_test"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/connection_button" />
+
+        <TextView
+            android:id="@+id/text_connection_results"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:visibility="gone" />
 
         <TextView
             android:layout_width="match_parent"

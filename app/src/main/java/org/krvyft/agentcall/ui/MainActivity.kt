@@ -7,6 +7,7 @@ import android.os.Bundle
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -23,6 +24,7 @@ import org.krvyft.agentcall.core.model.AgentConfig
 import org.krvyft.agentcall.core.model.EnvironmentKey
 import org.krvyft.agentcall.core.policy.CalibrationPolicy
 import org.krvyft.agentcall.core.rules.ConfigValidator
+import org.krvyft.agentcall.core.model.EndpointKind
 import org.krvyft.agentcall.ipc.BridgeClient
 import org.krvyft.agentcall.ipc.LocalSocketControlTransport
 import org.krvyft.agentcall.ipc.LocalSocketPcmLaneTransport
@@ -33,6 +35,9 @@ import org.krvyft.agentcall.service.BridgeDiagnostics
 import org.krvyft.agentcall.service.BridgeStatus
 import org.krvyft.agentcall.service.BridgeStatusResult
 import org.krvyft.agentcall.service.CalibrationEvidenceStore
+import org.krvyft.agentcall.service.ConnectionTestReport
+import org.krvyft.agentcall.service.ConnectionTestSupport
+import org.krvyft.agentcall.service.EndpointTestOutcome
 import org.krvyft.agentcall.service.EnvironmentResult
 import org.krvyft.agentcall.service.HookPresence
 import org.krvyft.agentcall.service.StatusText
@@ -65,6 +70,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var textError: TextView
     private lateinit var buttonNotification: Button
     private lateinit var buttonTakeover: Button
+    private lateinit var textConnectionResults: TextView
 
     private var bridgeReachable: Boolean? = null
     private var bridgeStatus: BridgeStatus? = null
@@ -112,6 +118,7 @@ class MainActivity : AppCompatActivity() {
         textError = findViewById(R.id.text_error)
         buttonNotification = findViewById(R.id.button_notification)
         buttonTakeover = findViewById(R.id.button_takeover)
+        textConnectionResults = findViewById(R.id.text_connection_results)
         evidence = CalibrationEvidenceStore(this)
     }
 
@@ -132,6 +139,68 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(this, CalibrationActivity::class.java))
         }
         buttonTakeover.setOnClickListener { openTakeover() }
+        findViewById<Button>(R.id.button_connection_test).setOnClickListener { confirmConnectionTest() }
+    }
+
+    /**
+     * 连接测试必须由用户显式确认：对话框文案明确“真实付费 API 请求”，取消后零调用。
+     * 这不是安全检查的替代——编排层同样要求 confirmed=true。
+     */
+    private fun confirmConnectionTest() {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.connection_confirm_title)
+            .setMessage(R.string.connection_confirm_message)
+            .setNegativeButton(R.string.connection_confirm_negative, null)
+            .setPositiveButton(R.string.connection_confirm_positive) { _, _ -> runConnectionTest() }
+            .show()
+    }
+
+    private fun runConnectionTest() {
+        val currentConfig = config
+        if (currentConfig == null) {
+            textConnectionResults.visibility = TextView.VISIBLE
+            textConnectionResults.text = getString(R.string.connection_needs_config)
+            return
+        }
+        val bridge = client ?: BridgeClient(
+            control = LocalSocketControlTransport(),
+            pcm = LocalSocketPcmLaneTransport(),
+            scope = scope,
+            logger = { },
+        ).also { client = it }
+        textConnectionResults.visibility = TextView.VISIBLE
+        textConnectionResults.text = getString(R.string.connection_running)
+        scope.launch {
+            val report = withContext(Dispatchers.IO) {
+                runCatching {
+                    // 显式 confirmed=true 只可能来自上面的对话框；UI 从不自动调用。
+                    ConnectionTestSupport.run(bridge, currentConfig, confirmed = true)
+                }.getOrNull()
+            }
+            if (report == null) {
+                textConnectionResults.text = getString(R.string.connection_request_failed, "request_failed")
+                return@launch
+            }
+            textConnectionResults.text = renderConnectionReport(report)
+        }
+    }
+
+    private fun renderConnectionReport(report: ConnectionTestReport): String {
+        val lines = report.results.map { result ->
+            val label = when (result.kind) {
+                EndpointKind.ASR -> "ASR"
+                EndpointKind.LLM -> "LLM"
+                EndpointKind.TTS -> "TTS"
+            }
+            val outcome = when (result.outcome) {
+                EndpointTestOutcome.PASSED -> getString(R.string.connection_passed)
+                EndpointTestOutcome.FAILED ->
+                    getString(R.string.connection_failed, result.code ?: "request_failed")
+                EndpointTestOutcome.NOT_CONFIGURED -> getString(R.string.connection_not_configured)
+            }
+            label + "：" + outcome
+        }
+        return lines.joinToString("\n")
     }
 
     private fun requestNotificationPermission() {
@@ -211,31 +280,35 @@ class MainActivity : AppCompatActivity() {
             PackageManager.PERMISSION_GRANTED
         buttonNotification.visibility = if (permissionGranted) Button.GONE else Button.VISIBLE
 
-        statusService.text = getString(R.string.main_status_service_prefix) + serviceText(status)
-        statusSession.text = getString(R.string.main_status_session_prefix) + sessionText(status)
+        statusService.text = getString(R.string.main_status_service_prefix, serviceText(status))
+        statusSession.text = getString(R.string.main_status_session_prefix, sessionText(status))
         textBlockers.text = when {
             status.ready -> getString(R.string.main_note_ready)
             status.blockers.isEmpty() -> getString(R.string.main_note_no_blockers)
-            else -> getString(R.string.main_note_blockers) +
-                status.blockers.joinToString("；") { StatusText.blocker(it) }
+            else -> getString(
+                R.string.main_note_blockers,
+                status.blockers.joinToString("；") { StatusText.blocker(it) },
+            )
         }
         val error = errorText(status)
         if (error == null) {
             textError.visibility = TextView.GONE
         } else {
             textError.visibility = TextView.VISIBLE
-            textError.text = getString(R.string.main_error_prefix) + error
+            textError.text = getString(R.string.main_error_prefix, error)
         }
         buttonTakeover.isEnabled = status.activeSession != null
 
-        statusRoot.text = getString(R.string.main_status_root_prefix) + when (bridgeReachable) {
-            true -> getString(R.string.main_bridge_reachable)
-            false -> getString(R.string.main_bridge_unreachable)
-            null -> getString(R.string.main_mode_unknown)
-        }
-        statusHook.text = getString(R.string.main_status_hook_prefix) + hookText()
-        statusConfig.text = getString(R.string.main_status_config_prefix) + configText()
-        statusCalibration.text = getString(R.string.main_status_calibration_prefix) + calibrationText()
+        statusRoot.text = getString(R.string.main_status_root_prefix, rootText())
+        statusHook.text = getString(R.string.main_status_hook_prefix, hookText())
+        statusConfig.text = getString(R.string.main_status_config_prefix, configText())
+        statusCalibration.text = getString(R.string.main_status_calibration_prefix, calibrationText())
+    }
+
+    private fun rootText(): String = when (bridgeReachable) {
+        true -> getString(R.string.main_bridge_reachable)
+        false -> getString(R.string.main_bridge_unreachable)
+        null -> getString(R.string.main_mode_unknown)
     }
 
     private fun serviceText(status: AgentCallStatus): String = when {

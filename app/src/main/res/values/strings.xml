@@ -14,12 +14,12 @@
 
     <!-- 主页/启动向导 -->
     <string name="main_intro">启动向导：以下每一项都必须是真机事实，缺一项就不会自动接听。启动请求本身不代表服务可用。</string>
-    <string name="main_status_root_prefix">root 桥接：</string>
-    <string name="main_status_hook_prefix">Hook 心跳：</string>
-    <string name="main_status_service_prefix">前台服务：</string>
-    <string name="main_status_calibration_prefix">校准：</string>
-    <string name="main_status_config_prefix">配置：</string>
-    <string name="main_status_session_prefix">会话：</string>
+    <string name="main_status_root_prefix">root 桥接：%1$s</string>
+    <string name="main_status_hook_prefix">Hook 心跳：%1$s</string>
+    <string name="main_status_service_prefix">前台服务：%1$s</string>
+    <string name="main_status_calibration_prefix">校准：%1$s</string>
+    <string name="main_status_config_prefix">配置：%1$s</string>
+    <string name="main_status_session_prefix">会话：%1$s</string>
     <string name="main_button_start">启动服务</string>
     <string name="main_button_stop">停止服务</string>
     <string name="main_button_retry">重新检测就绪</string>
@@ -27,10 +27,10 @@
     <string name="main_button_calibration">校准与人工测试</string>
     <string name="main_button_takeover">我来接听</string>
     <string name="main_note_device">真机状态需在目标 ROM 上人工验证；本页只展示可读取到的真实事实，读不到时显示“未知”，不会伪造成功。</string>
-    <string name="main_note_blockers">未就绪原因：</string>
+    <string name="main_note_blockers">未就绪原因：%1$s</string>
     <string name="main_note_no_blockers">未就绪原因：尚未完成检测</string>
     <string name="main_note_ready">已就绪：五项事实全部满足</string>
-    <string name="main_error_prefix">最近错误：</string>
+    <string name="main_error_prefix">最近错误：%1$s</string>
     <string name="main_bridge_reachable">可达，APP 已通过配对核验</string>
     <string name="main_bridge_unreachable">不可达（bridge_unavailable）</string>
     <string name="main_hook_unknown">未知（桥接未向 APP 开放 status）</string>
@@ -53,14 +53,29 @@
     <string name="main_toast_no_active_call">当前没有进行中的 AI 通话</string>
     <string name="main_toast_notification_requested">请允许通知权限以便显示接管入口</string>
 
+    <!-- 连接测试 -->
+    <string name="connection_title">连接测试（诊断）</string>
+    <string name="connection_note">手动触发：会给每个已配置端点各发一次真实付费 API 请求（ASR 100 ms WAV、LLM 最小对话、TTS 短文本）。不会自动运行，也不显示或记录密钥与响应正文。</string>
+    <string name="connection_button">发起连接测试</string>
+    <string name="connection_confirm_title">确认发起真实付费请求？</string>
+    <string name="connection_confirm_message">将对已配置的 ASR / LLM / TTS 各发起一次真实远程请求，可能产生费用。测试使用真实密钥，但不会在界面或日志中显示密钥。</string>
+    <string name="connection_confirm_positive">发起测试</string>
+    <string name="connection_confirm_negative">取消</string>
+    <string name="connection_running">正在测试，请稍候…</string>
+    <string name="connection_needs_config">配置不可读，无法测试（先启动服务并确认桥接可达）</string>
+    <string name="connection_passed">通过</string>
+    <string name="connection_failed">失败（%1$s）</string>
+    <string name="connection_not_configured">未配置</string>
+    <string name="connection_request_failed">测试无法执行：%1$s</string>
+
     <!-- 校准页 -->
     <string name="calibration_title">校准与人工测试</string>
     <string name="calibration_intro">五个步骤必须在真机上人工完成，并且绑定完整环境；方法可见、对象创建成功都不算验证。</string>
-    <string name="calibration_environment_prefix">环境：</string>
+    <string name="calibration_environment_prefix">环境：%1$s</string>
     <string name="calibration_environment_available">可用（API %1$d）</string>
     <string name="calibration_environment_unavailable">不可用：%1$s</string>
     <string name="calibration_environment_unknown">不可用（桥接未向 APP 开放 diagnose）</string>
-    <string name="calibration_state_prefix">本机记录：</string>
+    <string name="calibration_state_prefix">本机记录：%1$s（%2$d/%3$d）</string>
     <string name="calibration_state_verified">已验证</string>
     <string name="calibration_state_unverified">未验证</string>
     <string name="calibration_step_downlink">1. 本机识别到通话下行音频（不是环境麦克风）</string>
@@ -77,9 +92,9 @@
     <!-- 接管页 -->
     <string name="takeover_title">人工接管</string>
     <string name="takeover_intro">接管会先与 root 监督端串行撤销 AI 所有权；只有撤销确认后才恢复人工声音，撤销失败不会显示成功。</string>
-    <string name="takeover_session_prefix">会话：</string>
-    <string name="takeover_state_prefix">状态：</string>
-    <string name="takeover_outcome_prefix">结果：</string>
+    <string name="takeover_session_prefix">会话：%1$s</string>
+    <string name="takeover_state_prefix">状态：%1$s</string>
+    <string name="takeover_outcome_prefix">结果：%1$s</string>
     <string name="takeover_outcome_none">尚未提交接管</string>
     <string name="takeover_outcome_failed">接管未完成：%1$s</string>
     <string name="takeover_button_confirm">我来接听</string>

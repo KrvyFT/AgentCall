@@ -27,15 +27,13 @@
             android:id="@+id/calibration_environment"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:text="@string/calibration_environment_prefix" />
+            android:layout_marginTop="16dp" />
 
         <TextView
             android:id="@+id/calibration_state"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:text="@string/calibration_state_prefix" />
+            android:layout_marginTop="4dp" />
 
         <TextView
             android:id="@+id/calibration_environment_note"

@@ -113,14 +113,21 @@ class CalibrationActivity : AppCompatActivity() {
             environment != null &&
             record.environment == environment &&
             record.toEvidence() != null
-        environmentView.text = getString(R.string.calibration_environment_prefix) + when {
+        val environmentText = when {
             environment != null -> getString(R.string.calibration_environment_available, environment!!.apiLevel)
             environmentError != null -> getString(R.string.calibration_environment_unavailable, environmentError)
             else -> getString(R.string.calibration_environment_unknown)
         }
-        stateView.text = getString(R.string.calibration_state_prefix) + getString(
+        environmentView.text = getString(R.string.calibration_environment_prefix, environmentText)
+        val verifiedLabel = getString(
             if (verified) R.string.calibration_state_verified else R.string.calibration_state_unverified,
-        ) + "（" + record.completed.size + "/" + CalibrationManualStep.entries.size + "）"
+        )
+        stateView.text = getString(
+            R.string.calibration_state_prefix,
+            verifiedLabel,
+            record.completed.size,
+            CalibrationManualStep.entries.size,
+        )
         environmentNote.visibility = if (environment == null) TextView.VISIBLE else TextView.GONE
 
         rendering = true

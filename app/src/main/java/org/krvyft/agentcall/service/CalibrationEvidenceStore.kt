@@ -1,6 +1,7 @@
 package org.krvyft.agentcall.service
 
 import android.content.Context
+import androidx.core.content.edit
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
@@ -133,11 +134,11 @@ class CalibrationEvidenceStore(
     }
 
     fun reset() {
-        preferences.edit().remove(KEY_RECORD).apply()
+        preferences.edit { remove(KEY_RECORD) }
     }
 
     private fun save(record: CalibrationRecord) {
-        preferences.edit().putString(KEY_RECORD, encode(record)).apply()
+        preferences.edit { putString(KEY_RECORD, encode(record)) }
     }
 
     private fun encode(record: CalibrationRecord): String {

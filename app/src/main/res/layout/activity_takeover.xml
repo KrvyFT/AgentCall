@@ -27,15 +27,13 @@
             android:id="@+id/takeover_session"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="16dp"
-            android:text="@string/takeover_session_prefix" />
+            android:layout_marginTop="16dp" />
 
         <TextView
             android:id="@+id/takeover_state"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:text="@string/takeover_state_prefix" />
+            android:layout_marginTop="4dp" />
 
         <TextView
             android:id="@+id/takeover_outcome"

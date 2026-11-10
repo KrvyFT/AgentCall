@@ -30,8 +30,7 @@
         <!-- 唯一 exported 组件：Launcher Activity。其余组件一律不导出。 -->
         <activity
             android:name=".ui.MainActivity"
-            android:exported="true"
-            android:label="@string/app_name">
+            android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

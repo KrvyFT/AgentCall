@@ -6,8 +6,8 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
-import android.net.Uri
 import androidx.core.app.NotificationCompat
+import androidx.core.net.toUri
 import org.krvyft.agentcall.R
 import org.krvyft.agentcall.core.model.SessionId
 import org.krvyft.agentcall.ui.MainActivity
@@ -108,7 +108,7 @@ class CallNotification(private val context: Context) {
         val data = TakeoverTarget.encode(TakeoverTarget.of(id))
         val intent = Intent(context, AgentCallService::class.java)
             .setAction(AgentCallService.ACTION_TAKEOVER)
-            .setData(Uri.parse(data))
+            .setData(data.toUri())
         return PendingIntent.getService(
             context,
             TakeoverTarget.requestCode(TakeoverTarget.of(id)),

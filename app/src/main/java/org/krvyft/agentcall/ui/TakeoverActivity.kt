@@ -2,12 +2,12 @@ package org.krvyft.agentcall.ui
 
 import android.content.Context
 import android.content.Intent
-import android.net.Uri
 import android.os.Bundle
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.net.toUri
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -72,22 +72,22 @@ class TakeoverActivity : AppCompatActivity() {
         val data = TakeoverTarget.encode(TakeoverTarget.of(target))
         val intent = Intent(this, AgentCallService::class.java)
             .setAction(AgentCallService.ACTION_TAKEOVER)
-            .setData(Uri.parse(data))
+            .setData(data.toUri())
         startService(intent)
     }
 
     private fun render(status: AgentCallStatus) {
         val target = session
         if (target == null) {
-            sessionView.text = getString(R.string.takeover_session_prefix) + getString(R.string.takeover_missing_session)
-            stateView.text = getString(R.string.takeover_state_prefix)
-            outcomeView.text = getString(R.string.takeover_outcome_none)
+            sessionView.text = getString(R.string.takeover_missing_session)
+            stateView.text = getString(R.string.takeover_state_prefix, StatusText.sessionState(status.sessionState))
+            outcomeView.text = getString(R.string.takeover_outcome_prefix, getString(R.string.takeover_outcome_none))
             confirmButton.isEnabled = false
             return
         }
-        sessionView.text = getString(R.string.takeover_session_prefix) + target.callId
-        stateView.text = getString(R.string.takeover_state_prefix) + StatusText.sessionState(status.sessionState)
-        outcomeView.text = getString(R.string.takeover_outcome_prefix) + outcomeText(status)
+        sessionView.text = getString(R.string.takeover_session_prefix, target.callId)
+        stateView.text = getString(R.string.takeover_state_prefix, StatusText.sessionState(status.sessionState))
+        outcomeView.text = getString(R.string.takeover_outcome_prefix, outcomeText(status))
         // 只有目标仍是当前会话时才允许提交（旧页面 fail closed）。
         confirmButton.isEnabled = status.activeSession == target
     }

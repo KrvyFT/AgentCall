@@ -376,7 +376,8 @@ class AgentCallService : Service() {
                 AgentCallRuntime.update { it.copy(lastError = decision.code) }
             }
         }
-        updateNotification()
+        // handleTakeover 在主线程上执行：通知刷新放到服务 scope，避免阻塞。
+        scope.launch { updateNotification() }
     }
 
     // ------------------------------------------------------------------ 通知/观察者
