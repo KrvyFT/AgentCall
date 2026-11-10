@@ -337,7 +337,7 @@ internal object BridgeRuntime {
             identities = UnverifiedCallIdentityVerifier,
             termination = ReflectiveTelecomTermination(),
         )
-        // 环境仍是服务端构建；root 背书只填补桥接观测不到的 transport/route（C1）。
+        // 环境仍是服务端构建；transport/route 桥接从不观测（始终 UNKNOWN），只能由 root 背书（C1）。
         val authorization = AutoAnswerAuthorization {
             isCalibrationAuthorizedFor(calibration, environment)
         }
@@ -826,7 +826,8 @@ internal class ControlDispatcher(
      *
      * 请求只能提供五项布尔、可选的“预期环境”（仅用于一致性核验）与可选的
      * operatorAttestation。证据环境与时间戳一律由桥接进程生成：环境来自服务端采集
-     * （root 背书只填补桥接观测不到的 transport/route/frameworkVersion/simCarrier），
+     * （transport/route 桥接从不观测、只能由 root 背书；frameworkVersion/simCarrier 有真实
+     * 观测源，只在观测不到时才由背书填补），
      * 时间戳由 [CalibrationStore] 的时钟写入。未知/不一致环境、缺失步骤、非法背书一律
      * 拒绝；APP/HOOK 在 [RolePolicy] 层就已被拒绝，本方法再按角色二次拒绝。
      */
@@ -1531,7 +1532,7 @@ internal class ControlDispatcher(
 
         const val CALIBRATION_ENVIRONMENT_FIELD: String = "expectedEnvironment"
 
-        /** root 操作员背书（C1）：桥接观测不到的 transport/route + 必须为 true 的人工测试标记。 */
+        /** root 操作员背书（C1）：桥接从不观测的 transport/route + 必须为 true 的人工测试标记。 */
         const val CALIBRATION_ATTESTATION_FIELD: String = "operatorAttestation"
 
         const val CALIBRATION_ATTESTATION_MANUAL_TEST: String = "manualTestCompleted"
@@ -1644,8 +1645,9 @@ internal val ATTESTABLE_ROUTES: Set<String> =
     setOf("EARPIECE", "SPEAKER", "HEADSET", "BLUETOOTH", PlatformFacts.UNKNOWN)
 
 /**
- * 背书只填补桥接观测不到的字段：观测值是已知事实时永远以观测值为准，背书不能覆盖。
- * frameworkVersion/simCarrier 与 transport/route 适用同一规则（Task 11H1）。
+ * 背书只填补仍为 UNKNOWN 的字段：观测值是已知事实时永远以观测值为准，背书不能覆盖。
+ * transport/route 桥接从不观测，始终依赖背书；frameworkVersion/simCarrier 有观测源，
+ * 只在观测不到时采用背书（Task 11H1 / 11J）。
  */
 internal fun applyAttestation(observed: EnvironmentKey, attestation: OperatorAttestation?): EnvironmentKey {
     if (attestation == null) return observed

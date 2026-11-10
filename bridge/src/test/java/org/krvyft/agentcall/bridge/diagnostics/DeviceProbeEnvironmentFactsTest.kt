@@ -180,6 +180,54 @@ class DeviceProbeEnvironmentFactsTest {
         assertNull(reflectiveXposedBridgeVersion(UnsupportedVersionXposedBridge::class.java.name))
         assertNull(reflectiveXposedBridgeVersion("de.robv.android.xposed.DoesNotExist"))
     }
+
+    // ------------------------------------- Task 11J：只接受整数正数 + 有界字符串
+
+    @Test
+    fun directClassCheckAcceptsTheLongReturnedBySomeBranches() {
+        assertEquals(
+            "long 返回值同样是整数版本，必须归一化成有界字符串",
+            "99",
+            reflectiveXposedBridgeVersion(LongVersionXposedBridge::class.java.name),
+        )
+    }
+
+    @Test
+    fun directClassCheckRejectsNonIntegralNegativeZeroAndOverflowNumbers() {
+        for (className in listOf(
+            DoubleVersionXposedBridge::class.java.name,
+            NaNDoubleVersionXposedBridge::class.java.name,
+            NegativeIntVersionXposedBridge::class.java.name,
+            ZeroIntVersionXposedBridge::class.java.name,
+            NegativeLongVersionXposedBridge::class.java.name,
+            OverflowLongVersionXposedBridge::class.java.name,
+        )) {
+            assertNull(
+                "Double/NaN/负数/零/溢出都不是可观测的整数版本，必须保持 UNKNOWN：" + className,
+                reflectiveXposedBridgeVersion(className),
+            )
+        }
+    }
+
+    @Test
+    fun directClassCheckKeepsStringVersionsBounded() {
+        assertEquals(
+            "合法的旧分支 String 版本仍被接受",
+            "1.9.2",
+            reflectiveXposedBridgeVersion(BoundedStringVersionXposedBridge::class.java.name),
+        )
+        for (className in listOf(
+            OversizedStringVersionXposedBridge::class.java.name,
+            ControlCharacterStringVersionXposedBridge::class.java.name,
+            UnknownStringVersionXposedBridge::class.java.name,
+            BlankStringVersionXposedBridge::class.java.name,
+        )) {
+            assertNull(
+                "超长/控制字符/UNKNOWN/空白字符串都不是可观测事实，必须保持 UNKNOWN：" + className,
+                reflectiveXposedBridgeVersion(className),
+            )
+        }
+    }
 }
 
 /** 测试替身：真实 LSPosed/EdXposed 的 XposedBridge.getXposedVersion() 返回 int。 */
@@ -203,5 +251,101 @@ class UnsupportedVersionXposedBridge {
     companion object {
         @JvmStatic
         fun getXposedVersion(): Boolean = true
+    }
+}
+
+/** 测试替身：少数分支的版本号是 long；整数且为正时同样可接受。 */
+class LongVersionXposedBridge {
+    companion object {
+        @JvmStatic
+        fun getXposedVersion(): Long = 99L
+    }
+}
+
+/** 测试替身：Double 不是整数版本（82.9 会被截断成 82），必须保持 UNKNOWN。 */
+class DoubleVersionXposedBridge {
+    companion object {
+        @JvmStatic
+        fun getXposedVersion(): Double = 82.9
+    }
+}
+
+/** 测试替身：NaN 不是观测事实（toLong() 会给 0），必须保持 UNKNOWN。 */
+class NaNDoubleVersionXposedBridge {
+    companion object {
+        @JvmStatic
+        fun getXposedVersion(): Double = Double.NaN
+    }
+}
+
+/** 测试替身：负数不是版本，必须保持 UNKNOWN。 */
+class NegativeIntVersionXposedBridge {
+    companion object {
+        @JvmStatic
+        fun getXposedVersion(): Int = -1
+    }
+}
+
+/** 测试替身：零不是版本，必须保持 UNKNOWN。 */
+class ZeroIntVersionXposedBridge {
+    companion object {
+        @JvmStatic
+        fun getXposedVersion(): Int = 0
+    }
+}
+
+/** 测试替身：负 long 不是版本，必须保持 UNKNOWN。 */
+class NegativeLongVersionXposedBridge {
+    companion object {
+        @JvmStatic
+        fun getXposedVersion(): Long = -82L
+    }
+}
+
+/** 测试替身：超出 Int.MAX_VALUE 的 long 不是可接受的版本（不饱和），必须保持 UNKNOWN。 */
+class OverflowLongVersionXposedBridge {
+    companion object {
+        @JvmStatic
+        fun getXposedVersion(): Long = Int.MAX_VALUE.toLong() + 1L
+    }
+}
+
+/** 测试替身：合法的旧分支 String 版本。 */
+class BoundedStringVersionXposedBridge {
+    companion object {
+        @JvmStatic
+        fun getXposedVersion(): String = "1.9.2"
+    }
+}
+
+/** 测试替身：超过观测上限（128 字符）的字符串不是事实。 */
+class OversizedStringVersionXposedBridge {
+    companion object {
+        @JvmStatic
+        fun getXposedVersion(): String = "8".repeat(129)
+    }
+}
+
+/** 测试替身：含控制字符的字符串不是事实。 */
+class ControlCharacterStringVersionXposedBridge {
+    companion object {
+        @JvmStatic
+        fun getXposedVersion(): String = "82\n83"
+    }
+}
+
+/** 测试替身：显式 UNKNOWN 不是事实。 */
+class UnknownStringVersionXposedBridge {
+    companion object {
+        @JvmStatic
+        fun getXposedVersion(): String = "UNKNOWN"
+    }
+}
+
+/** 测试替身：空白字符串不是事实。 */
+class BlankStringVersionXposedBridge {
+    companion object {
+        @JvmStatic
+        fun getXposedVersion(): String = "   "
     }
 }

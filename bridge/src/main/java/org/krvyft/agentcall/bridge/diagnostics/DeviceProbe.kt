@@ -223,12 +223,18 @@ internal fun reflectiveXposedBridgeVersion(
 }
 
 /**
- * LSPosed/EdXposed 的 `getXposedVersion()` 返回 int，个别旧分支返回 String；统一成
- * 十进制字符串再交给 [boundedObservedFact] 做有界校验。其他返回类型视为未知。
+ * LSPosed/EdXposed 的 `getXposedVersion()` 返回 int，个别分支返回 long 或 String。
+ *
+ * 只有**整数且为正**的版本号才是观测事实：`Int` 必须 > 0，`Long` 必须 > 0 且
+ * `<= Int.MAX_VALUE`（不饱和）。`Double`/`Float`/NaN/负数/零/溢出一律视为未知——
+ * `toLong()` 会把 82.9 截成 82、把 NaN 变成 0，这些都不是设备上真实存在的版本，
+ * 更不能冒充“已知”去满足 CalibrationPolicy 的完整性。String 仍走
+ * [boundedObservedFact]（≤128、无控制字符、非 UNKNOWN）。其他返回类型视为未知。
  */
 private fun xposedVersionFact(value: Any?): String? = when (value) {
     is String -> value
-    is Number -> value.toLong().toString()
+    is Int -> value.takeIf { it > 0 }?.toString()
+    is Long -> value.takeIf { it > 0 && it <= Int.MAX_VALUE }?.toString()
     else -> null
 }
 
