@@ -22,7 +22,11 @@ android {
         release {
             optimization {
                 enable = true
-                packageScope = setOf("androidx.**", "kotlin.**", "kotlinx.**")
+                // I3：之前只收缩 androidx/kotlin/kotlinx，app 自己的代码根本没有进入 R8，
+                // mapping.txt 里没有任何 org.krvyft 条目，“release 缩水/保留规则生效”的
+                // 证据是空洞的。这里显式覆盖全部包（等价于默认值），让 app 代码真的被
+                // 收缩/改名；必须保留的入口与隐藏回调由 keepRules/rules.keep 证明。
+                packageScope = setOf("**")
             }
         }
     }
