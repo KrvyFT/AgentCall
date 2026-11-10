@@ -2,8 +2,8 @@
 
 本文描述 AgentCall 的安装范围、配对、配置、校准、升级与卸载。**所有真机步骤均为「未验证」**：
 交付时 `adb devices` 为空，本仓库没有真机 Google 电话、KernelSU WebView 或音频证据；
-用户也明确禁止设备侧验证。最终本地矩阵（HEAD `5638995`）通过：JVM 单测 **815**
-（core 126 / bridge 345 / app 344，0 failures / 0 errors / 0 skipped）、lint 0 errors /
+用户也明确禁止设备侧验证。最终本地矩阵（HEAD `1776ba4`）通过：JVM 单测 **839**
+（core 126 / bridge 354 / app 359，0 failures / 0 errors / 0 skipped）、lint 0 errors /
 15 warnings；release APK 与模块 ZIP 已在该 HEAD 上重新打包（大小与 SHA-256 见第 1 节）。
 标注「未验证」的条目仍不能当作已可用。
 
@@ -17,11 +17,11 @@
 | `dist/agentcall-<version>.apk` | AgentCall APK（Xposed 模块 + 远程语音回合） |
 | `dist/SHA256SUMS` | 两个产物的 SHA-256 |
 
-最终打包（代码 HEAD `5638995`，在最后的 hook/bridge 修复之后重新构建；以
-`dist/SHA256SUMS` 为准）：`agentcall-1.0.zip` 1,400,028 B（11 个条目），SHA-256
-`7e285e63b35fd9563fafffc3282dd8ace8141810cee27f3f2459e3e80b7195ef`；
-`agentcall-1.0.apk` 2,266,580 B，SHA-256
-`37ccd66c890aea749c885927a03faeb892a7c73a9a247afc48d3d2442ca52a65`。
+最终打包（代码 HEAD `1776ba4`，在最后的 bridge/module 修复之后重新构建；以
+`dist/SHA256SUMS` 为准）：`agentcall-1.0.zip` 1,405,356 B（11 个条目），SHA-256
+`e5660f58b8fd6d3b0eddd61fdc6e0fff52e4254de596c4e1dc63b0a691b34608`；
+`agentcall-1.0.apk` 2,274,772 B，SHA-256
+`b9834fe4ffec28f0872089fc0313bff4d61994e68e989421797d27f0f2e6e1ff`。
 `python3 tools/check_package.py --dist dist` 输出 `Status: PASS`：appId
 `org.krvyft.agentcall`、版本 1.0 (1)、`module.prop` 1.0 (1)、dex `classes.dex`、
 结构 module=1/scripts=3/bridge=2/bin=1/webroot=4。
@@ -88,7 +88,11 @@ su -c /data/adb/modules/agentcall/bin/agentcallctl status
 ```
 
 输出是单行 JSON；失败时形如 `{"error":{"code":"...","message":"..."}}`。常见码见第 8 节。
-`status` 现在包含两个概览实时字段（阶段 B）：`hookConnected`（HOOK 心跳 5000 ms 窗口）
+`status` 有 **18 个顶层键**（17 个标量/布尔 + `calibration` 对象），含
+`shutdownCode`（最近一次优雅关闭的机器码，干净/未发生为 `null`）与
+`calibration`（与 `calibration.read` 相同的只读视图，含 `operatorAttestation` /
+`effectiveEnvironment`）。`diagnose` 携带同一份校准视图。
+`status` 还包含两个概览实时字段（阶段 B）：`hookConnected`（HOOK 心跳 5000 ms 窗口）
 与 `dialerDefaultRole`（boolean，或无法在特权进程可靠确定时的字符串 `"unknown"`）。
 两者都是本地查询；真机取值**未验证**，`"unknown"` 时 WebUI 显示“未知”，不猜。
 
@@ -195,9 +199,21 @@ WebUI 的「连接测试」按钮只做本地地址格式校验，**不发起远
 未知/隐藏号码默认人工处理。
 
 校准依赖真实设备上的音频证据（downlink 抽取、uplink 注入、麦克风隔离、特权终止能力）。
-APK 校准页可辅助执行五项人工测试，但**只写 APK 自己的 SharedPreferences，不会写入桥接**。
+APK 校准页可辅助执行五项人工测试，但**只写 APK 自己的 SharedPreferences，不会写入桥接**；
+APP 的自动接听就绪同时要求桥接 `calibration.read`（`available && supportedApiLevel==37 &&
+verified && environmentComplete && environmentMatchesEvidence`）与本机 `CalibrationPolicy`，
+读取失败/未知一律 false（`calibration_unavailable`），绝不沿用上一轮的 true。
 桥接证据的唯一写入通道是 root CLI 的固定命令 `calibrate`（`calibration.record` RPC）：
 JSON 只从 stdin 进入，argv 携带负载会在启动 CLI 前以 `usage_invalid` 拒绝。
+
+环境事实由桥接观测，只有观测不到时才由 root 操作员背书：`frameworkVersion` 依次读 root
+SystemProperties（`ro.lsposed.version` / `persist.sys.lsposed.version` / `ro.vector.version` /
+`persist.sys.vector.version` / `ro.edxposed.version` / `persist.sys.edxposed.version`），再读
+`/data/adb/modules/{lsposed,zygisk_lsposed,vector}/module.prop` 的 `version=`，最后做
+XposedBridge 类检查；`simCarrier` 先取 TelephonyManager 的 SIM 运营商名，再回退
+`gsm.sim.operator.alpha` / `gsm.sim.operator.default-name` / `ro.cdma.home.operator.alpha`；
+`transport`/`route` 在通话上下文中观测，无上下文时为 `UNKNOWN`。任何观测到的已知值都优先于
+背书。
 
 五项人工测试（全部必须由真人实测，不得用本机记录、静态阅读或创建音频对象伪造）：
 
@@ -210,7 +226,8 @@ JSON 只从 stdin 进入，argv 携带负载会在启动 CLI 前以 `usage_inval
 | `processFailureVerified` | 进程故障注入后仍能故障终止/保持隔离 |
 
 记录示例（先写 root 私有文件，再重定向 stdin；`calibrate` 不会自动删除该文件，写完请手动删除）。
-`operatorAttestation` 只有 root 操作员能提供，用于填补 bridge 观测不到的 transport/route：
+`operatorAttestation` 只有 root 操作员能提供，用于填补 bridge 观测不到的字段；
+`transport`/`route`/`manualTestCompleted` 必填，`frameworkVersion`/`simCarrier` 可选：
 
 ```sh
 su -c 'cat > /data/adb/agentcall/inbox/calibration.json' <<'JSON'
@@ -225,7 +242,9 @@ su -c 'cat > /data/adb/agentcall/inbox/calibration.json' <<'JSON'
   "operatorAttestation": {
     "transport": "CELLULAR",
     "route": "EARPIECE",
-    "manualTestCompleted": true
+    "manualTestCompleted": true,
+    "frameworkVersion": "1.9.2",
+    "simCarrier": "Example Carrier"
   }
 }
 JSON
@@ -235,23 +254,29 @@ su -c 'rm -f /data/adb/agentcall/inbox/calibration.json'
 
 - 成功输出 `{recorded, environment, operatorAttestation, steps, verified, blockers, calibratedAtMs}`；
   `verified` 只在五项全部为 true 且环境完整时才是 true，不要用本机勾选替代。
-  `operatorAttestation` 回显 `{operatorAttested, transport, route}`：只有确实由 root 操作员
-  背书、且该字段原本是 UNKNOWN 时才为 true；bridge 已观测到的已知值永远优先，背书不能覆盖。
-- `operatorAttestation` 只允许三个键，且全部必须是字符串/true：
+  `operatorAttestation` 回显 `{operatorAttested, transport, route, frameworkVersion, simCarrier}`：
+  只有确实由 root 操作员背书、且该字段原本是 UNKNOWN 时才标记；bridge 已观测到的已知值
+  永远优先，背书不能覆盖。
+- `operatorAttestation` 允许五个键：前三个必填，后两个可选：
   - `transport` ∈ `CELLULAR`、`VOWIFI`、`UNKNOWN`；
   - `route` ∈ `EARPIECE`、`SPEAKER`、`HEADSET`、`BLUETOOTH`、`UNKNOWN`；
-  - `manualTestCompleted` 必须是 JSON `true`（操作员确认五项人工测试真实完成）。
-  其他形状/词表值整体拒绝（`payload_invalid`）；APP/HOOK 不能调用 `calibration.record`，
+  - `manualTestCompleted` 必须是 JSON `true`（操作员确认五项人工测试真实完成）；
+  - `frameworkVersion` / `simCarrier` 可选，出现时必须是 1..128 字符、前后无空白（已
+    trim）、不含控制字符、且不等于 `UNKNOWN` 的字符串。
+  其他形状/词表/长度整体拒绝（`payload_invalid`）；APP/HOOK 不能调用 `calibration.record`，
   也不能提供背书，服务端按角色二次拒绝。`UNKNOWN` 不能解锁完整环境。
+- `calibration.read`/status/diagnose 会标记**每一个**被背书的字段（`operatorAttested` 与
+  `frameworkVersion`/`simCarrier`/`transport`/`route`），不把操作员背书显示成桥接实测。
 - 可选 `expectedEnvironment` 把这些证据绑定到预期环境（`apiLevel`、`romFingerprint`、
   `kernelVersion`、`dialerPackageVersion`、`frameworkVersion`、`bridgeVersion`、
   `audioPolicyDigest`、`simCarrier`、`transport`、`route`）；当前环境（含 root 背书后的
   effective environment）的任一字段未知时返回 `calibration_environment_unknown`，与预期
   不一致时返回 `calibration_environment_mismatch`，两者都整体拒绝、绝不假装已验证。
 - 校准存储未接线时返回 `calibration_unavailable`。
-- 字段名、词表与最终语义以 HEAD `5638995` 与 `docs/config-schema.md` 为准。
-- 校准/身份两道闸门都还没有设备证据：自动接听仍保持关闭（`calibration_not_verified`），
-  `UnverifiedCallIdentityVerifier` 也仍 `blocksAutoAnswer=true`。
+- 字段名、词表与最终语义以 HEAD `1776ba4` 与 `docs/config-schema.md` 为准。
+- **产品阻塞项**：即使校准记录齐全，默认 `UnverifiedCallIdentityVerifier` 仍无法按通话
+  身份核验，保持 `blocksAutoAnswer=true`；不存在设备验证过的、按身份定位的特权 Telecom
+  终止路径。因此自动接听仍保持关闭（`calibration_not_verified`）。
 
 root 侧可查看能力/环境报告：
 
@@ -259,8 +284,11 @@ root 侧可查看能力/环境报告：
 su -c /data/adb/modules/agentcall/bin/agentcallctl diagnose
 ```
 
-**未验证**：`calibrate` 的 stdin 继承、真实环境探针（尤其 `transport`/`route`）与五项人工
-测试本身的设备行为均未上机；在真机校准完成且桥接读到完整环境前，产物一律按
+**未验证**：`calibrate` 的 stdin 继承、frameworkVersion/simCarrier 的真实观测（root
+SystemProperties、模块 `module.prop`、XposedBridge 类检查、TelephonyManager/telephony 属性）
+与五项人工测试本身的设备行为均未上机；`transport`/`route` 在无通话上下文时仍需 root 背书。
+校准通道已能在文档所述的 LSPosed/Vector + KernelSU 栈上补齐环境，但这不等于设备验证；
+在真机完成校准前，产物一律按
 「待适配/验证」对待，不宣称音频可用。
 
 ## 8. 升级、回退与卸载
@@ -336,6 +364,12 @@ AI 会话，等待人工处理。恢复路径：
       并明确“未确认通话已终止或交还；麦克风可能仍被隔离”，**不会**谎称已交还；
    6. 之后才按 PID 文件核验并结束音频工作进程与残留桥接（cmdline 不匹配就不猜、不杀），
       释放停止锁，最后才删除 `/data/adb/agentcall`（连同粘性所有权标记）。
+   持久裁决是模块**停止/退出路径**（`service.sh`）的行为，不是 `uninstall.sh` 的分支：
+   `service.sh` 在桥接退出（哪怕退出码 0）后读
+   `DATA_ROOT/supervisor-state.json`（schema ≥ 3），`shutdownCode` 非 null 或
+   `microphoneIsolated=true` 时打印 `! microphone_still_isolated` /
+   `! shutdown_unresolved` 与 `bridge_stop_unclean`，绝不打印 `bridge_exit_clean`，以非零
+   退出并拒绝重启。
    两个 PID 文件都是首行单个十进制 PID。按 KernelSU 的标记语义，卸载会先写
    `remove`/`disable` 标记（设备上的实际卸载时序未验证）；`service.sh` 在每次重启前
    重新检查该标记，标记存在时不会把模块重新拉起；若手动在无标记时对进程执行 TERM，
@@ -365,7 +399,7 @@ AI 会话，等待人工处理。恢复路径：
 | `service_not_running` | `service.sh` 已退出（本次开机没有重启循环） | 重启设备或重新启用模块；不要伪造重启成功 |
 | `module_disabled` | 模块带 `disable`/`remove` 标记 | 先启用/重装模块；不会重启已移除模块 |
 | `restart_unconfirmed` | 桥接未接受 `shutdown`（退出/不可达） | 刷新状态；仍不可达时重启设备 |
-| `shutdown_call_unresolved` | 5 s 内无法确认拥有的通话已断开；桥接保持隔离并失败关闭（粘性标记保留） | 先在 Google 电话中手动结束通话；确认 `status` 的 `microphoneIsolated` 与 `supervisionPhase`，必要时重启设备 |
+| `shutdown_call_unresolved` | 5 s 期限（只等待 `awaitConfirmedDisconnect`，不含终止命令本身）内无法确认拥有的通话已断开；桥接保持隔离并失败关闭（粘性标记保留） | 先在 Google 电话中手动结束通话；确认 `status` 的 `microphoneIsolated` 与 `supervisionPhase`，必要时重启设备 |
 | `shutdown_microphone_restore_failed` | 已确认断开，但麦克风恢复读回失败；桥接 `BLOCKED` | 人工确认麦克风状态；不要把“进程退出”当成已恢复 |
 | `calibration_environment_unknown` / `..._mismatch` | 校准环境事实不完整/与预期不一致 | 不要伪造；在完整环境上重测五项后重试 `calibrate` |
 
@@ -374,10 +408,10 @@ AI 会话，等待人工处理。恢复路径：
 | 步骤 | 状态 |
 | --- | --- |
 | 模块 ZIP 结构、DEX 入口、版本、SHA-256、密钥泄漏检查 | 本地已验证（`make package-check`） |
-| 最终矩阵（HEAD `5638995`） | 本地 PASS：225 个 Gradle task；JVM 815（core 126 / bridge 345 / app 344，0 failures / 0 errors / 0 skipped）、lint 0 errors / 15 warnings；APK/ZIP 已在该 HEAD 重新打包（哈希见第 1 节） |
-| JVM/JS/Python/脚本检查 | JVM 815；WebUI node 113/113；Python 59/59；`sh -n` 模块脚本通过；`make test` / `make build` / `make package-check` 全 PASS |
-| release 收缩（R8） | 本地已验证：`packageScope = setOf("**")`，mapping 约 98,580 行，release APK 6.44 MB → 2.27 MB；**真机未验证** |
-| 配对（WebUI/root CLI）与 APK 校准/诊断界面 | 已实现；root CLI `calibrate` 经 `calibration.record` 写入五项人工证据，transport/route 需 root 操作员固定词表背书（真机环境探针与五项实测未验证，见第 7 节） |
+| 最终矩阵（HEAD `1776ba4`） | 本地 PASS：225 个 Gradle task；JVM 839（core 126 / bridge 354 / app 359，0 failures / 0 errors / 0 skipped）、lint 0 errors / 15 warnings；APK/ZIP 已在该 HEAD 重新打包（哈希见第 1 节） |
+| JVM/JS/Python/脚本检查 | JVM 839；WebUI node 115/115；Python 59/59；`sh -n` 模块脚本通过；`make test` / `make build` / `make package-check` 全 PASS |
+| release 收缩（R8） | 本地已验证：`packageScope = setOf("**")`，mapping 99,205 行，release 未签名 APK 2.18 MB（debug 重签 2.27 MB）；**真机未验证** |
+| 配对（WebUI/root CLI）与 APK 校准/诊断界面 | 已实现；root CLI `calibrate` 经 `calibration.record` 写入五项人工证据；环境由桥接观测（frameworkVersion/simCarrier 有真实观测源），只有观测为 UNKNOWN 的 transport/route/frameworkVersion/simCarrier 才采用 root 背书；APP 就绪另需 `calibration.read` 的 supported/verified/environmentComplete/environmentMatchesEvidence（真机探针与五项实测未验证，见第 7 节） |
 | 优雅关闭停止顺序（先取 stop.lock、shutdown、后停音频工作进程、再 TERM→KILL） | 本地宿主已验证（`shutdown-order.test.mjs`、`module-scripts.test.mjs` 进程/CLI 替身，含并发锁等待）；**真机未验证** |
 | 关闭裁决/隔离读回与未确认警告（service.sh + uninstall.sh） | 本地宿主已验证（shutdown 响应与最终 status 探测的隔离读回、`! microphone_still_isolated`）；**真机 KernelSU 卸载时序未验证** |
 | `agentcallctl restart` 关闭裁决拒绝 | 本地宿主已验证（clean=false、mic 仍隔离、裁决缺失都返回 `restart_refused` 并收回标记）；**真机未验证** |
@@ -391,8 +425,11 @@ AI 会话，等待人工处理。恢复路径：
 | 双卡、VoWiFi、蓝牙 | **未验证**，未测组合不启用 |
 
 结论：安装步骤按设计写成，但**除本地构建/打包/结构检查与宿主测试替身外，没有真机证据**；
-交付时也没有设备连接。root CLI `calibrate` 已提供桥接校准写入通道（最终 HEAD 的
-operatorAttestation 只补 transport/route），但真实环境探针、五项人工测试、优雅关闭的
-麦克风恢复读回与 KernelSU 卸载时序都未上机；真机自动接听在
-完成这些验证前仍不能被当作已启用（保持 fail-closed，`calibration_not_verified`）。
-在完成 spec §12 设备验收前，不要把本模块当作可用的电话助理。
+交付时也没有设备连接。root CLI `calibrate` 已提供桥接校准写入通道，环境事实可由桥接真实
+观测（frameworkVersion/simCarrier 有真实观测源），只有观测为 UNKNOWN 的
+`transport`/`route`/`frameworkVersion`/`simCarrier` 才由 root 背书；但真实环境探针、五项
+人工测试、优雅关闭的麦克风恢复读回与 KernelSU 卸载时序都未上机。
+**剩余产品阻塞项（不是单纯的设备缺口）**：即使校准记录齐全，按通话身份定位的特权 Telecom
+终止路径仍不存在（`UnverifiedCallIdentityVerifier` 保持 `blocksAutoAnswer=true`），自动接听
+不会开启；APK 只有 debug 签名、不可分发。在完成 spec §12 设备验收与这两项阻塞前，不要把本
+模块当作可用的电话助理。

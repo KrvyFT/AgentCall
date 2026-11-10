@@ -126,6 +126,10 @@ inbox 中的一次性明文负载只在一次保存期间存在：正常路径�
   `operatorAttestation`、`steps`、`calibratedAtMs`）；存储未接线时为
   `{"available":false}`，读取失败时附 `error` 机器码。APP/HOOK 只读，写入只经
   `calibrate`（§8）。
+  APP 的自动接听就绪**从这份视图派生**：`available && supportedApiLevel == 37 && verified
+  && environmentComplete && environmentMatchesEvidence`，再叠加 APP 本机
+  `CalibrationPolicy`（本机五项证据 + 环境精确绑定）；读取失败或任何字段未知都返回 false 并
+  报 `calibration_unavailable`，绝不把上一轮的 true 缓存下来。
 - `processId`：桥接进程每次启动生成的随机字符串，是判断“桥接是否重启过”的唯一信标。
   缺失、非字符串、含空白/控制字符或超长时，调用方必须按“代次未知”处理，不得当成同一进程；
   `uptimeMs` 只作展示，不能替代它。
@@ -323,14 +327,20 @@ inbox 中的一次性明文负载只在一次保存期间存在：正常路径�
 退出码：`0` 成功、`1` 服务端错误、`2` 用法/负载错误、`3` 传输失败。
 错误输出始终是单行机器可读 JSON：`{"error":{"code":"...","message":"..."}}`。
 
-**`calibrate` 包装器契约（任务 11D2b / 11E）**：`module/bin/agentcallctl calibrate` 只接受
-零参数；stdin 逐字节原样交给 `AgentCallCli calibrate`（包装器不读、不拼、不回显），任何
+**`calibrate` 包装器契约（任务 11D2b / 11E / 11H1）**：`module/bin/agentcallctl calibrate` 只
+接受零参数；stdin 逐字节原样交给 `AgentCallCli calibrate`（包装器不读、不拼、不回显），任何
 argv 负载都在启动 CLI 之前以 `usage_invalid`（退出码 2）拒绝。外层只做“JSON 对象 + 只允许
 `steps`、可选 `expectedEnvironment`、可选 `operatorAttestation`，三者都是对象”的形状校验；
 五项步骤是否齐全、环境是否未知/不一致、背书词表/角色、以及 `verified` 裁决仍由桥接的
 `calibration.record` handler 独占（唯一权威）。环境与时间戳一律由桥接进程重新采集/写入；
-root 背书只能填补桥接观测不到的 transport/route，观测到的已知值永远优先。未知或不一致
-环境整体拒绝。校准存储未接线时返回 `calibration_unavailable`，绝不假装已验证。
+root 背书只能填补桥接观测不到的 `transport`/`route`/`frameworkVersion`/`simCarrier`，
+观测到的已知值永远优先。框架/SIM 先由桥接真实观测：`frameworkVersion` 依次读 root
+SystemProperties（`ro.lsposed.version`/`persist.sys.lsposed.version`/`ro.vector.version`/
+`persist.sys.vector.version`/`ro.edxposed.version`/`persist.sys.edxposed.version`）、
+`/data/adb/modules/{lsposed,zygisk_lsposed,vector}/module.prop` 的 `version=`、XposedBridge
+类检查；`simCarrier` 读 TelephonyManager SIM 运营商名并回退
+`gsm.sim.operator.alpha`/`gsm.sim.operator.default-name`/`ro.cdma.home.operator.alpha`。未知或
+不一致环境整体拒绝。校准存储未接线时返回 `calibration_unavailable`，绝不假装已验证。
 
 WebUI 的实际命令行（完整字符串，无用户数据）：
 
@@ -356,34 +366,43 @@ WebUI 不调用它。
 `calibration.record`（仅 CLI_ROOT）是控制 socket 上的固定 RPC 方法。操作员入口是
 `agentcallctl calibrate`（零参数，JSON 只从 stdin 进入）；WebUI 不提供该动作，也不伪造
 校准证据。`calibration.record` 接受五项布尔人工测试步骤、可选的“预期环境”与可选的
-`operatorAttestation`；环境与时间戳一律由桥接进程重新采集/写入（背书只补 transport/route），
-未知或不一致环境整体拒绝。校准存储未接线时返回 `calibration_unavailable`，绝不假装已验证。
+`operatorAttestation`；环境与时间戳一律由桥接进程重新采集/写入（背书只补桥接观测不到的
+`transport`/`route`/`frameworkVersion`/`simCarrier`），未知或不一致环境整体拒绝。校准存储
+未接线时返回 `calibration_unavailable`，绝不假装已验证。
 
-**`operatorAttestation`（11E，root 操作员背书）**：对象只允许三个键，多键/少键/错误类型都
-整体拒绝（`payload_invalid`）：
+**`operatorAttestation`（11E / 11H1，root 操作员背书）**：对象允许五个键；
+`transport`/`route`/`manualTestCompleted` 必填，`frameworkVersion`/`simCarrier` 可选。
+多键/少键/错误类型都整体拒绝（`payload_invalid`）：
 
 | 键 | 类型/词表 | 语义 |
 | --- | --- | --- |
 | `transport` | string；`CELLULAR` / `VOWIFI` / `UNKNOWN` | 通话承载；只有 bridge 观测为 UNKNOWN 时才采用 |
 | `route` | string；`EARPIECE` / `SPEAKER` / `HEADSET` / `BLUETOOTH` / `UNKNOWN` | 音频路由；只有 bridge 观测为 UNKNOWN 时才采用 |
 | `manualTestCompleted` | 必须是 JSON `true` | 操作员确认五项人工测试真实完成 |
+| `frameworkVersion` | string；1..128 字符，前后无空白（已 trim），无控制字符，且 ≠ `UNKNOWN` | Xposed 框架版本；只有 bridge 观测为 UNKNOWN 时才采用 |
+| `simCarrier` | 同上（有界自由文本） | SIM 运营商名；只有 bridge 观测为 UNKNOWN 时才采用 |
 
 - APP/HOOK 不能调用 `calibration.record`（RolePolicy 已拒绝，handler 再按角色二次拒绝），
   因此不能提供背书。
-- bridge 已观测到的已知 transport/route 永远优先，背书不能覆盖；`UNKNOWN` 不能解锁完整
-  环境。
-- 写入响应的 `operatorAttestation` 为 `{operatorAttested, transport, route}`；只有确实由
-  root 背书、且对应观测值为 UNKNOWN 时才标记 `operatorAttested=true`。
-- `calibration.read`/status/diagnose 的校准视图同样暴露 `operatorAttestation` 与
-  `effectiveEnvironment`，避免把“服务端观测”与“操作员背书”混为一谈。
+- bridge 已观测到的已知 `transport`/`route`/`frameworkVersion`/`simCarrier` 永远优先，背书
+  不能覆盖；`UNKNOWN` 不能解锁完整环境。
+- 写入响应与 `calibration.read`/status/diagnose 的 `operatorAttestation` 为
+  `{operatorAttested, transport, route, frameworkVersion, simCarrier}`；**每个**确实由 root
+  背书、且对应观测值为 UNKNOWN 的字段都会标记（`operatorAttested=true` + 该字段值），
+  不把操作员背书显示成桥接实测。
+- 校准视图同时暴露 `effectiveEnvironment`（观测 + 背书后的有效环境），避免把“服务端观测”
+  与“操作员背书”混为一谈。
 
-**`shutdown` 结果语义（11D2a/11D2b/11E）**：响应固定为
+**`shutdown` 结果语义（11D2a/11D2b/11E/11H1）**：响应固定为
 `{"stopping":true,"clean":<bool>,"shutdownCode":<string|null>,"supervision":
 {"clean":...,"ownedSession":...,"termination":...,"ownershipResolved":...,
 "disconnected":...,"microphoneIsolated":...,"code":...}}`。三个顶层字段是
 `clean` / `shutdownCode` / `supervision.microphoneIsolated`；`clean=true` 等价于
 `shutdownCode=null`。拥有中的通话只有在终止/交还并确认断开、且恢复读回为未隔离时才得到
-`null`。
+`null`。时间预算：`SHUTDOWN_TERMINATION_DEADLINE_MS` = 5 s，但该期限**只覆盖终止命令
+下发之后等待 `awaitConfirmedDisconnect` 的时间**；终止命令先执行、其角色通道等待另有预算，
+所以 5 s 不是“终止 + 确认”的总时长。恢复只有单一 `SHUTDOWN_RESTORE_BUDGET_MS` = 6 s；
+CLI 只对 `shutdown` 把 socket 超时放宽到 20 s。
 
 11E 起（最终 HEAD 保持）**没有拥有中的通话时也会处理观测到的隔离**：恢复成功才是 `clean=true`；仍隔离
 返回 `clean=false` + `shutdown_microphone_still_isolated`（不再出现“`clean=true` 但
@@ -398,6 +417,12 @@ WebUI 不调用它。
 `IDLE`/`ENDED`（或进程/socket 已退出）才宣称“已确认干净关闭”；否则打印机器可读警告。
 `service.sh` 在关闭响应之外，只要桥接在退出等待后仍存活就再做一次最终 `status` 探测；
 隔离仍为 true 时打印 `! microphone_still_isolated ...` 与 `bridge_stop_unclean`。
+11H1 起，桥接退出（哪怕退出码 0）后还会读 `DATA_ROOT/supervisor-state.json`（schema ≥ 3）
+作为持久裁决：`shutdownCode` 非 null 或 `microphoneIsolated=true` 时打印
+`! microphone_still_isolated` / `! shutdown_unresolved` 与 `bridge_stop_unclean`，
+**绝不打印 `bridge_exit_clean`**，以非零退出并拒绝重启。`agentcallctl restart` 同样只在
+`clean=true` + `shutdownCode=null` + `microphoneIsolated=false` 时继续，否则
+`restart_refused`。
 
 **监督端持久状态（schema 3）**：`/data/adb/agentcall/supervisor-state.json` 以 `schema: 3`
 原子落盘（同目录临时文件 + fsync + rename），字段含 `phase`、`ownedSession`、
@@ -580,12 +605,16 @@ WebUI 不加载任何在线 CDN、不发起 fetch/XHR、不用 `innerHTML` 渲�
 - **优雅关闭与卸载顺序未上机**：`service.sh`/`uninstall.sh` 的“先固定 CLI shutdown、
   再停音频工作进程、最后 TERM→KILL”只有宿主进程替身证据（`shutdown-order.test.mjs`、
   `module-scripts.test.mjs`）。真机 KernelSU 卸载时序、`app_process` 在停止/重启窗口内
-  能否及时响应 `shutdown`、以及卸载时读到的 `supervisionPhase` 均**未验证**。
+  能否及时响应 `shutdown`、持久裁决（`supervisor-state.json` schema 3）在真机的落盘/读回、
+  以及卸载时读到的 `supervisionPhase` 均**未验证**。
 - **`calibrate` 包装器/背书未上机**：stdin 逐字节透传、argv 拒绝、`operatorAttestation`
-  词表与角色拒绝只有宿主/JVM 证据；真机 `app_process` 的 stdin 继承与校准环境探针
-  **未验证**。`transport`/`route` 观测为 UNKNOWN 时，只有 root 操作员用固定词表背书
-  才能补齐；`UNKNOWN` 背书不完整时仍按 `calibration_environment_unknown` 拒绝，不会
-  伪造环境事实。APP/HOOK 不能背书。
+  词表/有界自由文本与角色拒绝只有宿主/JVM 证据；真机 `app_process` 的 stdin 继承与校准
+  环境探针**未验证**。`transport`/`route`/`frameworkVersion`/`simCarrier` 观测为 UNKNOWN 时，
+  只有 root 操作员背书才能补齐；`UNKNOWN` 背书不完整时仍按
+  `calibration_environment_unknown` 拒绝，不会伪造环境事实。APP/HOOK 不能背书。
+- **产品阻塞项**：校准记录只是自动接听的一道闸门；默认 `UnverifiedCallIdentityVerifier`
+  仍 `blocksAutoAnswer=true`，没有设备验证过的、按通话身份定位的特权 Telecom 终止路径，
+  所以即使记录齐全自动接听也不会开启。APK 只有 debug 签名、不可分发。
 - **概览实时字段**：`hookConnected`/`dialerDefaultRole` 已由桥接 status 提供，但只有
   JVM 假替身证据（`BridgeStatusLiveValuesTest`、`DialerDefaultRoleProbeTest`）。真机上
   `RoleManager` 隐藏方法（`getRoleHolders`）的反射可用性、root 的权限判定与真实取值

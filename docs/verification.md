@@ -5,8 +5,8 @@
 
 - 记录时间：2026-11-11（Asia/Shanghai）
 - 仓库：`/home/krvy/Projects/AgentCall`
-- 分支 / HEAD：`master` / `5638995`（最终代码提交：narrow route fingerprint、atomic write
-  progress、release zero-hook guard）
+- 分支 / HEAD：`master` / `1776ba4`（最终代码提交：observe framework facts、persisted
+  unclean shutdown、APP readiness 由 bridge `calibration.read` 派生）
 - 完整 225-task 验收矩阵、`make test`、`make build`、`make package-check` 都在这个 HEAD 上
   执行；`dist/` 也在其最终代码改动之后重新打包（哈希见 4.5），不是旧构建的遗留。
 - 远程仓库：`https://github.com/KrvyFT/AgentCall`（public，默认分支 `master`）；文档中不含任何令牌或凭据。
@@ -42,7 +42,7 @@
 
 ## 3. 最终验收矩阵
 
-最终矩阵在 HEAD `5638995` 上完整重跑（`--rerun-tasks`，没有复用 11E 之前的结果）：
+最终矩阵在 HEAD `1776ba4` 上完整重跑（`--rerun-tasks`，没有复用 11H 之前的结果）：
 
 ```sh
 flock /tmp/agentcall-gradle.lock ./gradlew \
@@ -56,9 +56,9 @@ flock /tmp/agentcall-gradle.lock ./gradlew \
 | 验证面 | 实际结果 |
 | --- | --- |
 | `:core:testDebugUnitTest` | 126 tests，0 failures / 0 errors / 0 skipped |
-| `:bridge:testDebugUnitTest` | 345 tests，0 failures / 0 errors / 0 skipped |
-| `:app:testDebugUnitTest` | 344 tests，0 failures / 0 errors / 0 skipped |
-| 合计 JVM | **815 tests，全部通过**（0 failures / 0 errors / 0 skipped） |
+| `:bridge:testDebugUnitTest` | 354 tests，0 failures / 0 errors / 0 skipped |
+| `:app:testDebugUnitTest` | 359 tests，0 failures / 0 errors / 0 skipped |
+| 合计 JVM | **839 tests，全部通过**（0 failures / 0 errors / 0 skipped） |
 | `:app:lintDebug` | SUCCESSFUL；0 errors，15 warnings（明细见 4.2） |
 | `:app:assembleRelease` | SUCCESSFUL |
 | `:bridge:packageRuntime` | SUCCESSFUL |
@@ -76,9 +76,9 @@ flock /tmp/agentcall-gradle.lock ./gradlew \
 | 模块 | 测试类 XML 数 | tests | failures | errors | skipped |
 | --- | --- | --- | --- | --- | --- |
 | `:core` | 7 | 126 | 0 | 0 | 0 |
-| `:bridge` | 49 | 345 | 0 | 0 | 0 |
-| `:app` | 28 | 344 | 0 | 0 | 0 |
-| 合计 | 84 | **815** | 0 | 0 | 0 |
+| `:bridge` | 49 | 354 | 0 | 0 | 0 |
+| `:app` | 29 | 359 | 0 | 0 | 0 |
+| 合计 | 85 | **839** | 0 | 0 | 0 |
 
 这些是宿主 JVM 上的逻辑测试，**不能**代替任何真机结论（见第 5 节）。
 
@@ -104,8 +104,8 @@ flock /tmp/agentcall-gradle.lock ./gradlew \
 
 交付时重跑 `make test` 通过（退出码 0）：
 
-- JVM 单测：同上 815 项（HEAD `5638995`，完整重跑）。
-- WebUI node 测试：`node --test module/webroot/tests/*.test.mjs`，113 tests / 113 pass / 0 fail / 0 skipped。
+- JVM 单测：同上 839 项（HEAD `1776ba4`，完整重跑）。
+- WebUI node 测试：`node --test module/webroot/tests/*.test.mjs`，115 tests / 115 pass / 0 fail / 0 skipped。
 - Python 打包测试：`python3 -m unittest discover -s tools/tests -v`，59 tests，OK。
 - 模块脚本语法：`sh -n` 检查 `customize.sh`、`service.sh`、`uninstall.sh`、`bin/agentcallctl`。
 - `make package-check` 重跑：`Status: PASS`（结构、版本、签名、SHA-256 见 4.5）。
@@ -116,11 +116,11 @@ flock /tmp/agentcall-gradle.lock ./gradlew \
 
 | 文件 | 大小 | SHA-256 |
 | --- | --- | --- |
-| `dist/agentcall-1.0.zip` | 1,400,028 B | `7e285e63b35fd9563fafffc3282dd8ace8141810cee27f3f2459e3e80b7195ef` |
-| `dist/agentcall-1.0.apk` | 2,266,580 B | `37ccd66c890aea749c885927a03faeb892a7c73a9a247afc48d3d2442ca52a65` |
+| `dist/agentcall-1.0.zip` | 1,405,356 B | `e5660f58b8fd6d3b0eddd61fdc6e0fff52e4254de596c4e1dc63b0a691b34608` |
+| `dist/agentcall-1.0.apk` | 2,274,772 B | `b9834fe4ffec28f0872089fc0313bff4d61994e68e989421797d27f0f2e6e1ff` |
 | `dist/SHA256SUMS` | 168 B | 两行，分别匹配上面两个摘要 |
 
-这些哈希对应**最终代码 HEAD `5638995` 上重新完成的打包**（在最后的 hook/bridge 修复之后），
+这些哈希对应**最终代码 HEAD `1776ba4` 上重新完成的打包**（在最后的 bridge/module 修复之后），
 与 `dist/SHA256SUMS` 一致；`sha256sum -c` 通过。重签 APK 后哈希必然变化，必须重生成
 `SHA256SUMS` 并以新文件为准。
 
@@ -142,9 +142,9 @@ flock /tmp/agentcall-gradle.lock ./gradlew \
   （`BridgeInfo.VERSION`），不另写一份版本号。
 - 运行时容器携带 **dex manifest（schema 2）**：记录每个 dex 的 name/SHA-256/size、
   来源 bridge APK 摘要与 `bridgeVersion`；本次容器内为 `classes.dex`
-  （sha256 `cb63ce5fb28811ddfa779e3f71a0153cf25fde2b45db1114ee737899774b97e7`，
-  size 4,025,208 B；来源 bridge APK sha256
-  `1b7652cd2f614589eb922d3a945674f9e9f3b28e9bed68cd5ba20177ea660b37`）。
+  （sha256 `1b3873b3c0842859ec43a5c9def8f4b5efa8d25379e7997a32a86c2e79ec85f1`，
+  size 4,035,992 B；来源 bridge APK sha256
+  `aa4a4ebaba738ea29595fc69b8504c7716d28dfb1e7f661046c6717f8abd0fab`）。
 - 模块 `module.prop` 为 `1.0` / `1`，与 APK 版本一致；不一致时打包直接失败。
 - DEX 覆盖只用容器 manifest 校验，不用 app APK（两者是不同产物）。
 
@@ -152,25 +152,41 @@ flock /tmp/agentcall-gradle.lock ./gradlew \
 
 - `:app` release 启用 R8：`optimization { enable = true }`，并显式
   `packageScope = setOf("**")`，让 app 自身代码（不只是 androidx/kotlin）真的进入收缩/改名。
-- 本次 `app/build/outputs/mapping/release/mapping.txt` 共 **98,580 行**。
-- release APK 由 **6.44 MB 缩到 2.27 MB**（交付的 debug 重签 APK 为 2,266,580 B）。
+- 本次 `app/build/outputs/mapping/release/mapping.txt` 共 **99,205 行**。
+- release 未签名 APK 为 **2,184,465 B（2.18 MB）**；交付的 debug 重签 APK 为 2,274,772 B（2.27 MB）。
 - R8 是本地构建行为；**没有在真机上验证** release 构建的运行时行为（见第 5.2 节）。
 
 ## 5. 本地已验证 / 设备未验证 / 阻塞项
 
 ### 5.1 本地已验证（宿主环境）
 
-- 最终矩阵：BUILD SUCCESSFUL，225 个 Gradle task 实际执行（HEAD `5638995`）。
-- JVM 单测：core 126 / bridge 345 / app 344，合计 815，0 failures / 0 errors / 0 skipped。
+- 最终矩阵：BUILD SUCCESSFUL，225 个 Gradle task 实际执行（HEAD `1776ba4`）。
+- JVM 单测：core 126 / bridge 354 / app 359，合计 839，0 failures / 0 errors / 0 skipped。
 - Lint：`:app:lintDebug` SUCCESSFUL，0 errors、15 warnings（全部 warning）。
-- R8：release 收缩启用（`packageScope = setOf("**")`），mapping 约 98,580 行；release APK
-  由 6.44 MB 缩到 2.27 MB（见 4.7）。
+- R8：release 收缩启用（`packageScope = setOf("**")`），mapping 99,205 行；release 未签名
+  APK 2.18 MB，debug 重签交付 APK 2.27 MB（见 4.7）。
 - Release APK 与 bridge 运行时容器均构建成功。
-- `make test` PASS：JVM（815）+ WebUI node（113）+ Python（59）+ 模块脚本 `sh -n`。
+- `make test` PASS：JVM（839）+ WebUI node（115）+ Python（59）+ 模块脚本 `sh -n`。
 - `make build` PASS；`make package-check` PASS（appId `org.krvyft.agentcall`，版本 1.0 (1)，
   `module.prop` 1.0 (1)，dex `classes.dex`，结构 module=1/scripts=3/bridge=2/bin=1/webroot=4）。
 - 产物结构、版本一致性、DEX manifest 覆盖、debug 签名类型、密钥泄漏检查与 SHA-256 均已核对。
 - 容器 manifest 的版本、每个 dex 的哈希与大小、来源 APK 摘要已核对。
+- `status` 暴露 **18 个顶层键**（17 个标量/布尔 + `calibration` 对象），含 `shutdownCode`；
+  `diagnose` 携带同一份校准视图。监督状态 schema 为 3。
+- 环境观测：`frameworkVersion` 依次读 root SystemProperties
+  （`ro.lsposed.version`/`persist.sys.lsposed.version`/`ro.vector.version`/
+  `persist.sys.vector.version`/`ro.edxposed.version`/`persist.sys.edxposed.version`），再读
+  `/data/adb/modules/{lsposed,zygisk_lsposed,vector}/module.prop` 的 `version=`，最后做
+  XposedBridge 类检查；`simCarrier` 读 TelephonyManager SIM 运营商名，失败后回退
+  `gsm.sim.operator.alpha`/`gsm.sim.operator.default-name`/`ro.cdma.home.operator.alpha`。
+- 关闭语义：5 s 期限只约束 `awaitConfirmedDisconnect`（终止命令先下发，其等待另有预算），
+  恢复只有单一 6 s 预算，CLI 仅 `shutdown` 放宽到 20 s；`clean=true` 只在隔离确认解除时成立。
+  `service.sh` 在桥接退出后读 `supervisor-state.json`（schema ≥ 3）：`shutdownCode` 非 null
+  或 `microphoneIsolated=true` 时打印 `! microphone_still_isolated`/`! shutdown_unresolved`
+  与 `bridge_stop_unclean`，绝不打印 `bridge_exit_clean`，非零退出并拒绝重启。
+- APP 就绪从 `calibration.read` 派生：`available && supportedApiLevel==37 && verified &&
+  environmentComplete && environmentMatchesEvidence` + 本机 `CalibrationPolicy`；读取失败/
+  未知一律 `calibration_unavailable` 并返回 false，绝不缓存上一轮的 true。
 
 ### 5.2 设备未验证（没有任何一行在真机上执行）
 
@@ -189,22 +205,21 @@ flock /tmp/agentcall-gradle.lock ./gradlew \
 
 ### 5.3 阻塞项（保持失败关闭，不伪造）
 
-1. **校准证据仍缺真机验证（不是缺写入通道）**：root CLI `calibrate` 经
-   `calibration.record`（仅 CLI_ROOT）写入五项人工测试证据；APK 校准页只写自身
-   SharedPreferences，WebUI 不写校准。最终 HEAD 保留 root 操作员对 bridge 观测不到的
-   transport/route 的显式背书（固定词表，服务端构建其余环境与时间戳；只有观测为
-   UNKNOWN 时才采用背书，已验证的值优先）。当前没有真机执行过任何一项人工测试，也没有
-   设备可做 operator attestation，因此生产就绪**有意保持 NOT_READY
-   （`calibration_not_verified`）**。必须继续 fail closed，不能在本机记录层面伪造授权。
-2. **特权终止身份路径仍不存在**：默认 `UnverifiedCallIdentityVerifier` 无法核对"这次通话"
-   的身份，保持 `blocksAutoAnswer=true`；没有设备验证过的 per-call 特权终止路径。
-   **即使校准证据齐全，自动接听也不会开启**，直到该身份路径在设备上被验证。
-3. **APK 只有 debug 签名**：不可分发；需发布密钥重签并重生成 `SHA256SUMS`。
-4. **交付时没有连接设备**：`adb devices` 为空。此前实现期间曾只读观察到一台
+1. **自动接听仍是产品阻塞项（两道闸门，缺一不可）**：校准写入通道与真实观测源都已实现，
+   环境现在能由桥接观测：`frameworkVersion` 读 root SystemProperties 与模块 `module.prop` 的
+   `version=`，`simCarrier` 读 TelephonyManager SIM 运营商名与 telephony 属性；只有观测为
+   UNKNOWN 的 `transport`/`route`/`frameworkVersion`/`simCarrier` 才由 root 操作员用固定
+   词表/有界自由文本背书（`manualTestCompleted=true`），观测到的已知值永远优先。
+   **但即使校准记录齐全，默认 `UnverifiedCallIdentityVerifier` 仍无法按通话身份核验，保持
+   `blocksAutoAnswer=true`；不存在设备验证过的、按身份定位的特权 Telecom 终止路径。**
+   因此生产就绪**有意保持 NOT_READY（`calibration_not_verified`）**，必须继续 fail closed。
+2. **APK 只有 debug 签名**：不可分发；需发布密钥重签并重生成 `SHA256SUMS`。
+3. **交付时没有连接设备**：`adb devices` 为空。此前实现期间曾只读观察到一台
    XQ-DQ72（API 37），但 `adb shell` 是 uid 2000，`su` 不可用，所以**没有在设备上运行
    任何东西**；用户也明确禁止设备侧验证。现在设备同样不在线。
-5. 因此没有仪器测试、模块安装、Hook 加载、真实音频/通话或付费请求证据；
-   `docs/device-validation.md` 的 D01–D12 全部仍为「未验证」。
+4. 因此没有仪器测试、模块安装、Hook 加载、真实音频/通话或付费请求证据；
+   `docs/device-validation.md` 的 D01–D12 全部仍为「未验证」；校准环境观测与四项背书也只有
+   宿主/JVM 证据，未在真机确认。
 
 ## 6. 回合预算裁决（必须保留）
 
@@ -237,7 +252,7 @@ WebUI 在保存/读取失败时显示「配对已失效」横幅，并给出「�
 - 没有发起任何真实付费 API 请求（ASR/LLM/TTS）。
 - 没有写入任何校准证据；没有启用自动接听。
 - 没有用发布密钥重签 APK。
-- 没有重跑完整验收矩阵之外的设备检查；本文件中的矩阵结果来自 HEAD `5638995` 上的一次
+- 没有重跑完整验收矩阵之外的设备检查；本文件中的矩阵结果来自 HEAD `1776ba4` 上的一次
   完整本地执行（225 个 Gradle task），不是旧提交结果的拼接。
 - 没有在设备上执行任何一项：交付时 `adb devices` 为空，用户明确禁止设备侧验证；
   仪器测试、KernelSU 安装、LSPosed 加载、真实通话、真实音频与真实付费 API 全部未运行。
