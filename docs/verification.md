@@ -62,12 +62,14 @@ major version 55 = Java 11 字节码，与 `compileOptions` 的 `VERSION_11` 一
 | alias | 坐标 | 版本 | 模块内是否已使用 |
 | --- | --- | --- | --- |
 | `libs.plugins.android.library` | `com.android.library` | 9.5.1（与 android-application 同一 agp） | `:core` |
-| `libs.kotlinx.coroutines.core` | `org.jetbrains.kotlinx:kotlinx-coroutines-core` | 1.9.0 | `:core` `implementation`（`AudioSession.downlink: Flow`） |
+| `libs.kotlinx.coroutines.core` | `org.jetbrains.kotlinx:kotlinx-coroutines-core` | 1.9.0 | `:core` `api`（`AudioSession.downlink: Flow` 是公开契约，消费方需看到同一份协程类型） |
 | `libs.kotlinx.coroutines.test` | `kotlinx-coroutines-test` | 1.9.0 | 否（任务 2 起的虚拟时间测试用） |
 | `libs.libphonenumber` | `com.googlecode.libphonenumber:libphonenumber` | 9.0.43 | 否（任务 2 号码规范化） |
 | `libs.gson` | `com.google.code.gson:gson` | 2.11.0 | 否（任务 3 协议/配置编码） |
 | `libs.okhttp` | `com.squareup.okhttp3:okhttp` | 4.12.0 | 否（任务 6 才加 usage） |
 | `libs.okhttp.mockwebserver` | `com.squareup.okhttp3:mockwebserver` | 4.12.0 | 否（任务 6 测试） |
+
+修复轮补充：`:core` 的协程依赖由 `implementation` 改为 `api`。`./gradlew :app:dependencies --configuration debugCompileClasspath` 输出中 `project ':core'` 下直接包含 `org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0`，证明消费方（app，以及后续 bridge）的编译类路径可见该类型；修复前它只出现在运行类路径。
 
 选取依据：
 

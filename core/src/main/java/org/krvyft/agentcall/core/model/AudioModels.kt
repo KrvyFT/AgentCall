@@ -32,12 +32,14 @@ data class AudioFormatSpec(
 }
 
 /**
- * 下行 PCM 分片，按内容比较。
+ * 下行 PCM 分片。按内容比较，是 data class（spec §5），copy()/解构均可用。
  *
- * 此处刻意不使用 data class：ByteArray 的默认相等性是引用相等，会让“同内容分片
- * 相等”的断言静默失效。字段仍是不可变引用，调用方不得原地修改 [data]。
+ * [data] 是 ByteArray，默认相等性是引用相等，所以本类在 body 中显式实现了
+ * equals/hashCode/toString：一旦显式实现，data class 不再生成这三个函数，
+ * 但 component/copy 仍由编译器生成，内容相等与 copy()/解构同时成立。
+ * copy() 是浅拷贝，[data] 仍是同一数组引用；调用方不得原地修改 [data]。
  */
-class PcmChunk(
+data class PcmChunk(
     val data: ByteArray,
     val format: AudioFormatSpec,
 ) {
@@ -52,9 +54,9 @@ class PcmChunk(
 }
 
 /**
- * 一段完整的上行 PCM 音频（例如 TTS 输出），按内容比较，理由同 [PcmChunk]。
+ * 一段完整的上行 PCM 音频（例如 TTS 输出）。按内容比较，是 data class，理由同 [PcmChunk]。
  */
-class PcmAudio(
+data class PcmAudio(
     val data: ByteArray,
     val format: AudioFormatSpec,
 ) {

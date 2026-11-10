@@ -27,8 +27,9 @@ kotlin {
 }
 
 dependencies {
-    // Flow/PcmChunk 下行流契约所需。
-    implementation(libs.kotlinx.coroutines.core)
+    // 公开契约（AudioSession.downlink: Flow<PcmChunk>）暴露协程类型，必须是 api：
+    // app/bridge 需要在自己的编译类路径上看到同一份 coroutines，否则消费方能编译失败或解析到别的版本。
+    api(libs.kotlinx.coroutines.core)
 
     testImplementation(libs.junit)
 }

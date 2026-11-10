@@ -42,11 +42,15 @@ enum class Presentation {
 /**
  * 某一时刻通话快照，供规则判断与状态机使用，不携带音频或会话租约。
  *
+ * 安全相关字段一律**无默认值**：spec §8 要求“缺一项就保留原响铃”，若为紧急/会议/通话数
+ * 提供 false/false/1 的默认值，漏填的 Hook 会把“紧急、会议、第二路”静默降级成可接管；
+ * 去掉默认值后，任何遗漏都在编译期失败。
+ *
  * @property number 原始号码，仅用于名单规范化匹配；未知或受限时为 null。
  * @property phoneAccount 实际 PhoneAccount 标识，用于限定已校准的 SIM/路由。
- * @property isEmergency 系统可识别的紧急呼叫或紧急回拨。
- * @property isConference 会议通话。
- * @property activeCallCount 当前活动/保持/等待的通话数，大于 1 时不自动接管第二路。
+ * @property isEmergency 系统可识别的紧急呼叫或紧急回拨，必须显式传入。
+ * @property isConference 会议通话，必须显式传入。
+ * @property activeCallCount 当前活动/保持/等待的通话数（至少 1），大于 1 时不自动接管第二路。
  */
 data class CallSnapshot(
     val id: SessionId,
@@ -55,9 +59,9 @@ data class CallSnapshot(
     val direction: CallDirection,
     val presentation: Presentation,
     val phoneAccount: String?,
-    val isEmergency: Boolean = false,
-    val isConference: Boolean = false,
-    val activeCallCount: Int = 1,
+    val isEmergency: Boolean,
+    val isConference: Boolean,
+    val activeCallCount: Int,
 )
 
 /**

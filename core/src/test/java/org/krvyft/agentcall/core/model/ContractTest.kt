@@ -1,6 +1,8 @@
 package org.krvyft.agentcall.core.model
 
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -59,11 +61,33 @@ class ContractTest {
     }
 
     @Test
-    fun secretUpdateKeepAndClearAreDistinct() {
-        assertEquals(SecretUpdate.Keep, SecretUpdate.Keep)
-        assertNotEquals(SecretUpdate.Keep, SecretUpdate.Clear)
+    fun secretUpdateVariantsStayDistinct() {
+        val keep: SecretUpdate = SecretUpdate.Keep
+        val clear: SecretUpdate = SecretUpdate.Clear
+
+        assertNotEquals(keep, clear)
+        assertNotEquals(keep, SecretUpdate.Replace("k-1"))
+        assertNotEquals(clear, SecretUpdate.Replace("k-1"))
+        // Replace 覆盖了 toString，但 equals 仍由 data class 生成。
+        assertEquals(SecretUpdate.Replace("k-1"), SecretUpdate.Replace("k-1"))
         assertNotEquals(SecretUpdate.Replace("k-1"), SecretUpdate.Replace("k-2"))
-        assertNotEquals(SecretUpdate.Keep, SecretUpdate.Replace("k-1"))
+    }
+
+    @Test
+    fun secretUpdateReplaceNeverPrintsItsValue() {
+        val secret = "sk-live-0123456789abcdef"
+        val replace: SecretUpdate = SecretUpdate.Replace(secret)
+
+        assertFalse(replace.toString().contains(secret))
+        assertEquals("Replace(value=<redacted>)", replace.toString())
+
+        // ConfigPatch 是 data class，默认 toString 会拼接成员；Replace 的覆盖必须同时遮蔽这条路径。
+        val patch = ConfigPatch(secrets = mapOf(EndpointKind.ASR to SecretUpdate.Replace(secret)))
+        assertFalse(patch.toString().contains(secret))
+
+        // Keep/Clear 没有密钥可泄露，保持可读即可。
+        assertEquals("Keep", SecretUpdate.Keep.toString())
+        assertEquals("Clear", SecretUpdate.Clear.toString())
     }
 
     @Test
@@ -148,6 +172,39 @@ class ContractTest {
             PcmAudio(byteArrayOf(9, 9), format),
             PcmAudio(byteArrayOf(9, 9), format),
         )
+    }
+
+    @Test
+    fun pcmChunkIsADataClassWithContentEquality() {
+        val format = AudioFormatSpec(sampleRate = 16_000)
+        val chunk = PcmChunk(byteArrayOf(1, 2, 3), format)
+
+        // copy() 是 data class 才有的能力，且复制品按内容相等。
+        assertEquals(chunk, chunk.copy())
+        assertEquals(chunk.hashCode(), chunk.copy().hashCode())
+        assertNotEquals(chunk, chunk.copy(data = byteArrayOf(1, 2, 4)))
+
+        // 解构依赖生成的 componentN()。
+        val (data, copiedFormat) = chunk
+        assertArrayEquals(byteArrayOf(1, 2, 3), data)
+        assertEquals(format, copiedFormat)
+
+        // toString 同样被显式覆盖，不打印原始字节。
+        assertEquals("PcmChunk(format=" + format + ", bytes=3)", chunk.toString())
+    }
+
+    @Test
+    fun pcmAudioIsADataClassWithContentEquality() {
+        val format = AudioFormatSpec(sampleRate = 24_000)
+        val audio = PcmAudio(byteArrayOf(9, 9), format)
+
+        assertEquals(audio, audio.copy())
+        assertEquals(audio.hashCode(), audio.copy().hashCode())
+        assertNotEquals(audio, audio.copy(data = byteArrayOf(9, 8)))
+
+        val (data, copiedFormat) = audio
+        assertArrayEquals(byteArrayOf(9, 9), data)
+        assertEquals(format, copiedFormat)
     }
 
     @Test
