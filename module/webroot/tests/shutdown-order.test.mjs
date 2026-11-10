@@ -24,6 +24,13 @@ import { tmpdir } from "node:os";
 const MODULE = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const NL = String.fromCharCode(10);
 
+function functionBody(source, name) {
+  const at = source.indexOf("\n" + name + "() {");
+  assert.ok(at > -1, "缺少函数 " + name);
+  const end = source.indexOf("\n}\n", at);
+  assert.ok(end > at, "函数 " + name + " 未正常结束");
+  return source.slice(at, end);
+}
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function waitFor(predicate, timeoutMs, label) {
@@ -100,6 +107,11 @@ function serviceHarness() {
     [
       "#!/bin/sh",
       'case "$*" in',
+      "  *AgentCallCli*status*)",
+      '    if [ -n "$AGENTCALL_FAKE_CLI_LOG" ]; then echo "$*" >> "$AGENTCALL_FAKE_CLI_LOG"; fi',
+      '    if [ -n "$AGENTCALL_FAKE_STATUS_JSON" ]; then echo "$AGENTCALL_FAKE_STATUS_JSON"; fi',
+      '    exit "$AGENTCALL_FAKE_STATUS_EXIT"',
+      "    ;;",
       "  *AgentCallCli*)",
       '    if [ -n "$AGENTCALL_FAKE_CLI_LOG" ]; then echo "$*" >> "$AGENTCALL_FAKE_CLI_LOG"; fi',
       '    if [ "$AGENTCALL_FAKE_CLI_HANG" = "1" ]; then while :; do sleep 1; done; fi',
@@ -264,6 +276,143 @@ test(
 // uninstall.sh：假固定 CLI（module/bin/agentcallctl）与假 socket/PID 进程
 // ---------------------------------------------------------------------------------------------
 
+test(
+  "service.sh：关闭结果声明 microphoneIsolated=true 时打印机器可读警告，不宣称干净停止",
+  { timeout: 60000 },
+  async () => {
+    const harness = serviceHarness();
+    const trigger = join(harness.root, "shutdown-trigger");
+    let child = null;
+    try {
+      child = spawn("sh", [harness.script], {
+        env: serviceEnv(harness, {
+          AGENTCALL_FAKE_BRIDGE_STAY: "1",
+          AGENTCALL_FAKE_SHUTDOWN_TRIGGER: trigger,
+          // 11E 之前的 no-owned-session 形状：clean=true 但麦克风仍被隔离。
+          AGENTCALL_FAKE_SHUTDOWN_JSON: JSON.stringify({
+            stopping: true,
+            clean: true,
+            shutdownCode: null,
+            supervision: { clean: true, ownedSession: false, microphoneIsolated: true },
+          }),
+          AGENTCALL_GRACEFUL_SHUTDOWN_WAIT_SECONDS: "3",
+          AGENTCALL_BRIDGE_EXIT_WAIT_SECONDS: "2",
+          AGENTCALL_STOP_GRACE_SECONDS: "1",
+        }),
+        stdio: "ignore",
+      });
+      await waitFor(
+        () => existsSync(harness.audioPidFile) && existsSync(harness.bridgePidFile),
+        20000,
+        "bridge/audio pid files",
+      );
+      const bridgePid = readPidFile(harness.bridgePidFile);
+
+      child.kill("SIGTERM");
+      await waitForExit(child, 30000);
+
+      const log = readFileSync(harness.logFile, "utf8");
+      assert.match(
+        log,
+        /bridge_shutdown_result clean=true shutdownCode=null microphoneIsolated=true/,
+        "关闭结果必须记录麦克风隔离读回：" + log,
+      );
+      assert.match(
+        log,
+        /! microphone_still_isolated source=shutdown clean=true shutdownCode=null/,
+        "仍被隔离时必须打印机器可读警告：" + log,
+      );
+      assert.match(log, /bridge_stop_unclean reason=microphone_isolated/, "不得把仍隔离的停止当成干净停止：" + log);
+      assert.equal(/bridge_stop_clean/.test(log), false, "麦克风仍隔离时不得打印干净停止：" + log);
+      assert.equal(processAlive(bridgePid), false, "进程仍需被有界回收");
+    } finally {
+      killQuietly(child);
+      rmSync(harness.root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "service.sh：桥接未退出时做最终 status 探测并读回麦克风隔离",
+  { timeout: 60000 },
+  async () => {
+    const harness = serviceHarness();
+    const cliLog = join(harness.root, "cli.log");
+    let child = null;
+    try {
+      child = spawn("sh", [harness.script], {
+        env: serviceEnv(harness, {
+          AGENTCALL_FAKE_BRIDGE_STAY: "1",
+          AGENTCALL_FAKE_CLI_IGNORE_SHUTDOWN: "1",
+          AGENTCALL_FAKE_CLI_LOG: cliLog,
+          AGENTCALL_FAKE_SHUTDOWN_JSON: JSON.stringify({
+            stopping: true,
+            clean: false,
+            shutdownCode: "shutdown_call_unresolved",
+            supervision: { clean: false, ownedSession: true, microphoneIsolated: true },
+          }),
+          AGENTCALL_FAKE_STATUS_JSON: JSON.stringify({
+            supervisionPhase: "ENDED",
+            shutdownCode: "shutdown_call_unresolved",
+            microphoneIsolated: true,
+          }),
+          AGENTCALL_GRACEFUL_SHUTDOWN_WAIT_SECONDS: "3",
+          AGENTCALL_BRIDGE_EXIT_WAIT_SECONDS: "1",
+          AGENTCALL_STATUS_PROBE_WAIT_SECONDS: "2",
+          AGENTCALL_STOP_GRACE_SECONDS: "1",
+        }),
+        stdio: "ignore",
+      });
+      await waitFor(
+        () => existsSync(harness.audioPidFile) && existsSync(harness.bridgePidFile),
+        20000,
+        "bridge/audio pid files",
+      );
+      const workerPid = readPidFile(harness.audioPidFile);
+      const bridgePid = readPidFile(harness.bridgePidFile);
+
+      child.kill("SIGTERM");
+      await waitForExit(child, 40000);
+
+      const log = readFileSync(harness.logFile, "utf8");
+      const resultAt = log.indexOf("bridge_shutdown_result clean=false");
+      const probeAt = log.indexOf("bridge_status_probe");
+      const warningAt = log.indexOf("! microphone_still_isolated source=status");
+      const workerAt = log.indexOf("audio_worker_stopped pid=" + workerPid);
+      assert.ok(resultAt > -1, "必须记录关闭结果：" + log);
+      assert.ok(probeAt > resultAt, "桥接未退出时必须做最终 status 探测：" + log);
+      assert.match(
+        log,
+        /bridge_status_probe phase=ENDED microphoneIsolated=true shutdownCode=shutdown_call_unresolved/,
+        "最终探测必须记录隔离/阶段/机器码：" + log,
+      );
+      assert.ok(warningAt > probeAt, "最终探测后仍隔离时必须打印警告：" + log);
+      assert.ok(workerAt > warningAt, "警告必须在停止音频工作进程之前给出：" + log);
+      assert.equal(processAlive(bridgePid), false, "桥接必须被有界回收");
+      const calls = readFileSync(cliLog, "utf8");
+      assert.equal((calls.match(/AgentCallCli status/g) || []).length, 1, "只允许一次最终 status 探测：" + calls);
+    } finally {
+      killQuietly(child);
+      rmSync(harness.root, { recursive: true, force: true });
+    }
+  },
+);
+
+test("service.sh：停止序列使用跨脚本 stop.lock（flock，有界等待），等待上限覆盖 25 s + 10 s", () => {
+  const service = readFileSync(join(MODULE, "service.sh"), "utf8");
+  assert.match(service, /^STOP_LOCK_FILE=\$DATA_ROOT\/stop\.lock$/m, "锁文件必须是 root 私有固定路径");
+  assert.match(service, /^GRACEFUL_SHUTDOWN_WAIT_SECONDS=25$/m, "CLI 关闭结果等待必须是 25 s（11E 的 20 s 超时 + 余量）");
+  assert.match(service, /^BRIDGE_EXIT_WAIT_SECONDS=10$/m, "桥接退出等待必须是 10 s");
+  assert.match(service, /^STATUS_PROBE_WAIT_SECONDS=\d+$/m, "最终 status 探测也必须有界");
+  const lock = functionBody(service, "acquire_stop_lock");
+  assert.match(lock, /flock -w "\$STOP_LOCK_WAIT_SECONDS" 9/, "必须用 flock 有界等待");
+  assert.match(lock, /STOP_LOCK_WAIT_SECONDS/, "等待上限必须可配置");
+  assert.match(service, /stop_lock_timeout/, "等待超时必须打印机器可读消息");
+  const shutdown = functionBody(service, "shutdown_children");
+  assert.match(shutdown, /acquire_stop_lock/, "停止序列必须先取锁");
+  assert.match(shutdown, /release_stop_lock/, "停止序列结束必须释放锁");
+});
+
 function uninstallHarness() {
   const root = mkdtempSync(join(tmpdir(), "agentcall-uninstall-order-"));
   const moduleDir = join(root, "module");
@@ -324,6 +473,9 @@ function uninstallEnv(harness, extra = {}) {
     AGENTCALL_FAKE_STATUS_EXIT: "0",
     AGENTCALL_FAKE_KEEP_SOCKET: "0",
     AGENTCALL_STOP_WAIT_SECONDS: "1",
+    AGENTCALL_BRIDGE_EXIT_WAIT_SECONDS: "1",
+    AGENTCALL_STATUS_PROBE_WAIT_SECONDS: "1",
+    AGENTCALL_STOP_LOCK_WAIT_SECONDS: "10",
     AGENTCALL_KILL_WAIT_SECONDS: "1",
     ...extra,
   };
@@ -461,6 +613,59 @@ test(
 // ---------------------------------------------------------------------------------------------
 // agentcallctl calibrate：stdin 逐字节透传、argv 负载拒绝
 // ---------------------------------------------------------------------------------------------
+
+test("uninstall.sh：与 service.sh 共用 stop.lock，有界等待并打印机器可读消息", () => {
+  const uninstall = readFileSync(join(MODULE, "uninstall.sh"), "utf8");
+  assert.match(uninstall, /^STOP_LOCK_FILE=\$DATA_ROOT\/stop\.lock$/m, "锁文件必须与 service.sh 相同");
+  assert.match(uninstall, /^STOP_WAIT_SECONDS=25$/m, "CLI 关闭结果等待必须是 25 s（覆盖 11E 的 20 s socket 超时）");
+  assert.match(uninstall, /^BRIDGE_EXIT_WAIT_SECONDS=10$/m, "桥接退出等待必须是 10 s");
+  const lock = functionBody(uninstall, "acquire_stop_lock");
+  assert.match(lock, /flock -w "\$STOP_LOCK_WAIT_SECONDS" 9/, "必须用 flock 有界等待");
+  assert.match(uninstall, /stop_lock_(wait|acquired|timeout)/, "等待/取得/超时必须打印机器可读消息");
+  assert.match(functionBody(uninstall, "terminate_verified_pid"), /process_alive "\$target"/, "僵尸必须按 process_alive 判定");
+  assert.equal(/\[ -d "\/proc\/\$target" \]/.test(functionBody(uninstall, "terminate_verified_pid")), false, "不得用 /proc 目录存在性代替存活判定");
+});
+
+test(
+  "uninstall.sh：另一个停止序列持有 stop.lock 时先有界等待，不并发发起 shutdown",
+  { timeout: 60000 },
+  async () => {
+    const harness = uninstallHarness();
+    const lockFile = join(harness.dataRoot, "stop.lock");
+    const ready = join(harness.root, "lock-ready");
+    let holder = null;
+    try {
+      holder = spawn("flock", [lockFile, "sh", "-c", 'echo ready > "$1"; sleep 2', "sh", ready], {
+        stdio: "ignore",
+      });
+      await waitFor(() => existsSync(ready), 5000, "lock holder ready");
+
+      const startedAt = Date.now();
+      const result = spawnSync("sh", [harness.script], {
+        env: uninstallEnv(harness, {
+          AGENTCALL_FAKE_SHUTDOWN_JSON: JSON.stringify({
+            stopping: true,
+            clean: true,
+            shutdownCode: null,
+            supervision: { clean: true, ownedSession: false, microphoneIsolated: false },
+          }),
+          AGENTCALL_STOP_LOCK_WAIT_SECONDS: "10",
+        }),
+        encoding: "utf8",
+        timeout: 30000,
+      });
+      const elapsed = Date.now() - startedAt;
+      const stdout = result.stdout + result.stderr;
+      assert.equal(result.status, 1, "替身数据目录必须被删除守卫拒绝：" + stdout);
+      assert.ok(elapsed >= 1500, "必须等锁持有者释放后才继续（实际 " + elapsed + " ms）：" + stdout);
+      assert.match(stdout, /stop_lock_(wait|acquired)/, "等待/取得锁必须有明确消息：" + stdout);
+      assert.deepEqual(readFileSync(harness.ctlLog, "utf8").trim().split(NL), ["shutdown"], "锁释放后只执行一次 shutdown");
+    } finally {
+      if (holder) holder.kill("SIGKILL");
+      rmSync(harness.root, { recursive: true, force: true });
+    }
+  },
+);
 
 function ctlHarness() {
   const root = mkdtempSync(join(tmpdir(), "agentcall-calibrate-"));

@@ -24,6 +24,11 @@
 #   优雅退出（它会终止/交还拥有的通话（若有）、读回恢复麦克风；音频工作进程必须仍然存活），
 #   再停音频工作进程，最后才把仍未退出的进程做有界 TERM → 等待 → KILL → 再等待 →
 #   读回核验。干净退出、显式停止、错误退出三条路径都执行同一套回收。
+# - 等待预算与 11E 对齐：CLI shutdown 结果最多 25 s，桥接退出最多 10 s；桥接仍未退出时
+#   再做一次有界 status 探测。麦克风隔离是独立读回事实：仍为 true 时打印
+#   `! microphone_still_isolated ...` 与 `bridge_stop_unclean`，绝不宣称干净停止（I2）。
+# - 跨脚本停止锁（I4）：停止序列先取 /data/adb/agentcall/stop.lock（flock，最多等 40 s），
+#   与 uninstall.sh 串行化；拿不到锁只记录 stop_lock_timeout 并跳过重复的优雅关闭请求。
 # - 顺序不能颠倒：先杀音频工作进程会让桥接的恢复请求不可达，麦克风会保持全局静音。
 # - 启动时先回收上一次实例留下的音频工作进程（幂等），并按 cmdline 核验 PID 身份，
 #   避免 PID 复用误杀无关进程。
@@ -47,10 +52,17 @@ GETPROP=${AGENTCALL_GETPROP:-getprop}
 CONTROL_SOCKET=@org.krvyft.agentcall.control
 AUDIO_SOCKET=@org.krvyft.agentcall.audio-role
 CLI_MAIN_CLASS=org.krvyft.agentcall.bridge.AgentCallCli
-# 优雅关闭等待：先等固定 CLI 返回（桥接在响应前完成终止/交还 + 麦克风读回），
-# 再等桥接进程退出。两个上限都独立有界，避免停止路径被不响应的进程拖住。
-GRACEFUL_SHUTDOWN_WAIT_SECONDS=15
-BRIDGE_EXIT_WAIT_SECONDS=5
+# 优雅关闭等待（与 11E 的桥接预算对齐）：先等固定 CLI 返回（桥接在响应前完成
+# 终止/交还 + 麦克风读回；11E 的 CLI socket 超时是 20 s，恢复路径上限约 6 s），
+# 再等桥接进程退出。三个上限都独立有界，避免停止路径被不响应的进程拖住。
+GRACEFUL_SHUTDOWN_WAIT_SECONDS=25
+BRIDGE_EXIT_WAIT_SECONDS=10
+# 桥接在退出等待后仍存活时，做一次最终 status 探测读回隔离状态（有界，不阻塞回收）。
+STATUS_PROBE_WAIT_SECONDS=5
+# 跨脚本停止锁：uninstall.sh 与 service.sh 的优雅关闭序列必须串行化，否则第二个
+# CLI shutdown 会在第一个的恢复窗口内杀音频工作进程。等待上限覆盖对端完整停止预算。
+STOP_LOCK_WAIT_SECONDS=40
+STOP_LOCK_FILE=$DATA_ROOT/stop.lock
 case "${AGENTCALL_GRACEFUL_SHUTDOWN_WAIT_SECONDS:-}" in
     ''|*[!0-9]*) ;;
     *) GRACEFUL_SHUTDOWN_WAIT_SECONDS=$AGENTCALL_GRACEFUL_SHUTDOWN_WAIT_SECONDS ;;
@@ -59,7 +71,16 @@ case "${AGENTCALL_BRIDGE_EXIT_WAIT_SECONDS:-}" in
     ''|*[!0-9]*) ;;
     *) BRIDGE_EXIT_WAIT_SECONDS=$AGENTCALL_BRIDGE_EXIT_WAIT_SECONDS ;;
 esac
+case "${AGENTCALL_STATUS_PROBE_WAIT_SECONDS:-}" in
+    ''|*[!0-9]*) ;;
+    *) STATUS_PROBE_WAIT_SECONDS=$AGENTCALL_STATUS_PROBE_WAIT_SECONDS ;;
+esac
+case "${AGENTCALL_STOP_LOCK_WAIT_SECONDS:-}" in
+    ''|*[!0-9]*) ;;
+    *) STOP_LOCK_WAIT_SECONDS=$AGENTCALL_STOP_LOCK_WAIT_SECONDS ;;
+esac
 SHUTDOWN_RESULT_FILE=$DATA_ROOT/shutdown.result
+STATUS_RESULT_FILE=$DATA_ROOT/status.result
 # 本脚本自己的 PID（agentcallctl restart 据此确认“重启请求有接收者”）；请求标记里保存
 # 同一个 PID，跨实例/跨开机的过期标记不会被新实例消费。
 SERVICE_PID_FILE=$DATA_ROOT/service.pid
@@ -126,6 +147,8 @@ clean_inbox_payloads() {
 bridge_pid=
 audio_manager_pid=
 stopping=0
+# 0 = 未持有；1 = flock 文件描述符；2 = mkdir 回退目录。
+stop_lock_held=0
 
 # 进程存在且不是僵尸（已退出但未被回收的进程不能再被“停止”）。
 pid_alive() {
@@ -271,6 +294,105 @@ json_scalar() {
     printf '%s' "$1" | sed -n "s/.*\"$2\":\\([^,}]*\\).*/\\1/p" | head -n 1
 }
 
+json_text() {
+    printf '%s' "$1" | sed 's/^"//; s/"$//'
+}
+
+# 跨脚本停止锁（I4）：uninstall.sh 与 service.sh 都可能发起优雅关闭，两个独立 CLI
+# shutdown 会在对方的恢复窗口内互相踩踏。锁文件是 root 私有固定路径；等待有界，
+# 超时只记录机器可读原因（绝不无限阻塞停止路径）。优先 flock；没有 flock 时退回
+# mkdir 原子目录锁，语义相同（同一路径只允许一个持有者）。
+acquire_stop_lock() {
+    [ "$stop_lock_held" -eq 0 ] || return 0
+    log_line "stop_lock_wait path=$STOP_LOCK_FILE timeout=${STOP_LOCK_WAIT_SECONDS}s"
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"$STOP_LOCK_FILE" 2>/dev/null || {
+            log_line "stop_lock_unavailable path=$STOP_LOCK_FILE reason=open_failed"
+            return 1
+        }
+        if flock -w "$STOP_LOCK_WAIT_SECONDS" 9 2>/dev/null; then
+            stop_lock_held=1
+            log_line "stop_lock_acquired path=$STOP_LOCK_FILE"
+            return 0
+        fi
+        exec 9>&- 2>/dev/null
+        log_line "! stop_lock_timeout waited=${STOP_LOCK_WAIT_SECONDS}s path=$STOP_LOCK_FILE"
+        return 1
+    fi
+    lock_dir="$STOP_LOCK_FILE.d"
+    waited=0
+    while [ "$waited" -lt "$STOP_LOCK_WAIT_SECONDS" ]; do
+        if mkdir "$lock_dir" 2>/dev/null; then
+            stop_lock_held=2
+            log_line "stop_lock_acquired path=$lock_dir fallback=mkdir"
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    log_line "! stop_lock_timeout waited=${waited}s path=$lock_dir fallback=mkdir"
+    return 1
+}
+
+release_stop_lock() {
+    if [ "$stop_lock_held" -eq 1 ]; then
+        flock -u 9 2>/dev/null
+        exec 9>&- 2>/dev/null
+    elif [ "$stop_lock_held" -eq 2 ]; then
+        rmdir "$STOP_LOCK_FILE.d" 2>/dev/null
+    fi
+    stop_lock_held=0
+}
+
+# 最终 status 探测（桥接在退出等待后仍存活时）：读回 phase / shutdownCode /
+# microphoneIsolated，供“仍被隔离”告警使用。探测本身有界；结果只写全局，
+# 失败不阻断后续有界回收。
+probe_bridge_status() {
+    STATUS_PHASE=
+    STATUS_ISOLATED=
+    STATUS_CODE=
+    if [ -z "$bridge_pid" ] || ! pid_alive "$bridge_pid"; then
+        return 1
+    fi
+    if ! is_bridge_pid "$bridge_pid"; then
+        log_line "bridge_status_probe_skipped reason=identity_mismatch pid=$bridge_pid"
+        return 1
+    fi
+    rm -f "$STATUS_RESULT_FILE" 2>/dev/null
+    "$APP_PROCESS" -Djava.class.path="$BRIDGE_JAR" /system/bin --nice-name=agentcall-cli "$CLI_MAIN_CLASS" status > "$STATUS_RESULT_FILE" 2>/dev/null &
+    probe_pid=$!
+    waited=0
+    while pid_alive "$probe_pid" && [ "$waited" -lt "$STATUS_PROBE_WAIT_SECONDS" ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if pid_alive "$probe_pid"; then
+        log_line "bridge_status_probe_timeout pid=$probe_pid waited=${waited}s"
+        kill -TERM "$probe_pid" 2>/dev/null
+        waited=0
+        while pid_alive "$probe_pid" && [ "$waited" -lt "$KILL_WAIT_SECONDS" ]; do
+            sleep 1
+            waited=$((waited + 1))
+        done
+        if pid_alive "$probe_pid"; then
+            kill -KILL "$probe_pid" 2>/dev/null
+        fi
+        reap_child "$probe_pid"
+        rm -f "$STATUS_RESULT_FILE" 2>/dev/null
+        return 1
+    fi
+    reap_child "$probe_pid"
+    status_result=$(cat "$STATUS_RESULT_FILE" 2>/dev/null)
+    rm -f "$STATUS_RESULT_FILE" 2>/dev/null
+    STATUS_PHASE=$(json_text "$(json_scalar "$status_result" supervisionPhase)")
+    STATUS_ISOLATED=$(json_scalar "$status_result" microphoneIsolated)
+    STATUS_CODE=$(json_text "$(json_scalar "$status_result" shutdownCode)")
+    log_line "bridge_status_probe phase=${STATUS_PHASE:-unknown} microphoneIsolated=${STATUS_ISOLATED:-unknown} shutdownCode=${STATUS_CODE:-unknown}"
+    case "$STATUS_ISOLATED" in
+        true|false) return 0 ;;
+    esac
+    return 1
+}
 # 优雅关闭桥接（任务 11D2b 的硬顺序）：
 # 1. 只在桥接确实由本实例拉起且 cmdline 核验通过时执行，绝不猜测 PID；
 # 2. 用固定 CLI（AgentCallCli shutdown，无参数、不执行任意 shell）请求关闭；
@@ -285,6 +407,11 @@ request_bridge_graceful_shutdown() {
         log_line "bridge_shutdown_skipped reason=identity_mismatch pid=$bridge_pid"
         return 1
     fi
+    shutdown_clean=
+    shutdown_code=
+    shutdown_isolated=
+    bridge_gone=0
+    cli_timed_out=0
     log_line "bridge_shutdown_request pid=$bridge_pid"
     rm -f "$SHUTDOWN_RESULT_FILE" 2>/dev/null
     "$APP_PROCESS" -Djava.class.path="$BRIDGE_JAR" /system/bin --nice-name=agentcall-cli "$CLI_MAIN_CLASS" shutdown > "$SHUTDOWN_RESULT_FILE" 2>/dev/null &
@@ -307,14 +434,18 @@ request_bridge_graceful_shutdown() {
         fi
         reap_child "$cli_pid"
         rm -f "$SHUTDOWN_RESULT_FILE" 2>/dev/null
-        return 1
+        cli_timed_out=1
+    else
+        reap_child "$cli_pid"
+        result=$(cat "$SHUTDOWN_RESULT_FILE" 2>/dev/null)
+        shutdown_clean=$(json_scalar "$result" clean)
+        shutdown_code=$(json_text "$(json_scalar "$result" shutdownCode)")
+        shutdown_isolated=$(json_scalar "$result" microphoneIsolated)
+        log_line "bridge_shutdown_result clean=${shutdown_clean:-unknown} shutdownCode=${shutdown_code:-unknown} microphoneIsolated=${shutdown_isolated:-unknown}"
+        rm -f "$SHUTDOWN_RESULT_FILE" 2>/dev/null
     fi
-    reap_child "$cli_pid"
-    result=$(cat "$SHUTDOWN_RESULT_FILE" 2>/dev/null)
-    clean=$(json_scalar "$result" clean)
-    code=$(json_scalar "$result" shutdownCode)
-    log_line "bridge_shutdown_result clean=${clean:-unknown} shutdownCode=${code:-unknown}"
-    rm -f "$SHUTDOWN_RESULT_FILE" 2>/dev/null
+    # 两个等待彼此独立：CLI 超时后仍要等桥接进程退出；桥接仍未退出时做一次最终
+    # status 探测，读回隔离状态（关闭响应缺失/不可信时这是唯一的读回来源）。
     waited=0
     while pid_alive "$bridge_pid" && [ "$waited" -lt "$BRIDGE_EXIT_WAIT_SECONDS" ]; do
         sleep 1
@@ -322,16 +453,50 @@ request_bridge_graceful_shutdown() {
     done
     if pid_alive "$bridge_pid"; then
         log_line "bridge_shutdown_unconfirmed pid=$bridge_pid waited=${waited}s"
+        probe_bridge_status || true
+    else
+        bridge_gone=1
+        log_line "bridge_shutdown_confirmed pid=$bridge_pid waited=${waited}s"
+    fi
+    # I2：麦克风隔离是独立事实，不能只看 clean/shutdownCode。桥接仍存活时以最终
+    # status 读回为准；已退出时以关闭响应为准。仍为 true 时显式打印机器可读警告，
+    # 绝不把“进程已退出”或 clean=true 当成干净停止。
+    isolated=$shutdown_isolated
+    isolated_source=shutdown
+    if [ "$bridge_gone" -eq 0 ]; then
+        case "$STATUS_ISOLATED" in
+            true|false)
+                isolated=$STATUS_ISOLATED
+                isolated_source=status
+                ;;
+        esac
+    fi
+    if [ "$isolated" = "true" ]; then
+        log_line "! microphone_still_isolated source=$isolated_source clean=${shutdown_clean:-unknown} shutdownCode=${shutdown_code:-unknown}"
+        log_line "bridge_stop_unclean reason=microphone_isolated source=$isolated_source bridgeGone=$bridge_gone"
         return 1
     fi
-    log_line "bridge_shutdown_confirmed pid=$bridge_pid waited=${waited}s"
+    if [ "$isolated" != "false" ]; then
+        log_line "bridge_stop_unclean reason=microphone_isolation_unconfirmed source=$isolated_source bridgeGone=$bridge_gone"
+    elif [ "$shutdown_clean" = "true" ] && [ "$shutdown_code" = "null" ] && [ "$bridge_gone" -eq 1 ]; then
+        log_line "bridge_stop_clean clean=true shutdownCode=null microphoneIsolated=false"
+    fi
+    if [ "$cli_timed_out" -eq 1 ]; then
+        return 1
+    fi
+    [ "$bridge_gone" -eq 1 ] || return 1
     return 0
 }
 
 shutdown_children() {
-    # 硬顺序：桥接优雅关闭（恢复麦克风需要音频工作进程存活）→ 停音频工作进程 →
-    # 对仍未退出的进程做有界 TERM→KILL。任何一步失败都不能颠倒后面的顺序。
-    request_bridge_graceful_shutdown
+    # 硬顺序：取跨脚本停止锁 → 桥接优雅关闭（恢复麦克风需要音频工作进程存活）→
+    # 停音频工作进程 → 对仍未退出的进程做有界 TERM→KILL。任何一步失败都不能颠倒
+    # 后面的顺序；锁确保 uninstall.sh 与本次停止只跑一次优雅关闭序列。
+    if acquire_stop_lock; then
+        request_bridge_graceful_shutdown
+    else
+        log_line "bridge_shutdown_skipped reason=stop_lock_timeout"
+    fi
     stop_audio_worker_supervisor
     stop_audio_worker
     if [ -n "$bridge_pid" ] && pid_alive "$bridge_pid"; then
@@ -341,7 +506,8 @@ shutdown_children() {
         reap_child "$bridge_pid"
     fi
     bridge_pid=
-    rm -f "$PID_FILE" "$AUDIO_PID_FILE" "$SERVICE_PID_FILE" "$SHUTDOWN_RESULT_FILE" 2>/dev/null
+    release_stop_lock
+    rm -f "$PID_FILE" "$AUDIO_PID_FILE" "$SERVICE_PID_FILE" "$SHUTDOWN_RESULT_FILE" "$STATUS_RESULT_FILE" 2>/dev/null
 }
 
 on_stop() {

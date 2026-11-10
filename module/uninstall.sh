@@ -5,17 +5,22 @@
 # - 桥接已经实现会话/租约（session.request / session.command / session.heartbeat /
 #   session.events / session.handover 与租约管理）以及优雅关闭（任务 11D2a）。
 # - 优雅关闭会先终止/交还拥有的通话（若有），确认断开后读回恢复麦克风，然后退出；该恢复路径
-#   要求音频工作进程仍然存活。因此本脚本的顺序是：请求固定 CLI shutdown → 读回关闭
-#   结果/status（clean、shutdownCode、phase、隔离）→ 停音频工作进程 → 对残留进程做
-#   有界 TERM→KILL → 最后删除数据目录。
+#   要求音频工作进程仍然存活。因此本脚本的顺序是：取跨脚本停止锁 → 请求固定 CLI shutdown
+#   → 读回关闭结果/status（clean、shutdownCode、phase、隔离）→ 停音频工作进程 → 对残留
+#   进程做有界 TERM→KILL → 释放锁 → 最后删除数据目录。
+# - 等待预算与 11E 对齐：CLI shutdown 结果最多 25 s（11E 的 socket 超时是 20 s），桥接
+#   退出最多 10 s，最终 status 探测最多 5 s。所有等待都有界。
+# - 停止锁是 /data/adb/agentcall/stop.lock（flock，最多等 40 s）；与 service.sh 共用，
+#   避免两个独立 CLI shutdown 在对方的恢复窗口内并发执行（I4）。
 # - 若桥接不响应、已退出或无法确认（shutdown_call_unresolved /
 #   shutdown_microphone_restore_failed），本脚本无法终止或交还正在进行的 AI 通话，
 #   也无法自行解除麦克风隔离；它只打印机器可读警告，绝不谎称已终止/交还。
 #
 # 停止顺序（与脚本末尾的实际执行顺序一致）：
 # 1. 分别探测 abstract socket 是否存在、固定 CLI 是否可执行（两者不是一回事）。
-# 2. socket 存在且 CLI 可执行：执行固定 CLI 的 shutdown，并分别有界等待 CLI 返回、
-#    桥接进程/socket 消失；随后（若桥接仍可响应）读 status 的 phase 与隔离状态。
+# 2. 取 stop.lock（有界等待）后，socket 存在且 CLI 可执行：执行固定 CLI 的 shutdown，
+#    并分别有界等待 CLI 返回、桥接进程/socket 消失；随后（若桥接仍可响应）读 status 的
+#    phase 与隔离状态。拿不到锁时跳过重复的关闭请求，只做有界 PID 回退。
 # 3. 音频工作进程是独立 app_process（PID 文件 audio-worker.pid，由 service.sh 写入）：
 #    核验 cmdline 后 TERM → 有界等待 → KILL，避免移除模块后残留持有麦克风隔离的
 #    root 音频进程。必须在优雅关闭请求之后执行。
@@ -54,21 +59,80 @@ SHUTDOWN_RESULT_FILE=$DATA_ROOT/shutdown.result
 STATUS_RESULT_FILE=$DATA_ROOT/status.result
 # 测试/诊断注入点：真机读内核的 /proc/net/unix；覆盖只改变本脚本的探测来源。
 UNIX_LIST=${AGENTCALL_UNIX_LIST:-/proc/net/unix}
-STOP_WAIT_SECONDS=15
+# 等待预算与 11E 的桥接对齐：CLI shutdown socket 超时 20 s（+余量），桥接退出 10 s；
+# 最终 status 探测单列上限，避免读回把停止路径拖长。
+STOP_WAIT_SECONDS=25
+BRIDGE_EXIT_WAIT_SECONDS=10
+STATUS_PROBE_WAIT_SECONDS=5
 KILL_WAIT_SECONDS=5
+# 跨脚本停止锁（I4）：与 service.sh 共用固定路径，优雅关闭序列只允许一个执行者。
+STOP_LOCK_WAIT_SECONDS=40
+STOP_LOCK_FILE=$DATA_ROOT/stop.lock
 case "${AGENTCALL_STOP_WAIT_SECONDS:-}" in
     ''|*[!0-9]*) ;;
     *) STOP_WAIT_SECONDS=$AGENTCALL_STOP_WAIT_SECONDS ;;
 esac
-case "${AGENTCALL_KILL_WAIT_SECONDS:-}" in
+case "${AGENTCALL_BRIDGE_EXIT_WAIT_SECONDS:-}" in
     ''|*[!0-9]*) ;;
-    *) KILL_WAIT_SECONDS=$AGENTCALL_KILL_WAIT_SECONDS ;;
+    *) BRIDGE_EXIT_WAIT_SECONDS=$AGENTCALL_BRIDGE_EXIT_WAIT_SECONDS ;;
 esac
+case "${AGENTCALL_STATUS_PROBE_WAIT_SECONDS:-}" in
+    ''|*[!0-9]*) ;;
+    *) STATUS_PROBE_WAIT_SECONDS=$AGENTCALL_STATUS_PROBE_WAIT_SECONDS ;;
+esac
+case "${AGENTCALL_STOP_LOCK_WAIT_SECONDS:-}" in
+    ''|*[!0-9]*) ;;
+    *) STOP_LOCK_WAIT_SECONDS=$AGENTCALL_STOP_LOCK_WAIT_SECONDS ;;
+esac
+stop_lock_held=0
 
 say() {
     printf '%s\n' "$*"
 }
 
+# 跨脚本停止锁（I4）：与 service.sh 相同的固定路径与语义；等待有界，超时打印
+# 机器可读原因。优先 flock；没有 flock 时退回 mkdir 原子目录锁。
+acquire_stop_lock() {
+    [ "$stop_lock_held" -eq 0 ] || return 0
+    say "stop_lock_wait path=$STOP_LOCK_FILE timeout=${STOP_LOCK_WAIT_SECONDS}s"
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"$STOP_LOCK_FILE" 2>/dev/null || {
+            say "! stop_lock_unavailable path=$STOP_LOCK_FILE reason=open_failed"
+            return 1
+        }
+        if flock -w "$STOP_LOCK_WAIT_SECONDS" 9 2>/dev/null; then
+            stop_lock_held=1
+            say "stop_lock_acquired path=$STOP_LOCK_FILE"
+            return 0
+        fi
+        exec 9>&- 2>/dev/null
+        say "! stop_lock_timeout waited=${STOP_LOCK_WAIT_SECONDS}s path=$STOP_LOCK_FILE"
+        return 1
+    fi
+    lock_dir="$STOP_LOCK_FILE.d"
+    waited=0
+    while [ "$waited" -lt "$STOP_LOCK_WAIT_SECONDS" ]; do
+        if mkdir "$lock_dir" 2>/dev/null; then
+            stop_lock_held=2
+            say "stop_lock_acquired path=$lock_dir fallback=mkdir"
+            return 0
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    say "! stop_lock_timeout waited=${waited}s path=$lock_dir fallback=mkdir"
+    return 1
+}
+
+release_stop_lock() {
+    if [ "$stop_lock_held" -eq 1 ]; then
+        flock -u 9 2>/dev/null
+        exec 9>&- 2>/dev/null
+    elif [ "$stop_lock_held" -eq 2 ]; then
+        rmdir "$STOP_LOCK_FILE.d" 2>/dev/null
+    fi
+    stop_lock_held=0
+}
 control_socket_present() {
     grep -q "$CONTROL_SOCKET" "$UNIX_LIST" 2>/dev/null
 }
@@ -172,7 +236,7 @@ wait_cli_bounded() {
 # 只依据可核验的事实，不在无法核验时宣称“已停止”。
 wait_bridge_stopped() {
     waited=0
-    while [ "$waited" -lt "$STOP_WAIT_SECONDS" ]; do
+    while [ "$waited" -lt "$BRIDGE_EXIT_WAIT_SECONDS" ]; do
         socket_up=0
         control_socket_present && socket_up=1
         current=$(pid_from_file 2>/dev/null) || current=""
@@ -200,7 +264,7 @@ terminate_verified_pid() {
         kill -KILL "$target" 2>/dev/null
         wait_pid_gone "$target" "$KILL_WAIT_SECONDS" || true
     fi
-    if [ -d "/proc/$target" ]; then
+    if process_alive "$target"; then
         say "! 无法确认 ${label} PID $target 已退出：可能存在仍在运行的进程，重启后会由 service.sh 重新拉起或由系统回收"
         return 1
     fi
@@ -238,8 +302,14 @@ if [ "$socket_present" -eq 0 ] && [ -z "$bridge_pid" ] && [ -z "$audio_pid" ]; t
     say "- 桥接与音频工作进程都未运行（无控制 socket，PID 文件也不存在或不可核验），跳过停止请求"
     shutdown_state=not_running
 else
+    # I4：先取跨脚本停止锁，确保与 service.sh 的停止序列不会并发发起两个 CLI shutdown。
+    if acquire_stop_lock; then
+        stop_lock_ok=1
+    else
+        stop_lock_ok=0
+    fi
     # 1) 先请求优雅关闭：桥接要终止/交还通话并读回恢复麦克风，音频工作进程必须还活着。
-    if [ "$socket_present" -eq 1 ] && [ "$ctl_usable" -eq 1 ]; then
+    if [ "$socket_present" -eq 1 ] && [ "$ctl_usable" -eq 1 ] && [ "$stop_lock_ok" -eq 1 ]; then
         say "- 控制 socket 存在：请求桥接优雅关闭（固定 CLI shutdown，不执行任意 shell）"
         rm -f "$SHUTDOWN_RESULT_FILE" 2>/dev/null
         "$CTL" shutdown > "$SHUTDOWN_RESULT_FILE" 2>/dev/null &
@@ -261,10 +331,13 @@ else
             rm -f "$STATUS_RESULT_FILE" 2>/dev/null
             "$CTL" status > "$STATUS_RESULT_FILE" 2>/dev/null &
             cli_pid=$!
-            wait_cli_bounded "$cli_pid" "$STOP_WAIT_SECONDS" || true
+            wait_cli_bounded "$cli_pid" "$STATUS_PROBE_WAIT_SECONDS" || true
             status_result=$(cat "$STATUS_RESULT_FILE" 2>/dev/null)
         fi
         rm -f "$SHUTDOWN_RESULT_FILE" "$STATUS_RESULT_FILE" 2>/dev/null
+    elif [ "$socket_present" -eq 1 ] && [ "$ctl_usable" -eq 1 ]; then
+        say "! 未能取得停止锁（stop_lock_timeout）：跳过重复的优雅关闭请求，改用 PID 回退"
+        shutdown_state=lock_timeout
     elif [ "$socket_present" -eq 1 ]; then
         say "! 控制 socket 存在，但固定 CLI 不可执行（$CTL）：无法请求优雅关闭，改用 PID 回退"
         shutdown_state=cli_unavailable
@@ -344,6 +417,9 @@ if control_socket_present || [ -n "$residual_pid" ]; then
         say "! 桥接似乎仍在运行，但 PID 文件缺失或不可核验：无法安全终止（不会猜测 PID）"
     fi
 fi
+
+# 停止序列结束：释放跨脚本锁（先于删除数据目录，锁文件随目录一起删除）。
+release_stop_lock
 
 say "- 说明：桥接已实现会话/租约（session.request/command/heartbeat/events/handover）与优雅关闭。"
 say "  固定 CLI shutdown 会先终止/交还拥有的通话，确认断开后读回恢复麦克风，然后退出。"
