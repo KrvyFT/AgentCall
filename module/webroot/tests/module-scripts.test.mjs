@@ -1,9 +1,19 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
 
 const MODULE = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const SCRIPTS = ["customize.sh", "service.sh", "uninstall.sh", "bin/agentcallctl"];
@@ -125,3 +135,232 @@ test("agentcallctl：固定六条命令，配置只从 stdin 进入，未知命�
   assert.match(ctl, /exit "\$result"|exit \$\?/, "必须转发 CLI 退出码");
   assert.equal(/cli_requires_root/.test(ctl), true, "非 root 必须给出机器可读错误");
 });
+
+
+// ---------------------------------------------------------------------------------------------
+// service.sh 进程所有权（修复轮 2 / 新增重要缺陷 1）
+//
+// 背景：模块停止时只杀 audio_worker_supervisor 子 shell 会把真正的 app_process 变成孤儿：
+// 它继续持有 abstract socket 与麦克风隔离，下一次模块启动会 bind 失败直到重启设备。
+// 下面的 host 级测试用假 app_process / 假 getprop 真正运行 service.sh，断言停止路径
+// 杀掉的是**音频工作进程自己的 PID**，并且干净退出也会回收它。
+// ---------------------------------------------------------------------------------------------
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function waitFor(predicate, timeoutMs, label) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await sleep(50);
+  }
+  throw new Error("timed out waiting for " + label);
+}
+
+function processAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readPidFile(path) {
+  return Number(readFileSync(path, "utf8").trim());
+}
+
+function killQuietly(child) {
+  if (!child || !child.pid) return;
+  try {
+    if (processAlive(child.pid)) child.kill("SIGKILL");
+  } catch {
+    // 测试清理：进程已退出时忽略。
+  }
+}
+
+function serviceEnv(harness, extra = {}) {
+  return {
+    ...process.env,
+    AGENTCALL_APP_PROCESS: harness.appProcess,
+    AGENTCALL_GETPROP: harness.getprop,
+    AGENTCALL_DATA_ROOT: harness.dataRoot,
+    ...extra,
+  };
+}
+
+/**
+ * 临时模块目录 + 假 app_process：
+ * - 参数里出现 BridgeMain 时，AGENTCALL_FAKE_BRIDGE_STAY=1 就常驻，否则 1 秒后干净退出；
+ * - 其余（音频工作角色）常驻，模拟冻结在通话音频里的 app_process。
+ */
+function serviceHarness() {
+  const root = mkdtempSync(join(tmpdir(), "agentcall-service-"));
+  const moduleDir = join(root, "module");
+  const dataRoot = join(root, "data");
+  const binDir = join(root, "bin");
+  mkdirSync(join(moduleDir, "bridge"), { recursive: true });
+  mkdirSync(join(dataRoot, "logs"), { recursive: true });
+  mkdirSync(binDir, { recursive: true });
+  writeFileSync(join(moduleDir, "bridge", "agentcall-bridge.jar"), "stub");
+  copyFileSync(join(MODULE, "service.sh"), join(moduleDir, "service.sh"));
+
+  const appProcess = join(binDir, "app_process");
+  writeFileSync(
+    appProcess,
+    [
+      "#!/bin/sh",
+      'case "$*" in',
+      "  *BridgeMain*)",
+      '    if [ "${AGENTCALL_FAKE_BRIDGE_STAY:-0}" = "1" ]; then sleep 300; else sleep 1; fi',
+      "    exit 0",
+      "    ;;",
+      "esac",
+      "while :; do sleep 1; done",
+      "",
+    ].join("\n"),
+  );
+  chmodSync(appProcess, 0o755);
+
+  const getprop = join(binDir, "getprop");
+  writeFileSync(getprop, "#!/bin/sh\nprintf '1\\n'\n");
+  chmodSync(getprop, 0o755);
+
+  return {
+    root,
+    moduleDir,
+    dataRoot,
+    appProcess,
+    getprop,
+    script: join(moduleDir, "service.sh"),
+    audioPidFile: join(dataRoot, "audio-worker.pid"),
+    bridgePidFile: join(dataRoot, "bridge.pid"),
+    logFile: join(dataRoot, "logs", "service.log"),
+  };
+}
+
+function waitForExit(child, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("service.sh did not exit in " + timeoutMs + " ms")), timeoutMs);
+    child.once("exit", (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal });
+    });
+  });
+}
+
+test(
+  "service.sh：SIGTERM 停止路径必须杀掉真实的音频工作进程 PID，而不是只杀子 shell",
+  { timeout: 60000 },
+  async () => {
+    const harness = serviceHarness();
+    let child = null;
+    try {
+      child = spawn("sh", [harness.script], {
+        env: serviceEnv(harness, { AGENTCALL_FAKE_BRIDGE_STAY: "1" }),
+        stdio: "ignore",
+      });
+      await waitFor(
+        () => existsSync(harness.audioPidFile) && existsSync(harness.bridgePidFile),
+        20000,
+        "bridge/audio pid files",
+      );
+      const workerPid = readPidFile(harness.audioPidFile);
+      const bridgePid = readPidFile(harness.bridgePidFile);
+      assert.ok(workerPid > 0, "音频工作进程必须有独立 PID 文件");
+      assert.ok(bridgePid > 0);
+      assert.notEqual(workerPid, bridgePid);
+
+      child.kill("SIGTERM");
+      await waitForExit(child, 20000);
+
+      await waitFor(() => !processAlive(workerPid), 5000, "audio worker termination");
+      assert.equal(
+        processAlive(workerPid),
+        false,
+        "停止后不得留下音频工作 app_process（会继续持有 abstract socket 与麦克风隔离）",
+      );
+      assert.equal(existsSync(harness.audioPidFile), false, "停止后必须收回音频 PID 文件");
+      assert.equal(existsSync(harness.bridgePidFile), false, "停止后必须收回 bridge PID 文件");
+
+      const log = readFileSync(harness.logFile, "utf8");
+      assert.match(log, /service_stop_signal/);
+      assert.match(log, /audio_worker_stopped/, "停止路径必须记录并验证音频工作进程已终止");
+    } finally {
+      killQuietly(child);
+      rmSync(harness.root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "service.sh：bridge 干净退出后也必须回收音频工作进程",
+  { timeout: 60000 },
+  async () => {
+    const harness = serviceHarness();
+    let child = null;
+    try {
+      child = spawn("sh", [harness.script], {
+        env: serviceEnv(harness, { AGENTCALL_FAKE_BRIDGE_STAY: "0" }),
+        stdio: "ignore",
+      });
+      await waitFor(() => existsSync(harness.audioPidFile), 20000, "audio worker pid file");
+      const workerPid = readPidFile(harness.audioPidFile);
+
+      const { code } = await waitForExit(child, 30000);
+
+      assert.equal(code, 0, "干净退出必须保留 0 退出码");
+      await waitFor(() => !processAlive(workerPid), 5000, "audio worker termination on clean exit");
+      assert.equal(
+        processAlive(workerPid),
+        false,
+        "bridge 干净退出后残留的音频工作进程会独占麦克风隔离与 socket",
+      );
+      assert.equal(existsSync(harness.audioPidFile), false);
+
+      const log = readFileSync(harness.logFile, "utf8");
+      assert.match(log, /bridge_exit_clean/);
+      assert.match(log, /audio_worker_stopped/);
+    } finally {
+      killQuietly(child);
+      rmSync(harness.root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "service.sh：启动时先回收上一次实例留下的音频工作进程（幂等启动）",
+  { timeout: 60000 },
+  async () => {
+    const harness = serviceHarness();
+    let child = null;
+    let stale = null;
+    try {
+      // 上一次模块实例被强杀后留下的 app_process：PID 文件与进程都还在。
+      stale = spawn(
+        "sh",
+        [harness.appProcess, "--nice-name=agentcall-audio-worker", "org.krvyft.agentcall.bridge.audio.AudioWorkerMain"],
+        { env: serviceEnv(harness), stdio: "ignore" },
+      );
+      await sleep(200);
+      writeFileSync(harness.audioPidFile, String(stale.pid) + "\n");
+
+      child = spawn("sh", [harness.script], {
+        env: serviceEnv(harness, { AGENTCALL_FAKE_BRIDGE_STAY: "0" }),
+        stdio: "ignore",
+      });
+      const { code } = await waitForExit(child, 30000);
+      assert.equal(code, 0);
+
+      await waitFor(() => !processAlive(stale.pid), 5000, "stale audio worker termination");
+      assert.equal(processAlive(stale.pid), false, "启动前必须回收上一次实例的音频工作进程");
+
+      const log = readFileSync(harness.logFile, "utf8");
+      assert.match(log, /stale_audio_worker_stopped/);
+    } finally {
+      killQuietly(child);
+      killQuietly(stale);
+      rmSync(harness.root, { recursive: true, force: true });
+    }
+  },
+);
