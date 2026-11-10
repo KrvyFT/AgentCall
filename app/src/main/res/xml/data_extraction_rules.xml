@@ -7,7 +7,8 @@
     <cloud-backup>
         <exclude domain="sharedpref" path="agentcall_calibration.xml" />
         <exclude domain="sharedpref" path="agentcall_diagnostics.xml" />
-        <exclude domain="sharedpref" path="agentcall_session.xml" />
+        <exclude domain="sharedpref" path="agentcall.session_events.xml" />
+        <exclude domain="sharedpref" path="agentcall.autostart.xml" />
         <exclude domain="file" path="diagnostics/" />
         <exclude domain="file" path="audio/" />
         <exclude domain="file" path="tmp/" />
@@ -19,7 +20,8 @@
     <device-transfer>
         <exclude domain="sharedpref" path="agentcall_calibration.xml" />
         <exclude domain="sharedpref" path="agentcall_diagnostics.xml" />
-        <exclude domain="sharedpref" path="agentcall_session.xml" />
+        <exclude domain="sharedpref" path="agentcall.session_events.xml" />
+        <exclude domain="sharedpref" path="agentcall.autostart.xml" />
         <exclude domain="file" path="diagnostics/" />
         <exclude domain="file" path="audio/" />
         <exclude domain="file" path="tmp/" />

@@ -8,6 +8,8 @@ import org.krvyft.agentcall.core.model.RpcError
 import org.krvyft.agentcall.core.model.RpcRequest
 import org.krvyft.agentcall.core.model.RpcResponse
 import org.krvyft.agentcall.core.protocol.RolePolicy
+import org.krvyft.agentcall.ipc.BridgeRead
+import org.krvyft.agentcall.ipc.BridgeStatusFacts
 import org.krvyft.agentcall.ipc.ControlTransport
 
 /**
@@ -124,21 +126,25 @@ class BridgeDiagnosticsTest {
     }
 
     @Test
-    fun dialerDefaultRoleProbeNeverInventsTheRole() = runBlocking {
+    fun liveFactsProbeNeverInventsTheDialerRole() = runBlocking {
         // true/false 按原值透传；不可用或字段缺失一律 null（就绪判定据此保持未就绪）。
-        val defaultRole = BridgeDiagnostics(FakeTransport(statusResponse("{\"dialerDefaultRole\":true}")))
-        assertEquals(true, BridgeDialerRoleProbe(defaultRole).isDefault())
+        val defaultRole = BridgeLiveFactsProbe {
+            BridgeRead.Available(BridgeStatusFacts(dialerDefaultRole = true))
+        }
+        assertEquals(true, defaultRole.isDefault())
 
-        val notDefault = BridgeDiagnostics(FakeTransport(statusResponse("{\"dialerDefaultRole\":false}")))
-        assertEquals(false, BridgeDialerRoleProbe(notDefault).isDefault())
+        val notDefault = BridgeLiveFactsProbe {
+            BridgeRead.Available(BridgeStatusFacts(dialerDefaultRole = false))
+        }
+        assertEquals(false, notDefault.isDefault())
 
-        val missingField = BridgeDiagnostics(FakeTransport(statusResponse("{}")))
-        assertEquals(null, BridgeDialerRoleProbe(missingField).isDefault())
+        val missingField = BridgeLiveFactsProbe { BridgeRead.Available(BridgeStatusFacts()) }
+        assertEquals(null, missingField.isDefault())
 
-        val forbidden = BridgeDiagnostics(FakeTransport { request ->
-            RpcResponse(id = request.id, error = RpcError("forbidden", "denied"))
-        })
-        assertEquals(null, BridgeDialerRoleProbe(forbidden).isDefault())
+        // status 不可用（旧桥接/角色表不匹配）同样不得猜成“默认拨号器”。
+        val forbidden = BridgeLiveFactsProbe { BridgeRead.Unavailable("forbidden") }
+        assertEquals(null, forbidden.isDefault())
+        assertEquals(HookPresence.UNKNOWN, forbidden.presence())
     }
 
     private fun statusJson(hookConnected: String): String =

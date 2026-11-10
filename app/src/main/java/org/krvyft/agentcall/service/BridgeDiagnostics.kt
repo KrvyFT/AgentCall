@@ -47,11 +47,12 @@ sealed interface EnvironmentResult {
 }
 
 /**
- * APP 角色的只读诊断客户端（`status` + `diagnose`）。
+ * APP 角色的只读诊断客户端（status + diagnose）。
  *
- * 这两个方法在 `RolePolicy` 的 APP 固定表里**目前不存在**，生产调用会得到 `forbidden`。
- * 这必须是可观察的“不可用”，绝不能兜底成“在线/已校准”：就绪判定据此保持 fail closed。
- * 只要 core/bridge 后续把只读诊断开放给 APP，本类无需改动即可工作。
+ * RolePolicy 的 APP 固定表现已包含 status/diagnose（只读），生产装配通常改用
+ * [org.krvyft.agentcall.ipc.BridgeClient] 读同一份负载；本类仍被 UI/校准页使用。
+ * `forbidden` 只可能来自旧桥接或角色表不匹配，必须表达为可观察的“不可用”，绝不能
+ * 兜底成“在线/已校准”：就绪判定据此保持 fail closed。
  *
  * 传输复用 [ControlTransport]（生产是 LocalSocket，测试注入假实现）；所有请求都有
  * [ControlTimeouts] 的每方法预算，另有客户端兜底超时。

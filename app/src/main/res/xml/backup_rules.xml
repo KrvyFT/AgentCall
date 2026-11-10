@@ -8,7 +8,8 @@
     <!-- 校准本机进度与（未来）诊断/会话偏好：不含密钥，但仍不备份。 -->
     <exclude domain="sharedpref" path="agentcall_calibration.xml" />
     <exclude domain="sharedpref" path="agentcall_diagnostics.xml" />
-    <exclude domain="sharedpref" path="agentcall_session.xml" />
+    <exclude domain="sharedpref" path="agentcall.session_events.xml" />
+    <exclude domain="sharedpref" path="agentcall.autostart.xml" />
 
     <!-- 诊断日志与临时音频：一律不进入备份。 -->
     <exclude domain="file" path="diagnostics/" />

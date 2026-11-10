@@ -108,7 +108,8 @@
     <string name="calibration_environment_unavailable">不可用：%1$s</string>
     <string name="calibration_environment_unknown">不可用（桥接未向 APP 开放 diagnose）</string>
     <string name="calibration_state_prefix">本机记录：%1$s（%2$d/%3$d）</string>
-    <string name="calibration_state_verified">已验证</string>
+    <!-- M8：本页只保存本机人工记录；桥接校准授权未贯通时，主页面/通知仍显示未验证。 -->
+    <string name="calibration_state_verified">本机记录已验证（不等于桥接授权）</string>
     <string name="calibration_state_unverified">未验证</string>
     <string name="calibration_step_downlink">1. 本机识别到通话下行音频（不是环境麦克风）</string>
     <string name="calibration_step_peer_heard">2. 对端听到测试语音（TTS 上行注入可用）</string>
