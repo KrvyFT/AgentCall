@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Release 资源收缩（AGP optimization）只保留被代码引用的资源；传统 Xposed 的
+  xposed_scope 数组只被框架管理器按名字读取，没有任何 APK 代码引用，会被剔除。
+  这里显式 keep，保证 release 包仍携带作用域声明（控制器裁定，Task 4 PART B）。
+-->
+<resources xmlns:tools="http://schemas.android.com/tools"
+    tools:keep="@array/xposed_scope" />
