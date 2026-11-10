@@ -1,6 +1,7 @@
 package org.krvyft.agentcall.bridge
 
 import com.google.gson.JsonArray
+import com.google.gson.JsonElement
 import com.google.gson.JsonNull
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
@@ -33,6 +34,7 @@ import org.krvyft.agentcall.bridge.diagnostics.AndroidDialerDefaultRoleProbe
 import org.krvyft.agentcall.bridge.diagnostics.AndroidPlatformFacts
 import org.krvyft.agentcall.bridge.diagnostics.DeviceProbe
 import org.krvyft.agentcall.bridge.diagnostics.DialerDefaultRole
+import org.krvyft.agentcall.bridge.diagnostics.PlatformFacts
 import org.krvyft.agentcall.bridge.diagnostics.ReflectiveAudioApiProbe
 import org.krvyft.agentcall.bridge.ipc.AndroidPackageIdentitySource
 import org.krvyft.agentcall.bridge.ipc.ControlServer
@@ -233,6 +235,8 @@ internal object BridgeRuntime {
             store = store,
             packages = packages,
             probe = probe,
+            // 授权、calibration.read、status、diagnose 必须使用同一份进程启动环境。
+            environment = { environment },
             shutdown = shutdown,
             supervision = supervisionRpc,
             hookCommands = hookCommands,
@@ -248,7 +252,8 @@ internal object BridgeRuntime {
             sessionEvents = sessionEvents,
             calibration = calibration,
             lifecycle = lifecycle,
-            shutdownCode = { lifecycle.shutdownCode },
+            // 本进程的关闭码优先；进程退出后从监督状态文件恢复的上一次关闭码兜底。
+            shutdownCode = { lifecycle.shutdownCode ?: supervision.previousShutdownCode },
         )
 
         // PCM 通道由 ControlServer 独立 bind（PCM lane）；音频工作角色负责真实 PCM
@@ -332,7 +337,10 @@ internal object BridgeRuntime {
             identities = UnverifiedCallIdentityVerifier,
             termination = ReflectiveTelecomTermination(),
         )
-        val authorization = AutoAnswerAuthorization { calibration.isVerified(environment) }
+        // 环境仍是服务端构建；root 背书只填补桥接观测不到的 transport/route（C1）。
+        val authorization = AutoAnswerAuthorization {
+            isCalibrationAuthorizedFor(calibration, environment)
+        }
         return SupervisorProductionGraph.build(
             object : SupervisionPlatform {
                 override fun clock(): MonotonicClock = clock
@@ -523,6 +531,11 @@ internal class ControlDispatcher(
     private val store: ConfigStore,
     private val packages: PackageIdentitySource,
     private val probe: DeviceProbe,
+    /**
+     * 判定/校准使用的当前环境。生产装配注入**进程启动时采集一次**的环境：自动接听授权、
+     * calibration.read、status、diagnose 必须看到同一份事实；默认值只服务于测试构造点。
+     */
+    private val environment: () -> EnvironmentKey = { probe.inspect().environment },
     private val shutdown: CountDownLatch,
     private val supervision: SupervisionRpcPort = SupervisionRpcPort(),
     private val startedAtMs: Long = System.currentTimeMillis(),
@@ -591,7 +604,7 @@ internal class ControlDispatcher(
             RolePolicy.METHOD_CONFIG_SECRET_READ -> secretRead(request)
             RolePolicy.METHOD_CONFIG_WRITE -> configWrite(request)
             RolePolicy.METHOD_PAIR -> pair(request)
-            RolePolicy.METHOD_DIAGNOSE -> ok(request, RpcCodec.encodeCapabilityReport(probe.inspect()))
+            RolePolicy.METHOD_DIAGNOSE -> ok(request, diagnosePayload())
             RolePolicy.METHOD_SHUTDOWN -> shutdownResponse(request)
             RolePolicy.METHOD_SESSION_REQUEST -> sessionRequest(request)
             RolePolicy.METHOD_SESSION_HEARTBEAT -> sessionHeartbeat(request)
@@ -604,7 +617,7 @@ internal class ControlDispatcher(
             RolePolicy.METHOD_CALL_COMMAND_RESULT -> hookCommandResult(request)
             RolePolicy.METHOD_AUDIO_CHANNEL -> audioChannel(request, peer)
             RolePolicy.METHOD_CALIBRATION_READ -> calibrationRead(request)
-            RolePolicy.METHOD_CALIBRATION_RECORD -> calibrationRecord(request)
+            RolePolicy.METHOD_CALIBRATION_RECORD -> calibrationRecord(request, peer)
             else -> failure(request, "method_not_implemented", "method is not in the fixed command table")
         }
     } catch (error: ConfigStoreException) {
@@ -792,40 +805,47 @@ internal class ControlDispatcher(
     /**
      * calibration.read：只读校准视图。
      *
-     * 当前环境每次由 [DeviceProbe] 重新采集（不缓存猜测值）；证据来自 [CalibrationStore]。
-     * 负载只有环境字段、五项布尔事实、服务端时间戳与 [CalibrationPolicy] 的未满足项，
-     * 绝不含密钥、号码或配置内容。
+     * 环境是与自动接听授权同源的进程环境（服务端事实，不是请求内容）；证据来自
+     * [CalibrationStore]。负载只有环境字段、五项布尔事实、服务端时间戳、
+     * [CalibrationPolicy] 的未满足项与 operator_attested 背书标记，绝不含密钥、号码或
+     * 配置内容。
      */
     private fun calibrationRead(request: RpcRequest): RpcResponse {
         val store = calibration
             ?: return failure(request, ERROR_CALIBRATION_UNAVAILABLE, "calibration store is not wired")
-        val environment = probe.inspect().environment
         val evidence = try {
             store.load()
         } catch (error: CalibrationStoreException) {
             return failure(request, error.code, error.message ?: error.code)
         }
-        return ok(request, encodeCalibrationView(environment, evidence))
+        return ok(request, calibrationView(environment(), evidence).toString())
     }
 
     /**
      * calibration.record：root 操作员为**当前服务端环境**背书五项人工测试事实。
      *
-     * 请求只能提供五项布尔与可选的“预期环境”（仅用于一致性核验）。证据环境与时间戳
-     * 一律由桥接进程生成：环境取自 [DeviceProbe]，时间戳由 [CalibrationStore] 的时钟写入。
-     * 未知/不一致环境、缺失步骤一律拒绝；APP/HOOK 在 [RolePolicy] 层就已被拒绝。
+     * 请求只能提供五项布尔、可选的“预期环境”（仅用于一致性核验）与可选的
+     * operatorAttestation。证据环境与时间戳一律由桥接进程生成：环境来自服务端采集
+     * （root 背书只填补桥接观测不到的 transport/route），时间戳由 [CalibrationStore]
+     * 的时钟写入。未知/不一致环境、缺失步骤、非法背书一律拒绝；APP/HOOK 在
+     * [RolePolicy] 层就已被拒绝，本方法再按角色二次拒绝。
      */
-    private fun calibrationRecord(request: RpcRequest): RpcResponse {
+    private fun calibrationRecord(request: RpcRequest, peer: PeerIdentity): RpcResponse {
+        // 方法表已把该方法限定给 CLI_ROOT；这里是服务端第二道判定（APP/HOOK 绝不背书）。
+        if (peer.role != PeerRole.CLI_ROOT) {
+            return failure(request, ControlServer.ERROR_FORBIDDEN, "calibration.record is restricted to the root CLI")
+        }
         val store = calibration
             ?: return failure(request, ERROR_CALIBRATION_UNAVAILABLE, "calibration store is not wired")
         val decoded = decodeCalibrationRecord(request.payload)
             ?: return failure(
                 request,
                 ERROR_PAYLOAD_INVALID,
-                "calibration.record payload must carry exactly the five boolean manual-test steps",
+                "calibration.record payload must carry exactly the five boolean manual-test steps and an optional operatorAttestation",
             )
-        val current = probe.inspect().environment
-        if (!isCompleteEnvironment(current)) {
+        val observed = environment()
+        val effective = applyAttestation(observed, decoded.attestation)
+        if (!isCompleteEnvironment(effective)) {
             return failure(
                 request,
                 ERROR_CALIBRATION_ENV_UNKNOWN,
@@ -841,7 +861,7 @@ internal class ControlDispatcher(
                     "expected environment has unknown facts",
                 )
             }
-            if (expected != current) {
+            if (expected != effective) {
                 return failure(
                     request,
                     ERROR_CALIBRATION_ENV_MISMATCH,
@@ -851,9 +871,9 @@ internal class ControlDispatcher(
         }
         var evidence: CalibrationEvidence? = null
         for ((step, passed) in decoded.steps) {
-            evidence = store.record(step, passed, current)
+            evidence = store.record(step, passed, effective)
         }
-        return ok(request, encodeCalibrationRecordResult(evidence!!, current))
+        return ok(request, encodeCalibrationRecordResult(evidence!!, observed, effective))
     }
 
     /** 当前环境能否作为校准绑定的可复现事实（任何字段 UNKNOWN/空白都不行）。 */
@@ -861,41 +881,85 @@ internal class ControlDispatcher(
         CalibrationBlocker.ENVIRONMENT_INCOMPLETE !in
             CalibrationPolicy.blockers(environment, CalibrationEvidence(environment = environment))
 
-    private fun encodeCalibrationView(
-        environment: EnvironmentKey,
-        evidence: CalibrationEvidence?,
-    ): String {
-        val blank = CalibrationEvidence(environment = environment)
-        val blockers = CalibrationPolicy.blockers(environment, evidence ?: blank)
+    /**
+     * 校准视图（calibration.read 与内嵌到 status/diagnose 的**同一份**负载）。
+     *
+     * 固定键：
+     * - available：校准存储是否接线；status/diagnose 未接线时只给 `{"available":false}`；
+     * - environment：服务端可观测环境（桥接读不到的就是 UNKNOWN）；
+     * - effectiveEnvironment：应用 root 背书后的判定环境；
+     * - environmentComplete / verified / blockers / environmentMatchesEvidence；
+     * - evidenceEnvironment：证据里持久化的环境（可能含背书值）；
+     * - operatorAttestation：{operatorAttested, transport, route}，明确标记背书字段；
+     * - steps / calibratedAtMs。
+     */
+    private fun calibrationView(observed: EnvironmentKey, evidence: CalibrationEvidence?): JsonObject {
+        val evidenceEnvironment = evidence?.environment
+        val effective = effectiveEnvironment(observed, evidenceEnvironment)
+        val judgedEvidence = evidence ?: CalibrationEvidence(environment = effective)
+        val blockers = CalibrationPolicy.blockers(effective, judgedEvidence)
         val json = JsonObject()
+        json.addProperty("available", true)
         json.addProperty("supportedApiLevel", CalibrationPolicy.SUPPORTED_API_LEVEL)
-        json.add("environment", encodeEnvironmentKey(environment))
-        json.addProperty("environmentComplete", isCompleteEnvironment(environment))
-        json.addProperty("verified", evidence != null && CalibrationPolicy.canAutoAnswer(environment, evidence))
+        json.add("environment", encodeEnvironmentKey(observed))
+        json.add("effectiveEnvironment", encodeEnvironmentKey(effective))
+        json.addProperty("environmentComplete", isCompleteEnvironment(effective))
+        json.addProperty("verified", evidence != null && CalibrationPolicy.canAutoAnswer(effective, judgedEvidence))
         json.add("blockers", JsonArray().apply { blockers.forEach { add(JsonPrimitive(it.name)) } })
-        json.addProperty("environmentMatchesEvidence", evidence != null && evidence.environment == environment)
+        json.addProperty("environmentMatchesEvidence", evidence != null && effective == evidenceEnvironment)
         if (evidence == null) {
-            json.add("evidenceEnvironment", com.google.gson.JsonNull.INSTANCE)
+            json.add("evidenceEnvironment", JsonNull.INSTANCE)
         } else {
             json.add("evidenceEnvironment", encodeEnvironmentKey(evidence.environment))
         }
+        json.add("operatorAttestation", encodeOperatorAttestation(attestedFacts(observed, evidenceEnvironment)))
         json.add("steps", encodeCalibrationSteps(evidence))
         json.addProperty("calibratedAtMs", evidence?.calibratedAtMs ?: 0L)
-        return json.toString()
+        return json
     }
 
     private fun encodeCalibrationRecordResult(
         evidence: CalibrationEvidence,
-        environment: EnvironmentKey,
+        observed: EnvironmentKey,
+        effective: EnvironmentKey,
     ): String {
-        val blockers = CalibrationPolicy.blockers(environment, evidence)
+        val blockers = CalibrationPolicy.blockers(effective, evidence)
         val json = JsonObject()
         json.addProperty("recorded", true)
-        json.add("environment", encodeEnvironmentKey(environment))
+        json.add("environment", encodeEnvironmentKey(effective))
+        json.add("operatorAttestation", encodeOperatorAttestation(attestedFacts(observed, effective)))
         json.add("steps", encodeCalibrationSteps(evidence))
-        json.addProperty("verified", CalibrationPolicy.canAutoAnswer(environment, evidence))
+        json.addProperty("verified", CalibrationPolicy.canAutoAnswer(effective, evidence))
         json.add("blockers", JsonArray().apply { blockers.forEach { add(JsonPrimitive(it.name)) } })
         json.addProperty("calibratedAtMs", evidence.calibratedAtMs)
+        return json.toString()
+    }
+
+    private fun encodeOperatorAttestation(attested: AttestedFacts): JsonObject = JsonObject().apply {
+        addProperty("operatorAttested", attested.operatorAttested)
+        if (attested.transport == null) add("transport", JsonNull.INSTANCE) else addProperty("transport", attested.transport)
+        if (attested.route == null) add("route", JsonNull.INSTANCE) else addProperty("route", attested.route)
+    }
+
+    /**
+     * status/diagnose 内嵌的校准视图；未接线时保持固定形状 `{"available":false}`，
+     * 读取失败只报告不可用，绝不能拖垮 status 或伪造已验证。
+     */
+    private fun calibrationPayload(): JsonObject {
+        val store = calibration ?: return JsonObject().apply { addProperty("available", false) }
+        return try {
+            calibrationView(environment(), store.load())
+        } catch (error: CalibrationStoreException) {
+            JsonObject().apply {
+                addProperty("available", false)
+                addProperty("error", error.code)
+            }
+        }
+    }
+
+    private fun diagnosePayload(): String {
+        val json = JsonParser.parseString(RpcCodec.encodeCapabilityReport(probe.inspect())).asJsonObject
+        json.add("calibration", calibrationPayload())
         return json.toString()
     }
 
@@ -998,18 +1062,28 @@ internal class ControlDispatcher(
     private data class CalibrationRecordPayload(
         val steps: Map<CalibrationStep, Boolean>,
         val expectedEnvironment: EnvironmentKey?,
+        /** 可选的 root 操作员背书；null 表示没有提供，必须由桥接观测补齐环境。 */
+        val attestation: OperatorAttestation?,
     )
 
     /**
-     * 解析 calibration.record 负载：只允许 steps（五项、全部布尔）与可选的
-     * expectedEnvironment（十个环境字段）。多键/缺键/错误类型都整体拒绝。
+     * 解析 calibration.record 负载：只允许 steps（五项、全部布尔）、可选的
+     * expectedEnvironment（十个环境字段）与可选的 operatorAttestation（固定三键）。
+     * 多键/缺键/错误类型/词表外取值都整体拒绝。
      */
     private fun decodeCalibrationRecord(payload: String): CalibrationRecordPayload? {
         if (payload.isEmpty() || payload.length > MAX_CALIBRATION_PAYLOAD_CHARS) return null
         val parsed = runCatching { JsonParser.parseString(payload) }.getOrNull() ?: return null
         if (!parsed.isJsonObject) return null
         val json = parsed.asJsonObject
-        if (!json.keySet().all { it == CALIBRATION_STEPS_KEY || it == CALIBRATION_ENVIRONMENT_FIELD }) return null
+        if (!json.keySet().all {
+                it == CALIBRATION_STEPS_KEY ||
+                    it == CALIBRATION_ENVIRONMENT_FIELD ||
+                    it == CALIBRATION_ATTESTATION_FIELD
+            }
+        ) {
+            return null
+        }
         val stepsJson = json.get(CALIBRATION_STEPS_KEY)
             ?.takeIf { it.isJsonObject }
             ?.asJsonObject
@@ -1028,7 +1102,38 @@ internal class ControlDispatcher(
             if (!expectedElement.isJsonObject) return null
             decodeEnvironmentKey(expectedElement.asJsonObject) ?: return null
         }
-        return CalibrationRecordPayload(steps, expected)
+        val attestationElement = json.get(CALIBRATION_ATTESTATION_FIELD)
+        val attestation = if (attestationElement == null) {
+            null
+        } else {
+            decodeOperatorAttestation(attestationElement) ?: return null
+        }
+        return CalibrationRecordPayload(steps, expected, attestation)
+    }
+
+    /**
+     * 操作员背书只允许固定三键：transport/route 是固定词表字符串，
+     * manualTestCompleted 必须是 JSON true。其余一切形状都 payload_invalid。
+     */
+    private fun decodeOperatorAttestation(element: JsonElement): OperatorAttestation? {
+        if (!element.isJsonObject) return null
+        val json = element.asJsonObject
+        if (json.keySet() != CALIBRATION_ATTESTATION_KEYS) return null
+        val transport = calibrationAttestationString(json, "transport") ?: return null
+        val route = calibrationAttestationString(json, "route") ?: return null
+        if (transport !in ATTESTABLE_TRANSPORTS || route !in ATTESTABLE_ROUTES) return null
+        val manual = json.get(CALIBRATION_ATTESTATION_MANUAL_TEST)
+        if (manual == null || !manual.isJsonPrimitive || !manual.asJsonPrimitive.isBoolean) return null
+        if (!manual.asBoolean) return null
+        return OperatorAttestation(transport = transport, route = route)
+    }
+
+    private fun calibrationAttestationString(json: JsonObject, name: String): String? {
+        val element = json.get(name) ?: return null
+        if (!element.isJsonPrimitive || !element.asJsonPrimitive.isString) return null
+        val value = element.asString
+        if (value.isEmpty() || value.length > MAX_CALIBRATION_ENV_CHARS) return null
+        return value
     }
 
     /** 只接受恰好十个环境字段；字符串有长度上限，API 等级必须是整数。 */
@@ -1180,6 +1285,9 @@ internal class ControlDispatcher(
         // 阶段 B 概览实时字段：确定为 boolean，无法可靠确定时写字符串 "unknown"。
         addLiveStatus(json, "hookConnected", state?.hookConnected)
         addLiveStatus(json, "dialerDefaultRole", inspectDialerDefaultRole())
+        // Task 11E / C1：APP 侧 calibration.read 没有生产消费者；内嵌同一份校准视图
+        // （与 calibration.read 完全一致，含 operatorAttestation 背书标记）供已有 UI 探针使用。
+        json.add("calibration", calibrationPayload())
         return json.toString()
     }
 
@@ -1391,6 +1499,13 @@ internal class ControlDispatcher(
 
         const val CALIBRATION_ENVIRONMENT_FIELD: String = "expectedEnvironment"
 
+        /** root 操作员背书（C1）：桥接观测不到的 transport/route + 必须为 true 的人工测试标记。 */
+        const val CALIBRATION_ATTESTATION_FIELD: String = "operatorAttestation"
+
+        const val CALIBRATION_ATTESTATION_MANUAL_TEST: String = "manualTestCompleted"
+
+        val CALIBRATION_ATTESTATION_KEYS: Set<String> = setOf("transport", "route", CALIBRATION_ATTESTATION_MANUAL_TEST)
+
         /** 线格式步骤名 → 存储步骤；顺序固定，写入后得到完整证据。 */
         val CALIBRATION_STEP_KEYS: Map<String, CalibrationStep> = linkedMapOf(
             "downlinkRecognized" to CalibrationStep.DOWNLINK_RECOGNIZED,
@@ -1439,3 +1554,99 @@ internal fun machineErrorJson(code: String, message: String): String {
     root.add("error", error)
     return root.toString()
 }
+
+
+// ---------------------------------------------------------------- 校准环境/背书（Task 11E / C1）
+
+/** root 操作员为桥接观测不到的两项事实背书；词表见 [ATTESTABLE_TRANSPORTS]/[ATTESTABLE_ROUTES]。 */
+internal data class OperatorAttestation(val transport: String, val route: String)
+
+/** 校准视图里被标记为 operator_attested 的事实。 */
+internal data class AttestedFacts(
+    val operatorAttested: Boolean,
+    val transport: String?,
+    val route: String?,
+) {
+    companion object {
+        val NONE: AttestedFacts = AttestedFacts(operatorAttested = false, transport = null, route = null)
+    }
+}
+
+/** 允许的承载词表；UNKNOWN 合法，但无法满足 CalibrationPolicy 的完整性要求（继续 fail closed）。 */
+internal val ATTESTABLE_TRANSPORTS: Set<String> = setOf("CELLULAR", "VOWIFI", PlatformFacts.UNKNOWN)
+
+/** 允许的音频路由词表；UNKNOWN 同上。 */
+internal val ATTESTABLE_ROUTES: Set<String> =
+    setOf("EARPIECE", "SPEAKER", "HEADSET", "BLUETOOTH", PlatformFacts.UNKNOWN)
+
+/** 背书只填补桥接观测不到的字段：观测值是已知事实时永远以观测值为准，背书不能覆盖。 */
+internal fun applyAttestation(observed: EnvironmentKey, attestation: OperatorAttestation?): EnvironmentKey {
+    if (attestation == null) return observed
+    return observed.copy(
+        transport = if (observed.transport == PlatformFacts.UNKNOWN) attestation.transport else observed.transport,
+        route = if (observed.route == PlatformFacts.UNKNOWN) attestation.route else observed.route,
+    )
+}
+
+/**
+ * 证据环境是否属于当前观测设备：除 transport/route 外的字段必须完全一致；
+ * 观测不到的两项允许证据使用背书值，桥接能观测到的字段则必须相等。
+ */
+internal fun environmentMatchesObserved(observed: EnvironmentKey, evidence: EnvironmentKey): Boolean {
+    if (observed.apiLevel != evidence.apiLevel) return false
+    if (observed.romFingerprint != evidence.romFingerprint) return false
+    if (observed.kernelVersion != evidence.kernelVersion) return false
+    if (observed.dialerPackageVersion != evidence.dialerPackageVersion) return false
+    if (observed.frameworkVersion != evidence.frameworkVersion) return false
+    if (observed.bridgeVersion != evidence.bridgeVersion) return false
+    if (observed.audioPolicyDigest != evidence.audioPolicyDigest) return false
+    if (observed.simCarrier != evidence.simCarrier) return false
+    val transportMatches = observed.transport == PlatformFacts.UNKNOWN || observed.transport == evidence.transport
+    val routeMatches = observed.route == PlatformFacts.UNKNOWN || observed.route == evidence.route
+    return transportMatches && routeMatches
+}
+
+/** 判定环境：证据与观测设备匹配时采用证据环境（含背书），否则只用观测事实。 */
+internal fun effectiveEnvironment(
+    observed: EnvironmentKey,
+    evidenceEnvironment: EnvironmentKey?,
+): EnvironmentKey =
+    if (evidenceEnvironment != null && environmentMatchesObserved(observed, evidenceEnvironment)) {
+        evidenceEnvironment
+    } else {
+        observed
+    }
+
+/** 视图里的背书标记：只有“观测不到 + 证据值是词表内已知值”才算 operator_attested。 */
+internal fun attestedFacts(observed: EnvironmentKey, evidenceEnvironment: EnvironmentKey?): AttestedFacts {
+    if (evidenceEnvironment == null || !environmentMatchesObserved(observed, evidenceEnvironment)) {
+        return AttestedFacts.NONE
+    }
+    val transport = evidenceEnvironment.transport.takeIf { value ->
+        observed.transport == PlatformFacts.UNKNOWN &&
+            value in ATTESTABLE_TRANSPORTS &&
+            value != PlatformFacts.UNKNOWN
+    }
+    val route = evidenceEnvironment.route.takeIf { value ->
+        observed.route == PlatformFacts.UNKNOWN &&
+            value in ATTESTABLE_ROUTES &&
+            value != PlatformFacts.UNKNOWN
+    }
+    return AttestedFacts(operatorAttested = transport != null || route != null, transport = transport, route = route)
+}
+
+/**
+ * 自动接听授权（[CalibrationPolicy] 本身不变）：判定环境 = 观测环境 + root 背书；
+ * 存储读取/解析失败一律 fail closed。
+ */
+internal fun isCalibrationAuthorizedFor(store: CalibrationStore, observed: EnvironmentKey): Boolean = try {
+    val evidence = store.load()
+    if (evidence == null) {
+        false
+    } else {
+        CalibrationPolicy.canAutoAnswer(effectiveEnvironment(observed, evidence.environment), evidence)
+    }
+} catch (t: CalibrationStoreException) {
+    false
+}
+

@@ -19,6 +19,7 @@ import org.junit.Test
 import org.krvyft.agentcall.bridge.AgentCallCli
 import org.krvyft.agentcall.bridge.CliTransport
 import org.krvyft.agentcall.bridge.ControlDispatcher
+import org.krvyft.agentcall.bridge.isCalibrationAuthorizedFor
 import org.krvyft.agentcall.bridge.config.CalibrationStore
 import org.krvyft.agentcall.bridge.config.ConfigStore
 import org.krvyft.agentcall.bridge.diagnostics.AudioApiProbe
@@ -52,6 +53,12 @@ class BridgeCalibrationRpcTest {
     private val appPeer = PeerIdentity(
         uid = 10_001,
         role = PeerRole.APP,
+        packageName = "org.krvyft.agentcall",
+        signatureSha256 = "sig",
+    )
+    private val hookPeer = PeerIdentity(
+        uid = 20_002,
+        role = PeerRole.HOOK,
         packageName = "org.krvyft.agentcall",
         signatureSha256 = "sig",
     )
@@ -150,14 +157,46 @@ class BridgeCalibrationRpcTest {
     private fun recordPayload(
         expected: EnvironmentKey? = environment(),
         steps: Map<String, Boolean> = ALL_STEP_KEYS.associateWith { true },
+    ): String = recordPayloadWithAttestation(expected = expected, steps = steps, attestation = null)
+
+    private fun attestationPayload(
+        transport: String = "CELLULAR",
+        route: String = "EARPIECE",
+        manualTestCompleted: Boolean = true,
+    ): JsonObject = JsonObject().apply {
+        addProperty("transport", transport)
+        addProperty("route", route)
+        addProperty("manualTestCompleted", manualTestCompleted)
+    }
+
+    private fun recordPayloadWithAttestation(
+        attestation: JsonObject? = attestationPayload(),
+        expected: EnvironmentKey? = null,
+        steps: Map<String, Boolean> = ALL_STEP_KEYS.associateWith { true },
     ): String {
         val json = JsonObject()
         if (expected != null) json.add("expectedEnvironment", encodeEnvironment(expected))
         val stepsJson = JsonObject()
         steps.forEach { (name, passed) -> stepsJson.addProperty(name, passed) }
         json.add("steps", stepsJson)
+        if (attestation != null) json.add("operatorAttestation", attestation)
         return json.toString()
     }
+
+    private fun readView(
+        peer: PeerIdentity,
+        transport: String = "VoLTE",
+        route: String = "SWB",
+        carrier: String = "Test Carrier",
+    ): JsonObject {
+        val response = dispatcher(carrier = carrier, transport = transport, route = route)
+            .handle(peer, request(RolePolicy.METHOD_CALIBRATION_READ))
+        assertNull("unexpected error: " + response.error, response.error)
+        return JsonParser.parseString(response.payload).asJsonObject
+    }
+
+    private fun targetEnvironment(transport: String, route: String): EnvironmentKey =
+        environment().copy(transport = transport, route = route)
 
     // ------------------------------------------------------------------ record
 
@@ -299,6 +338,185 @@ class BridgeCalibrationRpcTest {
         assertNotNull(calibration.load())
     }
 
+    // ------------------------------------------------- 操作员背书（Task 11E / C1）
+
+    /**
+     * C1：桥接观测不到承载与音频路由（PlatformFacts 默认 UNKNOWN），root 操作员在
+     * calibration.record 里为这两项背书。服务端仍然自己生成其余全部环境字段与时间戳。
+     */
+    @Test
+    fun rootAttestationSuppliesOnlyTheTwoFactsTheBridgeCannotObserve() {
+        val observed = targetEnvironment(PlatformFacts.UNKNOWN, PlatformFacts.UNKNOWN)
+        val response = dispatcher(transport = PlatformFacts.UNKNOWN, route = PlatformFacts.UNKNOWN)
+            .handle(cliPeer, request(RolePolicy.METHOD_CALIBRATION_RECORD, recordPayloadWithAttestation()))
+
+        assertNull("unexpected error: " + response.error, response.error)
+        val json = JsonParser.parseString(response.payload).asJsonObject
+        assertTrue(json.get("recorded").asBoolean)
+        assertTrue("背书后的完整环境必须能通过 CalibrationPolicy", json.get("verified").asBoolean)
+        val attestation = json.getAsJsonObject("operatorAttestation")
+        assertTrue(attestation.get("operatorAttested").asBoolean)
+        assertEquals("CELLULAR", attestation.get("transport").asString)
+        assertEquals("EARPIECE", attestation.get("route").asString)
+
+        val stored = calibration.load()
+        assertNotNull(stored)
+        assertEquals(
+            "其余字段仍由服务端构建，背书的 transport/route 进入证据环境",
+            observed.copy(transport = "CELLULAR", route = "EARPIECE"),
+            stored!!.environment,
+        )
+        assertEquals("时间戳仍由服务端生成", 12_345L, stored.calibratedAtMs)
+        assertTrue(CalibrationPolicy.canAutoAnswer(stored.environment, stored))
+        assertTrue(
+            "自动接听必须用观测环境 + 背书的有效环境判定",
+            isCalibrationAuthorizedFor(calibration, observed),
+        )
+        assertFalse(
+            "CalibrationPolicy 本身不变：原始 UNKNOWN 环境仍然不能自动接听",
+            CalibrationPolicy.canAutoAnswer(observed, stored),
+        )
+    }
+
+    /**
+     * C1：calibration.read 必须把背书字段标成 operator_attested，绝不能让 UI/文档把
+     * 操作员背书当成桥接实测；观测环境与有效环境分开可见。
+     */
+    @Test
+    fun calibrationReadMarksAttestedFieldsInsteadOfPresentingThemAsMeasured() {
+        dispatcher(transport = PlatformFacts.UNKNOWN, route = PlatformFacts.UNKNOWN).handle(
+            cliPeer,
+            request(RolePolicy.METHOD_CALIBRATION_RECORD, recordPayloadWithAttestation()),
+        )
+
+        val view = readView(appPeer, transport = PlatformFacts.UNKNOWN, route = PlatformFacts.UNKNOWN)
+
+        assertTrue(view.get("verified").asBoolean)
+        assertTrue(view.get("environmentMatchesEvidence").asBoolean)
+        assertEquals(
+            "environment 只报告桥接实测（这里观测不到）",
+            PlatformFacts.UNKNOWN,
+            view.getAsJsonObject("environment").get("transport").asString,
+        )
+        assertEquals(PlatformFacts.UNKNOWN, view.getAsJsonObject("environment").get("route").asString)
+        assertEquals(
+            "effectiveEnvironment 才是判定用的环境（含背书）",
+            "CELLULAR",
+            view.getAsJsonObject("effectiveEnvironment").get("transport").asString,
+        )
+        assertEquals("EARPIECE", view.getAsJsonObject("effectiveEnvironment").get("route").asString)
+        val attestation = view.getAsJsonObject("operatorAttestation")
+        assertTrue(attestation.get("operatorAttested").asBoolean)
+        assertEquals("CELLULAR", attestation.get("transport").asString)
+        assertEquals("EARPIECE", attestation.get("route").asString)
+    }
+
+    @Test
+    fun unpresentedFactsAreNeverMarkedOperatorAttested() {
+        val view = readView(appPeer, transport = PlatformFacts.UNKNOWN, route = PlatformFacts.UNKNOWN)
+
+        assertFalse(view.getAsJsonObject("operatorAttestation").get("operatorAttested").asBoolean)
+        assertTrue(view.getAsJsonObject("operatorAttestation").get("transport").isJsonNull)
+        assertTrue(view.getAsJsonObject("operatorAttestation").get("route").isJsonNull)
+        assertFalse("观测环境缺字段时 environmentComplete 必须为 false", view.get("environmentComplete").asBoolean)
+        assertFalse(view.get("verified").asBoolean)
+    }
+
+    @Test
+    fun recordWithoutAttestationStaysClosedWhenTheBridgeCannotObserveTransportOrRoute() {
+        assertEquals(
+            "calibration_environment_unknown",
+            dispatcher(transport = PlatformFacts.UNKNOWN, route = PlatformFacts.UNKNOWN)
+                .handle(cliPeer, request(RolePolicy.METHOD_CALIBRATION_RECORD, recordPayload()))
+                .error?.code,
+        )
+        assertNull(calibration.load())
+
+        assertEquals(
+            "只缺一项同样必须失败关闭",
+            "calibration_environment_unknown",
+            dispatcher(transport = PlatformFacts.UNKNOWN, route = "SWB")
+                .handle(cliPeer, request(RolePolicy.METHOD_CALIBRATION_RECORD, recordPayload()))
+                .error?.code,
+        )
+        assertNull(calibration.load())
+    }
+
+    @Test
+    fun onlyCliRootCanAttest() {
+        for (peer in listOf(appPeer, hookPeer)) {
+            val response = dispatcher(transport = PlatformFacts.UNKNOWN, route = PlatformFacts.UNKNOWN)
+                .handle(peer, request(RolePolicy.METHOD_CALIBRATION_RECORD, recordPayloadWithAttestation()))
+            assertEquals("背书只能由 CLI_ROOT 发起", "forbidden", response.error?.code)
+        }
+        assertNull("APP/HOOK 的背书绝不能落盘", calibration.load())
+    }
+
+    @Test
+    fun recordRejectsAttestationsOutsideTheFixedVocabulary() {
+        val invalid = listOf(
+            attestationPayload(transport = "VoLTE"),
+            attestationPayload(transport = "cell"),
+            attestationPayload(transport = ""),
+            attestationPayload(route = "SWB"),
+            attestationPayload(route = "speaker"),
+            attestationPayload(manualTestCompleted = false),
+            JsonObject().apply {
+                addProperty("transport", "CELLULAR")
+                addProperty("route", "EARPIECE")
+            },
+            attestationPayload().apply { addProperty("extra", "x") },
+            JsonObject().apply {
+                addProperty("transport", "CELLULAR")
+                addProperty("route", "EARPIECE")
+                addProperty("manualTestCompleted", "true")
+            },
+        )
+        for (attestation in invalid) {
+            val response = dispatcher(transport = PlatformFacts.UNKNOWN, route = PlatformFacts.UNKNOWN)
+                .handle(
+                    cliPeer,
+                    request(RolePolicy.METHOD_CALIBRATION_RECORD, recordPayloadWithAttestation(attestation = attestation)),
+                )
+            assertEquals("payload_invalid", response.error?.code)
+            assertNull("被拒绝的背书绝不能落盘", calibration.load())
+        }
+    }
+
+    @Test
+    fun attestedEvidenceInvalidatesWhenTheDeviceEnvironmentChanges() {
+        dispatcher(transport = PlatformFacts.UNKNOWN, route = PlatformFacts.UNKNOWN).handle(
+            cliPeer,
+            request(RolePolicy.METHOD_CALIBRATION_RECORD, recordPayloadWithAttestation()),
+        )
+        val observed = targetEnvironment(PlatformFacts.UNKNOWN, PlatformFacts.UNKNOWN)
+        assertTrue(isCalibrationAuthorizedFor(calibration, observed))
+
+        val changedCarrier = observed.copy(simCarrier = "Other Carrier")
+        assertFalse(isCalibrationAuthorizedFor(calibration, changedCarrier))
+        val view = readView(
+            appPeer,
+            transport = PlatformFacts.UNKNOWN,
+            route = PlatformFacts.UNKNOWN,
+            carrier = "Other Carrier",
+        )
+        assertFalse(view.get("verified").asBoolean)
+        assertTrue(
+            "环境变化必须显式报告 ENVIRONMENT_MISMATCH",
+            view.getAsJsonArray("blockers").map { it.asString }
+                .contains(CalibrationBlocker.ENVIRONMENT_MISMATCH.name),
+        )
+        assertFalse(
+            "陈旧环境绝不能继续显示成 operator_attested",
+            view.getAsJsonObject("operatorAttestation").get("operatorAttested").asBoolean,
+        )
+
+        assertFalse(
+            "桥接开始观测到不同的已知承载时，旧背书必须失效",
+            isCalibrationAuthorizedFor(calibration, targetEnvironment("VOWIFI", PlatformFacts.UNKNOWN)),
+        )
+    }
+
     // ------------------------------------------------------------------ read
 
     @Test
@@ -312,17 +530,25 @@ class BridgeCalibrationRpcTest {
 
         assertEquals(
             setOf(
+                "available",
                 "supportedApiLevel",
                 "environment",
+                "effectiveEnvironment",
                 "environmentComplete",
                 "verified",
                 "blockers",
                 "evidenceEnvironment",
                 "environmentMatchesEvidence",
+                "operatorAttestation",
                 "steps",
                 "calibratedAtMs",
             ),
             view.keySet(),
+        )
+        assertTrue(view.get("available").asBoolean)
+        assertEquals(
+            setOf("operatorAttested", "transport", "route"),
+            view.getAsJsonObject("operatorAttestation").keySet(),
         )
         assertEquals(37, view.get("supportedApiLevel").asInt)
         assertTrue(view.get("environmentComplete").asBoolean)
@@ -372,6 +598,37 @@ class BridgeCalibrationRpcTest {
             assertTrue("step " + key + " must be verified", steps.get(key).asBoolean)
         }
         assertEquals(environment(), decodeEnvironment(view.getAsJsonObject("environment")))
+    }
+
+    /**
+     * C1：APP 侧的 calibration.read 目前没有生产消费者。为了让已有 UI 探针不改 RPC 面
+     * 就能读到同样的数据，status/diagnose 内嵌**完全相同**的校准视图（含背书标记）。
+     */
+    @Test
+    fun statusAndDiagnoseEmbedTheExactCalibrationReadView() {
+        val current = dispatcher()
+
+        fun call(peer: PeerIdentity, method: String): JsonObject {
+            val response = current.handle(peer, request(method))
+            assertNull("unexpected error: " + response.error, response.error)
+            return JsonParser.parseString(response.payload).asJsonObject
+        }
+
+        val read = call(appPeer, RolePolicy.METHOD_CALIBRATION_READ)
+        val status = call(appPeer, RolePolicy.METHOD_STATUS)
+        val diagnose = call(appPeer, RolePolicy.METHOD_DIAGNOSE)
+
+        assertEquals(
+            "status.calibration 必须与 calibration.read 完全一致",
+            read,
+            status.getAsJsonObject("calibration"),
+        )
+        assertEquals(
+            "diagnose.calibration 必须与 calibration.read 完全一致",
+            read,
+            diagnose.getAsJsonObject("calibration"),
+        )
+        assertTrue(status.getAsJsonObject("calibration").get("available").asBoolean)
     }
 
     private fun decodeEnvironment(json: JsonObject): EnvironmentKey = EnvironmentKey(

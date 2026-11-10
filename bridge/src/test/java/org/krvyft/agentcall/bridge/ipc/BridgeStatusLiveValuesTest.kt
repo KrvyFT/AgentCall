@@ -63,7 +63,10 @@ class BridgeStatusLiveValuesTest {
         baseDir.deleteRecursively()
     }
 
-    private fun dispatcher(dialer: () -> DialerDefaultRole = { DialerDefaultRole.UNKNOWN }): ControlDispatcher =
+    private fun dispatcher(
+        dialer: () -> DialerDefaultRole = { DialerDefaultRole.UNKNOWN },
+        shutdownCode: () -> String? = { null },
+    ): ControlDispatcher =
         ControlDispatcher(
             store = store,
             packages = packages,
@@ -87,6 +90,7 @@ class BridgeStatusLiveValuesTest {
             startedAtMs = 0L,
             connectionStats = { 0 to 0L },
             dialerDefaultRole = dialer,
+            shutdownCode = shutdownCode,
         )
 
     private fun statusJson(dialer: () -> DialerDefaultRole = { DialerDefaultRole.UNKNOWN }): JsonObject {
@@ -113,6 +117,23 @@ class BridgeStatusLiveValuesTest {
         val element = json.get(name)
         assertTrue("$name 必须序列化为 JSON 字符串：$element", element is JsonPrimitive && element.isString)
         return (element as JsonPrimitive).asString
+    }
+
+    /**
+     * Task 11E（minor）：进程退出后内存里的 shutdownCode 不可读；生产装配改为从监督状态
+     * 文件恢复上一次的机器码。这里锁住 status 的投影（来源由 BridgeRuntime 注入）。
+     */
+    @Test
+    fun statusReportsTheShutdownCodeRecoveredAfterExit() {
+        val response = dispatcher(shutdownCode = { "shutdown_microphone_still_isolated" }).handle(
+            cliPeer,
+            RpcRequest(id = "req-status", method = RolePolicy.METHOD_STATUS),
+        )
+        assertNull(response.error)
+
+        val json = JsonParser.parseString(response.payload).asJsonObject
+
+        assertEquals("shutdown_microphone_still_isolated", stringField(json, "shutdownCode"))
     }
 
     @Test

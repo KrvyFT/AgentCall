@@ -174,11 +174,13 @@ class SessionEventsRpcTest {
             "shutdownCode",
             "hookConnected",
             "dialerDefaultRole",
+            // Task 11E：校准视图内嵌（与 calibration.read 完全一致），APP 侧无需新 RPC 面。
+            "calibration",
         )) {
             assertTrue("status 缺少字段 " + key, app.has(key))
         }
         assertEquals(1, app.get("protocolVersion").asInt)
-        assertEquals(17, app.keySet().size)
+        assertEquals(18, app.keySet().size)
     }
 
     /**
@@ -239,6 +241,7 @@ class SessionEventsRpcTest {
             assertTrue("diagnose.environment 缺少字段 " + key, environment.has(key))
         }
         assertTrue(json.has("downlinkExtraction"))
+        assertTrue("diagnose 必须内嵌校准视图（含背书标记）", json.has("calibration"))
         assertFalse("diagnose 不得包含任何密钥字段", json.has("secrets"))
     }
 
