@@ -14,3 +14,9 @@
 .cxx
 local.properties
 .kotlin/
+
+# 发布产物与打包检查生成物（tools/package.py + :bridge:packageRuntime）
+/dist/
+/bridge/build/outputs/agentcall/
+__pycache__/
+*.pyc
