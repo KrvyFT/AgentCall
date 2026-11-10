@@ -54,7 +54,14 @@ class ServiceBootstrapTest {
             },
             calibration = CalibrationProbe {
                 calibrationCalls.incrementAndGet()
-                calibration
+                if (calibration) {
+                    CalibrationAssessment(allowed = true)
+                } else {
+                    CalibrationAssessment(
+                        allowed = false,
+                        blockers = listOf(BootstrapBlocker.CALIBRATION_BLOCKED.code),
+                    )
+                }
             },
             network = NetworkProbe {
                 networkCalls.incrementAndGet()
@@ -182,7 +189,7 @@ class ServiceBootstrapTest {
             hook = HookPresenceProbe { HookPresence.PRESENT },
             dialer = DialerDefaultRoleProbe { true },
             config = ConfigProbe { ConfigFacts(enabled = true, valid = true, voiceCapable = true) },
-            calibration = CalibrationProbe { true },
+            calibration = CalibrationProbe { CalibrationAssessment(allowed = true) },
             network = NetworkProbe { true },
         )
         val bootstrap = ServiceBootstrap(probes, probeTimeoutMs = 100L)

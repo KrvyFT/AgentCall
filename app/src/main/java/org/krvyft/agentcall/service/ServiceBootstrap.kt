@@ -148,7 +148,12 @@ enum class BootstrapBlocker(val code: String) {
     /** ASR/LLM/TTS 三项语音端点不齐备（CONFIG_INVALID 不含端点检查）。 */
     CONFIG_VOICE_UNSUPPORTED("config_voice_unsupported"),
 
-    /** 校准策略不允许自动接听（环境/人工测试证据不满足）。 */
+    /**
+     * 校准策略不允许自动接听（环境/人工测试证据不满足）。
+     *
+     * 具体原因（桥接视图的 `calibration_*` 细节码）在
+     * [BootstrapDecision.calibrationBlockers] / [BootstrapDecision.statusCodes] 里。
+     */
     CALIBRATION_BLOCKED("calibration_not_verified"),
 
     /** 当前没有已验证的可用网络。 */
@@ -167,8 +172,24 @@ data class BootstrapDecision(
     val supervisionPhase: String? = null,
     /** status 是否真的读到（false 表示 hook/dialer 都是“不可用”，不是“离线”）。 */
     val statusAvailable: Boolean = false,
+    /**
+     * 校准未通过的细节机器码（Task 11H2；例如 `calibration_environment_mismatch`）。
+     *
+     * 只有 [blockers] 含 [BootstrapBlocker.CALIBRATION_BLOCKED] 时才可能有内容；顺序稳定、
+     * 已去重。UI 的未就绪文本直接渲染 [statusCodes]，因此这些原因对用户可见。
+     */
+    val calibrationBlockers: List<String> = emptyList(),
 ) {
     val codes: List<String> get() = blockers.map { it.code }
+
+    /**
+     * UI/通知渲染的完整未就绪码：先门禁码（顺序固定），再校准细节（去重）。
+     *
+     * 校准细节**不**进入 [blockers]（那是门禁枚举，顺序契约由 [BootstrapPolicy] 固定）；
+     * 它们只作为同一份诊断文本的补充，绝不改变“是否就绪”的裁决。
+     */
+    val statusCodes: List<String>
+        get() = (codes + calibrationBlockers).distinct()
 }
 
 /**
@@ -229,9 +250,33 @@ fun interface ConfigProbe {
     suspend fun read(): ConfigFacts
 }
 
-/** 校准/环境策略（生产实现：桥接 diagnose 的环境 + 人工校准证据 + CalibrationPolicy）。 */
+/**
+ * 一次校准判定（Task 11H2）。
+ *
+ * [allowed] 为 true 当且仅当**桥接裁决**（见 [BridgeCalibrationView.authorizesAutoAnswer]）
+ * 与 APP 本机证据（core [CalibrationPolicy]）同时成立；[blockers] 是未满足项的固定机器码，
+ * 供 UI/诊断渲染（未知码原样显示，绝不粉饰成“正常”）。
+ */
+data class CalibrationAssessment(
+    val allowed: Boolean,
+    val blockers: List<String> = emptyList(),
+) {
+    companion object {
+        /** 探针失败/超时：桥接裁决未知，必须 fail closed 且给出可显示的原因。 */
+        fun unavailable(): CalibrationAssessment = CalibrationAssessment(
+            allowed = false,
+            blockers = listOf(BridgeCalibrationView.CALIBRATION_UNAVAILABLE),
+        )
+    }
+}
+
+/**
+ * 校准/环境策略（生产实现 [BridgeCalibrationProbe]：桥接 calibration.read 的授权视图 +
+ * diagnose 的环境 + 人工校准证据 + core CalibrationPolicy）。
+ */
 fun interface CalibrationProbe {
-    suspend fun canAutoAnswer(): Boolean
+    /** 每次就绪复评都重新判定；绝不缓存上一轮的 true。 */
+    suspend fun assess(): CalibrationAssessment
 }
 
 /** 网络可达性（生产实现：ConnectivityManager 的 VALIDATED + INTERNET 能力）。 */
@@ -295,12 +340,15 @@ class ServiceBootstrap(
         } else {
             probe("supervision") { probes.supervision.phase() }
         }
+        // 桥接校准裁决每次复评都重读（calibration.read）；探针超时/异常 ⇒ 未知，fail closed。
+        val calibration = probe("calibration") { probes.calibration.assess() }
+            ?: CalibrationAssessment.unavailable()
         val facts = ReadinessFacts(
             bridgeReady = probe("bridge") { probes.bridge.isReachable() } ?: false,
             hookPresence = hookPresence,
             dialerDefaultRole = dialerDefaultRole,
             config = probe("config") { probes.config.read() } ?: ConfigFacts.UNAVAILABLE,
-            calibrationAllowed = probe("calibration") { probes.calibration.canAutoAnswer() } ?: false,
+            calibrationAllowed = calibration.allowed,
             networkReachable = probe("network") { probes.network.isOnline() } ?: false,
             supervisionPhase = supervisionPhase,
         )
@@ -309,6 +357,11 @@ class ServiceBootstrap(
             dialerDefaultRole = dialerDefaultRole,
             supervisionPhase = supervisionPhase,
             statusAvailable = live?.statusAvailable ?: false,
+            calibrationBlockers = if (calibration.allowed) {
+                emptyList()
+            } else {
+                calibration.blockers.distinct()
+            },
         )
         for (blocker in decision.blockers) logger("bootstrap.not_ready code=" + blocker.code)
         return decision
@@ -366,29 +419,62 @@ class BridgeLiveFactsProbe(
 }
 
 /**
- * 生产校准探针：真实 diagnose 的 [EnvironmentKey] + 本机人工证据 + core [CalibrationPolicy]
- * + **桥接校准授权**（Task 7B3）。
+ * 生产校准探针（Task 11H2）：**桥接 calibration.read 的授权视图** + 真实 diagnose 的
+ * [EnvironmentKey] + 本机人工证据 + core [CalibrationPolicy]。
  *
- * 为什么多一个 [bridgeCalibrationVerified] 输入：桥接的 `CalibrationStore` 才是
- * `prepareAnswer` 授权的唯一权威（`AutoAnswerAuthorization`），而它目前**没有任何
- * 可读/可写通道**。APK 本机勾选五项人工测试不等于桥接已放行；若只看本机证据，服务会
- * 宣布 READY，却在真正接听时被桥接拒绝。因此生产装配显式传入 `{ false }`，就绪保持
- * NOT_READY（`calibration_not_verified`），直到桥接提供一条可验证的校准读写通道。
+ * 判定顺序（任一失败都 false，绝不伪造 true）：
+ * 1. 桥接视图必须满足 [BridgeCalibrationView.authorizesAutoAnswer]：
+ *    `supported && verified && environmentComplete && environmentMatchesEvidence`。
+ *    桥接的 `CalibrationStore` 才是 `prepareAnswer` 授权的唯一权威；`verified` 由桥接按
+ *    **有效环境**（观测 + root 背书）与持久证据计算，APP 不再猜测。
+ * 2. APP 本机证据仍过 core [CalibrationPolicy]：五项人工测试 + 时间戳 + 环境精确绑定。
+ *    这两道门禁互为补充，缺一不可（桥接裁决对桥接证据权威，本机门禁对本机证据权威）。
  *
- * 这不是“永久禁用”：未来通道落地时，把 [bridgeCalibrationVerified] 换成真实读取即可，
- * 其余判定（环境绑定、API 37、五项证据、时间戳）完全复用 [CalibrationPolicy]。
+ * 未知/缺失/传输失败由 [readCalibration] 表达为 [BridgeRead.Unavailable]，这里直接
+ * 返回 `calibration_unavailable`；绝不把“读不到”当成“已验证”，也绝不缓存上一轮的 true。
+ * 每次就绪复评（15 s 循环 / 接听前复检）都会重新读取桥接裁决。
  */
 class BridgeCalibrationProbe(
+    private val readCalibration: suspend () -> BridgeRead<BridgeCalibrationView>,
     private val environment: suspend () -> EnvironmentKey?,
     private val evidenceFor: (EnvironmentKey) -> CalibrationEvidence?,
-    private val bridgeCalibrationVerified: suspend () -> Boolean,
 ) : CalibrationProbe {
 
-    override suspend fun canAutoAnswer(): Boolean {
-        val current = environment() ?: return false
-        if (!bridgeCalibrationVerified()) return false
-        val evidence = evidenceFor(current) ?: return false
-        return CalibrationPolicy.canAutoAnswer(current, evidence)
+    override suspend fun assess(): CalibrationAssessment {
+        val view = when (val result = readCalibration()) {
+            is BridgeRead.Unavailable -> return CalibrationAssessment(
+                allowed = false,
+                blockers = listOf(BridgeCalibrationView.CALIBRATION_UNAVAILABLE),
+            )
+            is BridgeRead.Available -> result.value
+        }
+        // 桥接裁决是桥接证据的权威：四个字段缺一不可。
+        if (!view.authorizesAutoAnswer) return CalibrationAssessment(false, view.readinessBlockers())
+
+        // APP 本机证据门禁保持不变（环境绑定/API 37/五项证据/时间戳）。
+        val current = environment() ?: return CalibrationAssessment(
+            allowed = false,
+            blockers = listOf(CALIBRATION_ENVIRONMENT_UNKNOWN),
+        )
+        val evidence = evidenceFor(current) ?: return CalibrationAssessment(
+            allowed = false,
+            blockers = listOf(CALIBRATION_LOCAL_EVIDENCE_MISSING),
+        )
+        if (!CalibrationPolicy.canAutoAnswer(current, evidence)) {
+            return CalibrationAssessment(
+                allowed = false,
+                blockers = listOf(BridgeCalibrationView.CALIBRATION_NOT_VERIFIED),
+            )
+        }
+        return CalibrationAssessment(allowed = true)
+    }
+
+    companion object {
+        /** diagnose 环境不可用/不完整：本机证据无法绑定，保持 NOT_READY。 */
+        const val CALIBRATION_ENVIRONMENT_UNKNOWN: String = "calibration_environment_unknown"
+
+        /** 本机没有可用的五项人工测试证据。 */
+        const val CALIBRATION_LOCAL_EVIDENCE_MISSING: String = "calibration_local_evidence_missing"
     }
 }
 

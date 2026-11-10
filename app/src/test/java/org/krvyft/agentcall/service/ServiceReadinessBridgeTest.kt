@@ -28,8 +28,9 @@ import org.krvyft.agentcall.ipc.ControlTransport
  * - hookConnected/dialerDefaultRole/supervisionPhase 都来自桥接的真实 status，不再有
  *   “APP 读不到所以永远 unknown”的占位探针；status 不可用时仍是 UNKNOWN/null（fail closed）；
  * - 校准环境来自真实 diagnose 的 EnvironmentKey；环境不完整/不可用一律不允许自动接听；
- * - **真机仍会 NOT_READY（calibration_not_verified）**：桥接 CalibrationStore（prepareAnswer
- *   的唯一权威）没有任何可读/可写通道，本机勾选不能解锁服务就绪。绝不伪造授权。
+ * - 桥接 CalibrationStore（prepareAnswer 的唯一权威）的裁决经 `calibration.read` 进入
+ *   [BridgeCalibrationProbe]：只有桥接授权视图与本机证据同时成立才解锁 READY；
+ *   桥接不可用/未验证时绝不伪造授权（Task 11H2）。
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class ServiceReadinessBridgeTest {
@@ -165,12 +166,15 @@ class ServiceReadinessBridgeTest {
         val environment = readEnvironment(client)
         assertNotNull(environment)
         val probe = BridgeCalibrationProbe(
+            readCalibration = { BridgeRead.Available(calibrationVerified()) },
             environment = { environment },
             evidenceFor = { env -> completeEvidence(env) },
-            bridgeCalibrationVerified = { true },
         )
 
-        assertTrue(probe.canAutoAnswer())
+        val assessment = probe.assess()
+
+        assertTrue(assessment.allowed)
+        assertEquals(emptyList<String>(), assessment.blockers)
         assertEquals(listOf("diagnose"), control.requests.map { it.method })
         client.close()
     }
@@ -181,27 +185,37 @@ class ServiceReadinessBridgeTest {
             RpcResponse(id = request.id, error = RpcError("forbidden", "denied"))
         })
         val probe = BridgeCalibrationProbe(
+            readCalibration = { BridgeRead.Available(calibrationVerified()) },
             environment = { readEnvironment(client) },
             evidenceFor = { env -> completeEvidence(env) },
-            bridgeCalibrationVerified = { true },
         )
-        assertFalse(probe.canAutoAnswer())
+        val assessment = probe.assess()
+        assertFalse(assessment.allowed)
+        assertEquals(
+            listOf(BridgeCalibrationProbe.CALIBRATION_ENVIRONMENT_UNKNOWN),
+            assessment.blockers,
+        )
 
-        val incomplete = BridgeCalibrationProbe(
-            environment = { readEnvironment(client) },
+        val noEvidence = BridgeCalibrationProbe(
+            readCalibration = { BridgeRead.Available(calibrationVerified()) },
+            environment = { COMPLETE_ENVIRONMENT },
             evidenceFor = { null },
-            bridgeCalibrationVerified = { true },
         )
-        assertFalse(incomplete.canAutoAnswer())
+        val noEvidenceAssessment = noEvidence.assess()
+        assertFalse(noEvidenceAssessment.allowed)
+        assertEquals(
+            listOf(BridgeCalibrationProbe.CALIBRATION_LOCAL_EVIDENCE_MISSING),
+            noEvidenceAssessment.blockers,
+        )
         client.close()
     }
 
     /**
-     * 真机阻塞：APK 本机五项证据即使齐全，桥接也没有任何读取/写入校准授权的通道，
-     * 服务就绪必须保持 NOT_READY（calibration_not_verified），绝不伪造授权。
+     * 桥接裁决是桥接证据的权威：本机五项证据即使齐全，桥接不可用/未验证时仍必须
+     * NOT_READY（calibration_not_verified），绝不伪造授权。
      */
     @Test
-    fun localCalibrationEvidenceCannotUnlockReadinessWithoutABridgeWritePath() = runTest {
+    fun unavailableBridgeCalibrationCannotBeReplacedByLocalEvidence() = runTest {
         val control = FakeTransport { request ->
             when (request.method) {
                 "diagnose" -> RpcResponse(id = request.id, payload = DIAGNOSE_OK)
@@ -212,17 +226,16 @@ class ServiceReadinessBridgeTest {
         val environment = readEnvironment(client)
         assertNotNull("the real diagnose environment must be readable", environment)
         val localOnly = BridgeCalibrationProbe(
+            readCalibration = { BridgeRead.Available(calibrationVerified()) },
             environment = { environment },
             evidenceFor = { env -> completeEvidence(env) },
-            bridgeCalibrationVerified = { true },
         )
-        assertTrue("the local evidence itself is complete and bound", localOnly.canAutoAnswer())
+        assertTrue("the local evidence itself is complete and bound", localOnly.assess().allowed)
 
-        // 生产装配：bridgeCalibrationVerified 恒为 false（没有可读的桥接校准授权）。
         val productionCalibration = BridgeCalibrationProbe(
+            readCalibration = { BridgeRead.Unavailable("forbidden") },
             environment = { environment },
             evidenceFor = { env -> completeEvidence(env) },
-            bridgeCalibrationVerified = { false },
         )
         val bootstrap = bootstrap(
             live = BridgeLiveFactsProbe { client.status() },
@@ -233,6 +246,10 @@ class ServiceReadinessBridgeTest {
 
         assertFalse("a real device must stay NOT_READY here", decision.ready)
         assertEquals(listOf(BootstrapBlocker.CALIBRATION_BLOCKED), decision.blockers)
+        assertEquals(
+            listOf(BridgeCalibrationView.CALIBRATION_UNAVAILABLE),
+            decision.calibrationBlockers,
+        )
         assertEquals("IDLE", decision.supervisionPhase)
         client.close()
     }
@@ -249,7 +266,12 @@ class ServiceReadinessBridgeTest {
                     ),
                 )
             },
-            calibration = CalibrationProbe { false },
+            calibration = CalibrationProbe {
+                CalibrationAssessment(
+                    allowed = false,
+                    blockers = listOf(BootstrapBlocker.CALIBRATION_BLOCKED.code),
+                )
+            },
             config = ConfigFacts(enabled = true, valid = true, voiceCapable = false),
         )
         val decision = bootstrap.evaluate()
@@ -265,7 +287,7 @@ class ServiceReadinessBridgeTest {
 
     private fun TestScope.bootstrap(
         live: LiveFactsProbe,
-        calibration: CalibrationProbe = CalibrationProbe { true },
+        calibration: CalibrationProbe = CalibrationProbe { CalibrationAssessment(allowed = true) },
         config: ConfigFacts = ConfigFacts(enabled = true, valid = true, voiceCapable = true),
     ): ServiceBootstrap = ServiceBootstrap(
         ReadinessProbes(
@@ -283,6 +305,14 @@ class ServiceReadinessBridgeTest {
 
     private suspend fun readEnvironment(client: BridgeClient): EnvironmentKey? =
         (client.diagnose() as? BridgeRead.Available)?.value
+
+    private fun calibrationVerified(): BridgeCalibrationView = BridgeCalibrationView(
+        available = true,
+        supportedApiLevel = 37,
+        verified = true,
+        environmentComplete = true,
+        environmentMatchesEvidence = true,
+    )
 
     private fun completeEvidence(environment: EnvironmentKey): CalibrationEvidence = CalibrationEvidence(
         environment = environment,
@@ -316,6 +346,19 @@ class ServiceReadinessBridgeTest {
     }
 
     private companion object {
+        val COMPLETE_ENVIRONMENT = EnvironmentKey(
+            apiLevel = 37,
+            romFingerprint = "fp",
+            kernelVersion = "6.1",
+            dialerPackageVersion = "1",
+            frameworkVersion = "82",
+            bridgeVersion = "1.0",
+            audioPolicyDigest = "digest",
+            simCarrier = "carrier",
+            transport = "VoLTE",
+            route = "handset",
+        )
+
         const val STATUS_OK: String = "{\"bridgeVersion\":\"1.0\",\"protocolVersion\":1," +
             "\"revision\":3,\"enabled\":true,\"paired\":true,\"uptimeMs\":1," +
             "\"activeConnections\":0,\"rejectedConnections\":0," +

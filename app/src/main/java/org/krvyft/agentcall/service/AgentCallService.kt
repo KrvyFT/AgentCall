@@ -53,7 +53,12 @@ data class AgentCallStatus(
     val foregroundError: String? = null,
     /** 全部就绪事实满足；只有 true 时协调器才可能自动接听。 */
     val ready: Boolean = false,
-    /** 未就绪的固定机器码列表（顺序稳定）。 */
+    /**
+     * 未就绪的固定机器码列表（顺序稳定）。
+     *
+     * Task 11H2 起还可能包含桥接校准的细节码（例如 `calibration_environment_mismatch`）；
+     * UI 的未就绪文本直接逐条渲染，未知码原样显示，绝不粉饰成“正常”。
+     */
     val blockers: List<String> = emptyList(),
     /** HOOK 心跳存在性三态。 */
     val hookPresence: HookPresence = HookPresence.UNKNOWN,
@@ -173,8 +178,11 @@ object AgentCallRuntime {
  *   投给协调器（保留原响铃）；
  * - 真实来电路径由 [SessionEventPoller] 提供：轮询 `session.events`（Task 7C）→ 映射成
  *   [SessionEvent.StateChanged] → 协调器；协调器自己的 reducer 决定是否以及何时接听；
- * - 真机仍会是 NOT_READY（`calibration_not_verified`）：桥接 CalibrationStore 没有可验证的
- *   读写通道，APK 本机校准勾选不能解锁服务就绪。这是 fail closed，不是假成功。
+ * - 校准就绪来自桥接的只读授权视图（`calibration.read`）：`supported && verified &&
+ *   environmentComplete && environmentMatchesEvidence` 全部成立、且 APP 本机五项证据仍通过
+ *   core `CalibrationPolicy` 时，才不再报告 `calibration_not_verified`。未知/缺失/传输失败
+ *   一律 false（fail closed），绝不把“读不到”当成“已验证”。细节机器码（例如
+ *   `calibration_environment_mismatch`）随未就绪码一起显示。
  *
  * ## 生命周期
  * - [BridgeClient]、[SessionCoordinator] 与 [SessionEventPoller] 懒创建、在 [onDestroy] 关闭
@@ -197,6 +205,7 @@ class AgentCallService : Service() {
     private var notificationManager: NotificationManager? = null
 
     private var bridge: BridgeClient? = null
+    private var calibrationReader: BridgeCalibrationReader? = null
     private var coordinator: SessionCoordinator? = null
     private var poller: SessionEventPoller? = null
     private var bootstrapJob: Job? = null
@@ -250,14 +259,19 @@ class AgentCallService : Service() {
         coordinator = null
         val client = bridge
         bridge = null
-        // close() 只关 PCM lane 与控制传输，是本地 IO；绝不在主线程 runBlocking（ANR 风险）。
+        val reader = calibrationReader
+        calibrationReader = null
+        // close() 只关 PCM lane / 控制传输，是本地 IO；绝不在主线程 runBlocking（ANR 风险）。
         // 收尾有界（CLIENT_CLOSE_TIMEOUT_MS），完成后才取消服务 scope。
-        if (client == null) {
+        if (client == null && reader == null) {
             scope.cancel()
         } else {
             CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
                 try {
-                    withTimeoutOrNull(CLIENT_CLOSE_TIMEOUT_MS) { runCatching { client.close() } }
+                    withTimeoutOrNull(CLIENT_CLOSE_TIMEOUT_MS) {
+                        runCatching { reader?.close() }
+                        if (client != null) runCatching { client.close() }
+                    }
                 } finally {
                     scope.cancel()
                 }
@@ -315,18 +329,20 @@ class AgentCallService : Service() {
         )
         val evidence = CalibrationEvidenceStore(this)
         val liveFacts = BridgeLiveFactsProbe { client.status() }
+        // 桥接 CalibrationStore 是 prepareAnswer 的授权权威；`calibration.read` 是它的只读视图。
+        // 独立客户端（同一条控制 socket 协议、同一套每方法超时），不复用 BridgeClient 的
+        // status 投影——那里刻意只保留稳定标量字段。
+        val calibrationClient = BridgeCalibrationReader(logger = ::log)
+        calibrationReader = calibrationClient
         val probes = ReadinessProbes(
             bridge = BridgeProbe { client.ensureReady() },
             hook = liveFacts,
             dialer = liveFacts,
             config = RedactedConfigProbe { client.readRedactedConfig() },
             calibration = BridgeCalibrationProbe(
+                readCalibration = { calibrationClient.read() },
                 environment = { (client.diagnose() as? BridgeRead.Available)?.value },
                 evidenceFor = { environment -> evidence.evidenceFor(environment) },
-                // 桥接 CalibrationStore（prepareAnswer 的授权权威）没有任何可读/可写通道：
-                // APK 本机勾选不能解锁服务就绪，真机保持 NOT_READY（calibration_not_verified）。
-                // 该通道落地后只需换成真实读取，其余判定仍由 CalibrationPolicy 决定。
-                bridgeCalibrationVerified = { false },
             ),
             network = AndroidNetworkProbe(this),
             live = liveFacts,
@@ -425,10 +441,12 @@ class AgentCallService : Service() {
         // 就绪判定同时带回它观测到的真实 status 事实（hookConnected，监督端 5000 ms 窗口
         // 内的结论 / dialerDefaultRole / supervisionPhase），UI 与通知直接使用，
         // 不再多读一次 status，也不会把“不可用”显示成“在线”。
+        // statusCodes 含校准细节（如 calibration_environment_mismatch）：UI 的未就绪文本
+        // 直接渲染它们，未知码原样显示，绝不粉饰成“正常”。
         AgentCallRuntime.update {
             it.copy(
                 ready = decision.ready,
-                blockers = decision.codes,
+                blockers = decision.statusCodes,
                 foregroundActive = foregroundStarted,
                 statusAvailable = decision.statusAvailable,
                 hookPresence = decision.hookPresence,
