@@ -119,17 +119,19 @@ su -c /data/adb/modules/agentcall/bin/agentcallctl pair org.krvyft.agentcall
 ## 5. 配置与 WebUI（未验证）
 
 KernelSU 管理器里打开 AgentCall 模块的 WebUI（静态资源随模块安装，无在线 CDN）。
-WebUI 只调用模块内的固定包装器 `bin/agentcallctl` 六条命令，不接受任意 shell：
+WebUI 只调用模块内的固定包装器 `bin/agentcallctl` 六条命令，不接受任意 shell；
+包装器另有 root 操作员命令 `calibrate`（JSON 只从 stdin 进入）与模块侧 `restart`：
 
 ```
 status | config-get | config-set（JSON 从 stdin） | pair | diagnose | shutdown
+calibrate（JSON 从 stdin；只作为 root 操作员命令，WebUI 不调用） | restart（模块侧重启）
 ```
 
 能力状态：
 
 | 状态 | 条件 | 能力 |
 | --- | --- | --- |
-| `kernelsu` | `ksu.exec` + `ksu.io()` v1 + 模块目录可信 | 全部六条命令，保存可用 |
+| `kernelsu` | `ksu.exec` + `ksu.io()` v1 + 模块目录可信 | WebUI 的六条命令，保存可用 |
 | `readonly` | 缺少 `ksu.io()` | 读取/诊断/配对/关闭可用，**保存被拒绝** |
 | `readonly` | `moduleInfo()` 明确给出不可信 `moduleDir` | 依赖模块目录的命令禁用，固定路径日志仍可读 |
 | `demo` | 普通浏览器无管理器注入 | 明确标注模拟数据，不发起任何请求 |
@@ -184,13 +186,46 @@ WebUI 的「连接测试」按钮只做本地地址格式校验，**不发起远
 未知/隐藏号码默认人工处理。
 
 校准依赖真实设备上的音频证据（downlink 抽取、uplink 注入、麦克风隔离、特权终止能力）。
-APK 校准页已实现，可记录五项人工测试；但它只写 APK 自己的 SharedPreferences，**桥接的
-`CalibrationStore` 没有读/写 RPC，固定 CLI 命令表也没有校准写操作**。因此：
+APK 校准页可辅助执行五项人工测试，但**只写 APK 自己的 SharedPreferences，不会写入桥接**。
+桥接证据的唯一写入通道是 root CLI 的固定命令 `calibrate`（`calibration.record` RPC）：
+JSON 只从 stdin 进入，argv 携带负载会在启动 CLI 前以 `usage_invalid` 拒绝。
 
-- 校准证据无法端到端写入桥接，APK 本机勾选**不会**解锁自动接听；
-- 生产就绪有意保持 `NOT_READY`（`calibration_not_verified`），真机自动接听在出现可验证的
-  运营者写入路径之前无法启用；
-- 这是 fail-closed 设计，不是可绕过的步骤：不得用本机记录、静态阅读或创建音频对象伪造校准。
+五项人工测试（全部必须由真人实测，不得用本机记录、静态阅读或创建音频对象伪造）：
+
+| JSON 键（全为 boolean） | 人工测试 |
+| --- | --- |
+| `downlinkRecognized` | 本机识别到通话下行音频（不是环境麦克风） |
+| `peerHeardSpeech` | 对端真的听到注入的测试语音（TTS 注入可用） |
+| `microphoneIsolated` | 本机麦克风隔离实际生效（对端听不到本机声音） |
+| `manualRestoreVerified` | 人工接管能解除隔离并交还麦克风 |
+| `processFailureVerified` | 进程故障注入后仍能故障终止/保持隔离 |
+
+记录示例（先写 root 私有文件，再重定向 stdin；`calibrate` 不会自动删除该文件，写完请手动删除）：
+
+```sh
+su -c 'cat > /data/adb/agentcall/inbox/calibration.json' <<'JSON'
+{
+  "steps": {
+    "downlinkRecognized": true,
+    "peerHeardSpeech": true,
+    "microphoneIsolated": true,
+    "manualRestoreVerified": true,
+    "processFailureVerified": true
+  }
+}
+JSON
+su -c '/data/adb/modules/agentcall/bin/agentcallctl calibrate < /data/adb/agentcall/inbox/calibration.json'
+su -c 'rm -f /data/adb/agentcall/inbox/calibration.json'
+```
+
+- 成功输出 `{recorded, environment, steps, verified, blockers, calibratedAtMs}`；`verified`
+  只在五项全部为 true 且环境完整时才是 true，不要用本机勾选替代。
+- 可选 `expectedEnvironment` 把这些证据绑定到预期环境（`apiLevel`、`romFingerprint`、
+  `kernelVersion`、`dialerPackageVersion`、`frameworkVersion`、`bridgeVersion`、
+  `audioPolicyDigest`、`simCarrier`、`transport`、`route`）；当前环境的任一字段未知时
+  返回 `calibration_environment_unknown`，与预期不一致时返回
+  `calibration_environment_mismatch`，两者都整体拒绝、绝不假装已验证。
+- 校准存储未接线时返回 `calibration_unavailable`。
 
 root 侧可查看能力/环境报告：
 
@@ -198,7 +233,9 @@ root 侧可查看能力/环境报告：
 su -c /data/adb/modules/agentcall/bin/agentcallctl diagnose
 ```
 
-在真机校准完成且桥接能读到证据前，产物一律按「待适配/验证」对待，不宣称音频可用。
+**未验证**：`calibrate` 的 stdin 继承、真实环境探针（尤其 `transport`/`route`）与五项人工
+测试本身的设备行为均未上机；在真机校准完成且桥接读到完整环境前，产物一律按
+「待适配/验证」对待，不宣称音频可用。
 
 ## 8. 升级、回退与卸载
 
@@ -226,8 +263,10 @@ AI 会话，等待人工处理。恢复路径：
    su -c /data/adb/modules/agentcall/bin/agentcallctl restart
    ```
 3. 命令先写 `/data/adb/agentcall/restart.requested`（内容是当前 `service.sh` 的 PID，
-   0600），再执行固定 CLI `shutdown` 让桥接干净退出；`service.sh` 在本次开机的有限
-   重启循环内消费该标记并重新拉起桥接（只消费一次，不消耗故障重启预算）。
+   0600），再执行固定 CLI `shutdown` 让桥接干净退出；该 `shutdown` 会先尝试终止/交还
+   拥有的通话，确认断开后读回恢复麦克风（因此 `service.sh` 的停止路径必须先请求它、
+   再停音频工作进程）；`service.sh` 在本次开机的有限重启循环内消费该标记并重新拉起
+   桥接（只消费一次，不消耗故障重启预算）。
 4. **诚实边界**：
    - `service_not_running`：`service.sh` 已退出（例如之前用过“关闭桥接服务”），
      本次开机内没有重启循环；只能重启设备或重新启用模块，`restart` **不会**伪造成功。
@@ -250,18 +289,32 @@ AI 会话，等待人工处理。恢复路径：
 
 ### 卸载
 
-1. 关闭总开关并确认没有进行中的通话。
+1. 关闭总开关并**先确认没有进行中的通话**（卸载路径不能替代手动结束通话）。
 2. KernelSU 管理器 → 模块 → 移除 AgentCall → 重启。
-   移除时 `uninstall.sh` 只能**请求**停止桥接进程，并按 PID 文件核验后结束残留的桥接与
-   音频工作进程（两个 PID 文件都是首行单个十进制 PID；cmdline 不匹配就不猜、不杀），
-   最后才删除 `/data/adb/agentcall`。按 KernelSU 的标记语义，卸载会先写 `remove`/`disable`
-   标记（设备上的实际卸载时序未验证）；`service.sh` 在每次重启前重新检查该标记，
-   标记存在时不会在卸载过程中把模块重新拉起；
-   若手动在无标记时对进程执行 TERM，约 5 s 后可能被重启循环拉起。
-   它**不能终止或交还正在进行的 AI 通话**（脚本头部已声明该边界），如卸载时正在 AI 通话，
-   请先在 Google 电话中手动结束。它不改写 Google 电话角色或系统音频配置。
-3. 卸载 AgentCall APK：设计上模块侧会关闭会话（**未验证**）；Google 电话保持默认拨号器与原行为。
-4. 如需彻底清理：确认 `/data/adb/agentcall` 已删除、WebUI 不再被管理器加载；
+   移除时 `uninstall.sh` 的固定顺序（任务 11D2b）：
+   1. 收回待处理的 `restart.requested`；
+   2. 固定 CLI `shutdown`（有界等待 CLI 返回与桥接进程/socket 消失）；桥接在响应前
+      终止/交还拥有的通话并读回恢复麦克风——此时音频工作进程仍然存活；
+   3. 读回 shutdown 响应（`clean`/`shutdownCode`/`supervision.microphoneIsolated`），
+      桥接仍可响应时再读 `status` 的 `supervisionPhase`/`microphoneIsolated`；
+   4. 只有 `clean=true`、`shutdownCode=null`、`microphoneIsolated=false` 且 phase 为
+      `IDLE`/`ENDED`（或进程已退出）才打印“已确认干净关闭”；否则打印机器可读警告
+      `! shutdown_result clean=... shutdownCode=... phase=... microphoneIsolated=... owned=... cli=...`
+      并明确“未确认通话已终止或交还；麦克风可能仍被隔离”，**不会**谎称已交还；
+   5. 之后才按 PID 文件核验并结束音频工作进程与残留桥接（cmdline 不匹配就不猜、不杀），
+      最后才删除 `/data/adb/agentcall`（连同粘性所有权标记）。
+   两个 PID 文件都是首行单个十进制 PID。按 KernelSU 的标记语义，卸载会先写
+   `remove`/`disable` 标记（设备上的实际卸载时序未验证）；`service.sh` 在每次重启前
+   重新检查该标记，标记存在时不会把模块重新拉起；若手动在无标记时对进程执行 TERM，
+   约 5 s 后可能被重启循环拉起。
+3. 卸载时的能力边界（脚本会原样打印）：若收到警告，说明关闭未被确认——进行中的通话、
+   麦克风隔离状态与粘性所有权标记可能仍然存在。脚本只能有界地停止进程；它**不能终止或
+   交还正在进行的 AI 通话，也不能自行解除麦克风隔离**。重启设备会重新初始化系统音频/
+   静音状态（脚本无法读回验证），且只有音频工作进程已停止后才不会被它再次设置；但重启
+   不证明通话已结束，**下一次启动**仍会因粘性标记保持 `BLOCKED`，直到人工确认。卸载会删除
+   该标记，重新安装后不会记得这次未解决的通话。它不改写 Google 电话角色或系统音频配置。
+4. 卸载 AgentCall APK：设计上模块侧会关闭会话（**未验证**）；Google 电话保持默认拨号器与原行为。
+5. 如需彻底清理：确认 `/data/adb/agentcall` 已删除、WebUI 不再被管理器加载；
    残留的 Xposed 作用域记录在框架管理器中删除。
 
 ### 常见错误
@@ -279,6 +332,9 @@ AI 会话，等待人工处理。恢复路径：
 | `service_not_running` | `service.sh` 已退出（本次开机没有重启循环） | 重启设备或重新启用模块；不要伪造重启成功 |
 | `module_disabled` | 模块带 `disable`/`remove` 标记 | 先启用/重装模块；不会重启已移除模块 |
 | `restart_unconfirmed` | 桥接未接受 `shutdown`（退出/不可达） | 刷新状态；仍不可达时重启设备 |
+| `shutdown_call_unresolved` | 5 s 内无法确认拥有的通话已断开；桥接保持隔离并失败关闭（粘性标记保留） | 先在 Google 电话中手动结束通话；确认 `status` 的 `microphoneIsolated` 与 `supervisionPhase`，必要时重启设备 |
+| `shutdown_microphone_restore_failed` | 已确认断开，但麦克风恢复读回失败；桥接 `BLOCKED` | 人工确认麦克风状态；不要把“进程退出”当成已恢复 |
+| `calibration_environment_unknown` / `..._mismatch` | 校准环境事实不完整/与预期不一致 | 不要伪造；在完整环境上重测五项后重试 `calibrate` |
 
 ## 9. 验证状态
 
@@ -286,8 +342,11 @@ AI 会话，等待人工处理。恢复路径：
 | --- | --- |
 | 模块 ZIP 结构、DEX 入口、版本、SHA-256、密钥泄漏检查 | 本地已验证（`make package-check`） |
 | 最终验收矩阵（HEAD `1ee7277`，225 任务） | 本地 PASS：JVM 731、lint 0 errors、release APK、bridge 运行时容器 |
-| JVM/JS/Python/脚本检查 | 本地已验证：JVM 731（core 125 / bridge 283 / app 323）、node 79、Python 52、`sh -n` 4 个脚本（`make test` PASS） |
-| 配对（WebUI/root CLI）与 APK 校准/诊断界面 | 已实现；校准证据写入桥接的通道缺失（阻塞，见第 7 节） |
+| JVM/JS/Python/脚本检查 | 历史：JVM 731（core 125 / bridge 283 / app 323）、Python 52（`make test` PASS）。11D2b 本波只重跑 `node --test module/webroot/tests/*.test.mjs`（104 pass）与 `sh -n` 4 个脚本，未跑 Gradle |
+| 配对（WebUI/root CLI）与 APK 校准/诊断界面 | 已实现；root CLI `calibrate` 已提供桥接校准写入通道（真机环境探针与五项实测未验证，见第 7 节） |
+| 优雅关闭停止顺序（先 shutdown、后停音频工作进程、再 TERM→KILL） | 本地宿主已验证（`shutdown-order.test.mjs`、`module-scripts.test.mjs` 进程/CLI 替身）；**真机未验证** |
+| 卸载关闭结果读回与未确认警告 | 本地宿主已验证（假 CLI/status/socket）；**真机 KernelSU 卸载时序未验证** |
+| `agentcallctl calibrate` stdin 逐字节透传与 argv 拒绝 | 本地宿主已验证（假 app_process）；**真机 app_process stdin 未验证** |
 | 模块安装、重启后 `service.sh` 拉起桥 | **未验证** |
 | LSPosed/Vector 作用域与 Hook 生效 | **未验证** |
 | 首次配对、重新配对、`peer_version_mismatch` 提示 | **未验证** |
@@ -296,6 +355,8 @@ AI 会话，等待人工处理。恢复路径：
 | 人工接管、故障终止、麦克风隔离 | **未验证** |
 | 双卡、VoWiFi、蓝牙 | **未验证**，未测组合不启用 |
 
-结论：安装步骤按设计写成，但**除本地构建/打包/结构检查外，没有真机证据**；
-交付时也没有设备连接。校准写入通道缺失使真机自动接听无法启用（保持
-`calibration_not_verified`）。在完成 spec §12 设备验收前，不要把本模块当作可用的电话助理。
+结论：安装步骤按设计写成，但**除本地构建/打包/结构检查与宿主测试替身外，没有真机证据**；
+交付时也没有设备连接。root CLI `calibrate` 已补上桥接校准写入通道，但真实环境探针、
+五项人工测试、优雅关闭的麦克风恢复读回与 KernelSU 卸载时序都未上机；真机自动接听在
+完成这些验证前仍不能被当作已启用（保持 fail-closed，`calibration_not_verified`）。
+在完成 spec §12 设备验收前，不要把本模块当作可用的电话助理。
