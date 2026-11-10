@@ -23,6 +23,9 @@ import org.krvyft.agentcall.core.rules.RuleMatcher
  * - READY 确认后进入 PREPARING：这是接听前的准备/倒计时窗口。进入时按 spec §8 声明
  *   AcquireLease 与 IsolateMicrophone，倒计时基准点就是进入 PREPARING 的 nowMs；窗口内
  *   到期才下发唯一一次 SendCommand(Answer) 并转入 ANSWER_PENDING。
+ * - READY 在 ELIGIBLE/PREPARING 内丢失即视为本通自动接听被永久放弃（spec §8：缺一项就保留
+ *   原响铃）：之后 READY 恢复也不得重新倒计时或接听；PREPARING 已取得的租约与麦克风隔离按
+ *   安全顺序交还（先 RevokeLease、后 RestoreMicrophone），绝不挂断这通未由模块接听的电话。
  * - ANSWER_PENDING 是 Answer 命令已下发、尚未观察到结果的窗口；ACTIVE 快照到达后才打开
  *   实际双向流（StartConversation）。
  * - 最长 AI 通话时长从第一次观察到 ACTIVE 起算，且只终止仍归 AI 的通话；用户已接管
@@ -183,10 +186,18 @@ class SessionReducer(
 
     private fun onReadyChanged(ready: Boolean, nowMs: Long): List<SessionEffect> {
         this.ready = ready
-        if (!ready) return emptyList()
-        if (state != SessionState.ELIGIBLE || !eligible) return emptyList()
-        if (disabled || lostPeers.isNotEmpty()) return emptyList()
-        return enterPreparing(nowMs)
+        if (ready) {
+            if (state != SessionState.ELIGIBLE || !eligible) return emptyList()
+            if (disabled || lostPeers.isNotEmpty()) return emptyList()
+            return enterPreparing(nowMs)
+        }
+        // READY 丢失（spec §8：接听前任一前置条件缺失就保留原响铃）：本通自动接听被永久
+        // 放弃，READY 即使随后恢复也不得重新进入倒计时；已进入 PREPARING 时交还人工，
+        // 按安全顺序撤销租约并恢复麦克风。模块从未接听，因此这里绝不产生挂断命令。
+        return when (state) {
+            SessionState.ELIGIBLE, SessionState.PREPARING -> handBack()
+            else -> emptyList()
+        }
     }
 
     /**

@@ -581,4 +581,103 @@ class SessionReducerTest {
         assertTrue(reducer.reduce(SessionEvent.Tick, 3_001).none { it is SessionEffect.SendCommand })
         assertTrue(reducer.reduce(SessionEvent.Tick, 13_000).none { it is SessionEffect.SendCommand })
     }
+
+    // ---- 任务 7D：接听前 READY 丢失必须永久放弃本通自动接听（spec §8） ----
+
+    @Test
+    fun readyLostDuringPreparingDoesNotAnswerAtDeadline() {
+        val reducer = startedReducer()
+        assertEquals(SessionState.PREPARING, reducer.state)
+
+        // 倒计时窗口内 READY 丢失：本通自动接听被永久放弃并保守交还。
+        reducer.reduce(SessionEvent.ReadyChanged(ready = false), 1_000)
+        assertEquals(SessionState.HANDOFF, reducer.state)
+
+        assertEquals(0, reducer.reduce(SessionEvent.Tick, 2_999).answerCommands().size)
+        assertEquals(0, reducer.reduce(SessionEvent.Tick, 3_000).answerCommands().size)
+        assertEquals(0, reducer.reduce(SessionEvent.Tick, 30_000).answerCommands().size)
+    }
+
+    @Test
+    fun readyLostDuringPreparingReleasesLeaseAndIsolation() {
+        val reducer = startedReducer()
+        assertEquals(SessionState.PREPARING, reducer.state)
+
+        val effects = reducer.reduce(SessionEvent.ReadyChanged(ready = false), 1_000)
+
+        // 安全顺序：先撤销租约（所有权与后续命令都以租约为基础），再恢复麦克风。
+        assertEquals(
+            listOf(SessionEffect.RevokeLease(id), SessionEffect.RestoreMicrophone(id)),
+            effects,
+        )
+        // 模块从未接听这通电话：READY 丢失不得产生任何通话命令，尤其不得挂断。
+        assertTrue(effects.none { it is SessionEffect.SendCommand })
+        assertEquals(SessionState.HANDOFF, reducer.state)
+
+        // 重复的 READY 丢失与到期 Tick 不得重复撤销/恢复。
+        assertTrue(reducer.reduce(SessionEvent.ReadyChanged(ready = false), 1_500).isEmpty())
+        assertTrue(reducer.reduce(SessionEvent.Tick, 30_000).isEmpty())
+
+        // 隔离只恢复一次：随后确认断开不得再发一次 RestoreMicrophone。
+        val disconnected = reducer.reduce(
+            SessionEvent.StateChanged(Fixtures.disconnected()),
+            30_001,
+        )
+        assertTrue(disconnected.none { it is SessionEffect.RestoreMicrophone })
+        assertEquals(SessionState.ENDED, reducer.state)
+    }
+
+    @Test
+    fun readyRecoveryAfterLossDoesNotResurrectTheAnswer() {
+        val reducer = startedReducer()
+        reducer.reduce(SessionEvent.ReadyChanged(ready = false), 1_000)
+        assertEquals(SessionState.HANDOFF, reducer.state)
+
+        // READY 在 2500 ms 恢复：不得重新取得租约/隔离，也不得恢复倒计时。
+        val recovery = reducer.reduce(SessionEvent.ReadyChanged(ready = true), 2_500)
+        assertEquals(emptyList<SessionEffect>(), recovery)
+        assertEquals(SessionState.HANDOFF, reducer.state)
+
+        assertEquals(0, reducer.reduce(SessionEvent.Tick, 2_999).answerCommands().size)
+        assertEquals(0, reducer.reduce(SessionEvent.Tick, 3_000).answerCommands().size)
+        assertEquals(0, reducer.reduce(SessionEvent.Tick, 30_000).answerCommands().size)
+    }
+
+    @Test
+    fun readyLossDuringEligibleHandsBackAndNeverAnswers() {
+        val reducer = SessionReducer(id = id, config = Fixtures.config())
+        reducer.reduce(SessionEvent.StateChanged(Fixtures.ringing()), 0L)
+        assertEquals(SessionState.ELIGIBLE, reducer.state)
+
+        // ELIGIBLE 尚未取得租约/隔离：READY 丢失只保守交还，不产生资源副作用。
+        val effects = reducer.reduce(SessionEvent.ReadyChanged(ready = false), 1_000)
+        assertTrue(effects.isEmpty())
+        assertEquals(SessionState.HANDOFF, reducer.state)
+
+        // READY 迟到恢复也不得重新准备或接听；原响铃保留给人工。
+        assertTrue(reducer.reduce(SessionEvent.ReadyChanged(ready = true), 2_000).isEmpty())
+        assertEquals(SessionState.HANDOFF, reducer.state)
+        assertEquals(0, reducer.reduce(SessionEvent.Tick, 3_000).answerCommands().size)
+        assertEquals(0, reducer.reduce(SessionEvent.Tick, 30_000).answerCommands().size)
+    }
+
+    @Test
+    fun readyLossBeforePreparingAcquisitionEmitsNoSpuriousRestoreOrRevoke() {
+        val reducer = SessionReducer(id = id, config = Fixtures.config())
+
+        // IDLE 时的 READY 丢失与本次会话无关：无副作用。
+        assertTrue(reducer.reduce(SessionEvent.ReadyChanged(ready = false), 0L).isEmpty())
+        assertEquals(SessionState.IDLE, reducer.state)
+
+        // 名单已命中但 READY 未确认（ELIGIBLE）：没有取得租约/隔离，
+        // READY 丢失不得发出任何撤销或恢复副作用。
+        reducer.reduce(SessionEvent.StateChanged(Fixtures.ringing()), 100L)
+        assertEquals(SessionState.ELIGIBLE, reducer.state)
+
+        val effects = reducer.reduce(SessionEvent.ReadyChanged(ready = false), 200L)
+        assertTrue(effects.none { it is SessionEffect.RevokeLease })
+        assertTrue(effects.none { it is SessionEffect.RestoreMicrophone })
+        assertTrue(effects.isEmpty())
+        assertEquals(SessionState.HANDOFF, reducer.state)
+    }
 }
