@@ -12,8 +12,10 @@ import org.krvyft.agentcall.core.model.SessionId
  *
  * Task 3 的控制通道是“一请求一响应”，服务端不能主动推送，因此：
  * - 待执行命令排入本路由，随下一次 `hook.snapshot`/`hook.heartbeat` 的响应负载下发；
- * - Hook 执行后回报 `call.command.result`，本路由解析成真实 [CommandResult]，
- *   供 Task 7 的 CallControl.send 返回给 APP；
+ * - Hook 执行后回报 `call.command.result`，本路由只做**校验与解析**（[parseResult]），
+ *   结果唯一的去路是监督端收件箱
+ *   （[org.krvyft.agentcall.bridge.supervision.HookCallInbox]）。本类没有第二个结果缓冲区：
+ *   任何"结果队列"都只会在没人消费时填满并开始拒绝真实结果；
  * - 队列按会话/总量双上限，满了有界失败，绝不无界堆积。
  *
  * 命令行的线格式与 app 端 `org.krvyft.agentcall.hook.HookWireFormat` 一致：
@@ -26,13 +28,11 @@ import org.krvyft.agentcall.core.model.SessionId
 class HookCommandRouter(
     private val maxPendingPerSession: Int = MAX_PENDING_PER_SESSION,
     private val maxSessions: Int = MAX_SESSIONS,
-    private val maxResults: Int = MAX_RESULTS,
 ) {
 
     init {
         require(maxPendingPerSession > 0) { "maxPendingPerSession must be positive" }
         require(maxSessions > 0) { "maxSessions must be positive" }
-        require(maxResults > 0) { "maxResults must be positive" }
     }
 
     /** Hook 回报的一条命令结果；[source] 是 Hook 上报的动作来源（MODULE/USER/UNKNOWN）。 */
@@ -46,7 +46,6 @@ class HookCommandRouter(
 
     private val lock = Any()
     private val pending = LinkedHashMap<SessionId, ArrayDeque<CallCommand>>()
-    private val results = ArrayDeque<HookCommandOutcome>()
 
     /** 为某个会话排入一条待执行命令。会话字段非法或队列饱和时返回 false。 */
     fun enqueueCommand(session: SessionId, command: CallCommand): Boolean = synchronized(lock) {
@@ -78,22 +77,14 @@ class HookCommandRouter(
     fun pendingCount(session: SessionId): Int = synchronized(lock) { pending[session]?.size ?: 0 }
 
     /**
-     * 记录一条 `call.command.result`。负载必须是固定字段的 JSON，且其中的会话字段
-     * 必须与请求的会话一致；任何不合法输入整体拒绝，不猜测结果。
+     * 解析一条 `call.command.result`。负载必须是固定字段的 JSON，且其中的会话字段
+     * 必须与请求的会话一致；任何不合法输入整体拒绝（返回 null），不猜测结果。
+     *
+     * 只解析、不存储：调用方必须把结果交给监督端收件箱（唯一结果通路），
+     * 不存在"路由缓冲区 + 收件箱"两条互相抢结果的路。
      */
-    fun recordResult(session: SessionId, payload: String): Boolean = synchronized(lock) {
-        val parsed = decodeResult(session, payload) ?: return false
-        if (results.size >= maxResults) return false
-        results.addLast(parsed)
-        true
-    }
-
-    /** 取走全部未消费的结果（供 Task 7 的 CallControl.send 返回）。 */
-    fun takeResults(): List<HookCommandOutcome> = synchronized(lock) {
-        val taken = results.toList()
-        results.clear()
-        taken
-    }
+    fun parseResult(session: SessionId, payload: String): HookCommandOutcome? =
+        synchronized(lock) { decodeResult(session, payload) }
 
     // ------------------------------------------------------------------ 解析
 
@@ -160,7 +151,6 @@ class HookCommandRouter(
     companion object {
         const val MAX_PENDING_PER_SESSION: Int = 8
         const val MAX_SESSIONS: Int = 64
-        const val MAX_RESULTS: Int = 64
         const val MAX_RESULT_PAYLOAD_CHARS: Int = 2048
 
         private const val MAX_SESSION_FIELD_CHARS: Int = 64

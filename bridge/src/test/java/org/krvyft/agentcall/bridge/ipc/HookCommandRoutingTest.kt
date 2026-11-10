@@ -12,6 +12,7 @@ import org.junit.Before
 import org.junit.Test
 import org.krvyft.agentcall.bridge.ControlDispatcher
 import org.krvyft.agentcall.bridge.config.ConfigStore
+import org.krvyft.agentcall.bridge.supervision.SupervisionRpcPort
 import org.krvyft.agentcall.bridge.diagnostics.AudioApiProbe
 import org.krvyft.agentcall.bridge.diagnostics.DeviceProbe
 import org.krvyft.agentcall.bridge.diagnostics.PlatformFacts
@@ -37,6 +38,7 @@ class HookCommandRoutingTest {
 
     private lateinit var baseDir: File
     private lateinit var dispatcher: ControlDispatcher
+    private val supervision = RecordingSupervision()
 
     private val session = SessionId(processEpoch = "epoch-1", callId = "call-1")
     private val hookPeer = PeerIdentity(
@@ -78,6 +80,7 @@ class HookCommandRoutingTest {
                 bridgeVersion = "1.0",
             ),
             shutdown = CountDownLatch(1),
+            supervision = supervision,
             startedAtMs = 0L,
             connectionStats = { 0 to 0L },
         )
@@ -131,15 +134,12 @@ class HookCommandRoutingTest {
         val response = dispatcher.handle(hookPeer, hookRequest(RolePolicy.METHOD_CALL_COMMAND_RESULT, payload))
 
         assertNull(response.error)
-        val results = dispatcher.takeHookCommandResults()
-        assertEquals(1, results.size)
-        assertEquals(session, results.single().session)
-        assertEquals(CallCommand.Answer, results.single().command)
-        assertEquals("MODULE", results.single().source)
-        assertEquals(CommandResult.Rejected(RejectReason.NOT_OWNED), results.single().result)
-        assertEquals("not_owned", results.single().note)
-        // 结果只被取走一次。
-        assertTrue(dispatcher.takeHookCommandResults().isEmpty())
+        // 结果只有一条生产通路：call.command.result → 监督端收件箱。
+        val recorded = supervision.results.single()
+        assertEquals(session, recorded.first)
+        assertEquals(CallCommand.Answer, recorded.second)
+        assertEquals(CommandResult.Rejected(RejectReason.NOT_OWNED), recorded.third)
+        assertTrue("结果不得留在任何第二缓冲区", supervision.results.size == 1)
     }
 
     @Test
@@ -147,7 +147,7 @@ class HookCommandRoutingTest {
         val payload = resultPayload("Hangup", "UNKNOWN", "failed", "null", "\"disconnect_failed\"", "\"SECURITY\"")
         assertNull(dispatcher.handle(hookPeer, hookRequest(RolePolicy.METHOD_CALL_COMMAND_RESULT, payload)).error)
 
-        val result = dispatcher.takeHookCommandResults().single().result
+        val result = supervision.results.single().third
         assertEquals(CommandResult.Failed("disconnect_failed", "SECURITY"), result)
     }
 
@@ -165,7 +165,7 @@ class HookCommandRoutingTest {
         val response = dispatcher.handle(hookPeer, hookRequest(RolePolicy.METHOD_CALL_COMMAND_RESULT, payload))
 
         assertEquals("payload_invalid", response.error?.code)
-        assertTrue(dispatcher.takeHookCommandResults().isEmpty())
+        assertTrue(supervision.results.isEmpty())
     }
 
     @Test
@@ -174,7 +174,25 @@ class HookCommandRoutingTest {
             val response = dispatcher.handle(hookPeer, hookRequest(RolePolicy.METHOD_CALL_COMMAND_RESULT, payload))
             assertEquals("payload_invalid", response.error?.code)
         }
-        assertTrue(dispatcher.takeHookCommandResults().isEmpty())
+        assertTrue(supervision.results.isEmpty())
+    }
+
+    /**
+     * I4：结果路由没有第二个 64 条缓冲区。旧实现的 HookCommandRouter.results 从不被生产
+     * 消费，第 65 条结果起 recordResult 返回 false → payload_invalid 且监督端收不到结果。
+     */
+    @Test
+    fun moreThanSixtyFourResultsKeepFlowingToTheSupervisor() {
+        for (index in 1..70) {
+            val payload = resultPayload("Answer", "MODULE", "accepted", "null", "null", "null")
+            val response = dispatcher.handle(
+                hookPeer,
+                hookRequest(RolePolicy.METHOD_CALL_COMMAND_RESULT, payload),
+            )
+            assertNull("第 " + index + " 条结果必须被接受: " + response.error, response.error)
+        }
+        assertEquals(70, supervision.results.size)
+        assertTrue(supervision.results.all { it.third == CommandResult.Accepted })
     }
 
     @Test
@@ -190,6 +208,14 @@ class HookCommandRoutingTest {
         val malformed = SessionId(processEpoch = "epoch-1", callId = "bad id\nanswer other")
         assertFalse(dispatcher.enqueueHookCommand(malformed, CallCommand.Answer))
         assertEquals("", dispatcher.handle(hookPeer, hookRequest(RolePolicy.METHOD_HOOK_SNAPSHOT)).payload)
+    }
+
+    private class RecordingSupervision : SupervisionRpcPort() {
+        val results = java.util.concurrent.CopyOnWriteArrayList<Triple<SessionId, CallCommand, CommandResult>>()
+
+        override fun recordCommandResult(id: SessionId, command: CallCommand, result: CommandResult) {
+            results += Triple(id, command, result)
+        }
     }
 
     private fun resultPayload(

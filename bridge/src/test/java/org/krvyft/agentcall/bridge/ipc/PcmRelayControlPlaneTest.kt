@@ -13,6 +13,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+import org.krvyft.agentcall.bridge.BridgeWiring
 import org.krvyft.agentcall.bridge.ControlDispatcher
 import org.krvyft.agentcall.bridge.audio.AudioPcmLinkException
 import org.krvyft.agentcall.bridge.audio.AudioPcmProtocol
@@ -61,6 +62,12 @@ class PcmRelayControlPlaneTest {
         packageName = "org.krvyft.agentcall",
         signatureSha256 = "00",
     )
+    private val hookPeer = PeerIdentity(
+        uid = 10_002,
+        role = PeerRole.HOOK,
+        packageName = "com.google.android.dialer",
+        signatureSha256 = "00",
+    )
 
     private lateinit var baseDir: File
     private lateinit var owner: SimpleOwner
@@ -73,7 +80,8 @@ class PcmRelayControlPlaneTest {
         baseDir = Files.createTempDirectory("agentcall-pcm-control-").toFile()
         owner = SimpleOwner()
         links = SimpleLinkFactory(format)
-        relay = AudioPcmRelay(owner, links, FixedClock())
+        // 与生产同一装配点：audio.channel 返回 ControlServer 的 APP lane 名字。
+        relay = BridgeWiring.audioPcmRelay(owner, links, FixedClock())
         dispatcher = ControlDispatcher(
             store = ConfigStore(File(baseDir, "agentcall"), clockMs = { 0L }),
             packages = NoPackages,
@@ -93,7 +101,7 @@ class PcmRelayControlPlaneTest {
                 bridgeVersion = "1.0",
             ),
             shutdown = CountDownLatch(1),
-            supervision = SupervisionRpcPort(),
+            supervision = DisconnectingSupervision(owner),
             startedAtMs = 0L,
             audioPcm = relay,
         )
@@ -113,7 +121,13 @@ class PcmRelayControlPlaneTest {
 
         val payload = JsonParser.parseString(response.payload).asJsonObject
         assertTrue(payload.get("opened").asBoolean)
-        assertEquals(AudioPcmProtocol.SOCKET_NAME, payload.get("socket").asString)
+        // C1：APP 必须拿到 ControlServer bind 的 APP lane 字面值，绝不是 root 私有的 worker lane。
+        assertEquals("org.krvyft.agentcall.pcm", payload.get("socket").asString)
+        assertEquals(ControlServer.DEFAULT_PCM_SOCKET, payload.get("socket").asString)
+        assertTrue(
+            "worker lane 名不得出现在 audio.channel 响应里",
+            payload.get("socket").asString != AudioPcmProtocol.SOCKET_NAME,
+        )
         val formatJson = payload.getAsJsonObject("format")
         assertEquals(16_000, formatJson.get("sampleRate").asInt)
         assertEquals(1, formatJson.get("channels").asInt)
@@ -201,12 +215,16 @@ class PcmRelayControlPlaneTest {
         val workerLink = links.links.single()
         workerLink.toWorker.blockFromCurrentSize()
 
-        repeat(AudioPcmRelay.UPLINK_QUEUE_CAPACITY + 6) { index ->
+        // 先喂一帧并等 writer 真的阻塞在写路径上（否则整批 feed 后 serve 线程可能先
+        // 把队列灌满并中断 writer，写法会变成竞态而不是确定性的饱和）。
+        appInput.feed(frameBytes(PcmLaneType.UPLINK, PcmLaneCodec.encodeUplink(1, byteArrayOf(1, 2))!!))
+        assertTrue("worker 写入必须已被阻塞", workerLink.toWorker.awaitBlocked(2_000))
+
+        repeat(AudioPcmRelay.UPLINK_QUEUE_CAPACITY + 2) { index ->
             appInput.feed(
-                frameBytes(PcmLaneType.UPLINK, PcmLaneCodec.encodeUplink(index + 1, byteArrayOf(1, 2))!!),
+                frameBytes(PcmLaneType.UPLINK, PcmLaneCodec.encodeUplink(index + 2, byteArrayOf(1, 2))!!),
             )
         }
-        assertTrue("worker 写入必须已被阻塞", workerLink.toWorker.awaitBlocked(2_000))
 
         // PCM 饱和期间：控制面请求必须立即返回，不被流拖住。
         val heartbeatStartedAt = System.currentTimeMillis()
@@ -246,6 +264,33 @@ class PcmRelayControlPlaneTest {
         assertTrue(!serveThread.isAlive)
     }
 
+    @Test
+    fun disconnectedCallReleasesTheAppAudioBindingImmediately() {
+        owner.owned += session
+        val opened = dispatcher.handle(appPeer, audioChannelRequest(session, formatPayload()))
+        assertNull(opened.error)
+        assertNotNull(relay.sessionState(session))
+
+        // 监督端确认断开（故障终止/正常结束）后，APP 音频绑定必须被释放，
+        // 不能等到下一次 open 或进程退出才回收。
+        val snapshot = dispatcher.handle(
+            hookPeer,
+            RpcRequest(
+                id = "hook-snapshot",
+                method = RolePolicy.METHOD_HOOK_SNAPSHOT,
+                sessionId = session,
+                payload = "{\"processEpoch\":\"epoch-1\",\"callId\":\"call-A\"," +
+                    "\"state\":\"DISCONNECTED\",\"handbackReason\":null}",
+            ),
+        )
+        assertNull(snapshot.error)
+        assertNull(
+            "断开确认后 APP 音频绑定必须已释放",
+            relay.sessionState(session),
+        )
+        assertEquals(0, relay.boundSessionCount())
+    }
+
     // ------------------------------------------------------------------ 辅助
 
     private fun audioChannelRequest(sessionId: SessionId?, payload: String): RpcRequest =
@@ -268,6 +313,13 @@ private class SimpleOwner : PcmSessionOwner {
     val owned = CopyOnWriteArrayList<SessionId>()
 
     override fun owns(id: SessionId): Boolean = id in owned
+}
+
+/** 生产断开的替身：确认断开后监督端不再持有该会话。 */
+private class DisconnectingSupervision(private val owner: SimpleOwner) : SupervisionRpcPort() {
+    override suspend fun onCallDisconnected(id: SessionId) {
+        owner.owned -= id
+    }
 }
 
 private class SimpleLinkFactory(private val format: AudioFormatSpec) : PcmWorkerLinkFactory {

@@ -46,8 +46,13 @@ fun interface PcmSink {
  * - **有界资源**：控制通道最多 [MAX_CONNECTIONS] 条连接、[MAX_QUEUE_DEPTH] 个排队
  *   请求；PCM 通道有独立执行器与独立连接信号量，每条 PCM 连接独占一个线程且上限为
  *   [maxPcmConnections]（默认 [MAX_PCM_CONNECTIONS]）。PCM 是长生命周期读取循环，
- *   因此绝不与控制请求共用 worker 池：控制命令不会被 PCM 流饿死。任一 lane 满时
- *   立即关闭新连接并计数，不阻塞 accept 线程，也不阻塞电话 UI。
+ *   因此绝不与控制请求共用 worker 池：控制命令不会被 PCM 流饿死。
+ * - **长等待命令有专用 lane**：`session.command`/`session.request` 会同步等待 HOOK
+ *   结果（最长 4 s）。它们在读完帧之后被移交给命令 lane（[usesCommandLane]），控制
+ *   worker 立即归还，因此两个并发命令等待期间 HOOK 心跳仍能被服务（否则命令永远
+ *   取不走 → 必然 command_timeout）。命令 lane 有独立的槽位上限
+ *   （[ConnectionLanes.MAX_COMMAND_CONNECTIONS]）与控制连接槽分离。
+ *   任一 lane 满时立即以机器码有界失败，不阻塞 accept 线程，也不阻塞电话 UI。
  * - **校验顺序**：内核凭据 → 包名/签名/角色 → 帧长度 → 请求 ID/版本/会话 →
  *   [RolePolicy] 固定方法表。任一步失败都回错误帧后关闭连接。
  * - **错误内容**：只回机器可读错误码与固定短消息，异常消息只保留异常类名。
@@ -150,10 +155,13 @@ class ControlServer(
             }
             activeConnections.incrementAndGet()
             openSockets.add(socket)
-            val submitted = if (isPcm) {
-                lanes.submitPcm { serveConnection(socket, isPcm = true) }
-            } else {
-                lanes.submitControl { serveConnection(socket, isPcm = false) }
+            var submitted = false
+            if (isPcm) {
+                submitted = lanes.submitPcm { serveConnection(socket, isPcm = true) }
+            } else if (lanes.tryAdmitControl()) {
+                // 接纳与执行分开：一条请求可能被移交给命令 lane，连接槽必须占到连接结束。
+                submitted = lanes.submitControlTask { serveConnection(socket, isPcm = false) }
+                if (!submitted) lanes.releaseControlSlot()
             }
             if (!submitted) {
                 // lane 关闭或槽位/队列饱和：有界失败，不排队等待，也不影响已接受的连接。
@@ -164,53 +172,89 @@ class ControlServer(
         }
     }
 
-    /** 连接任务外壳：无论通道、成功或异常，都回收 socket/计数/连接槽（槽位由 lane 释放）。 */
+    /**
+     * 连接任务外壳：无论通道、成功或异常，都回收 socket/计数/连接槽。
+     *
+     * 控制连接的处理权可能在读完帧之后交给命令 lane（[serveControlRequest] 返回 true），
+     * 这时本方法**不能**回收：清理由命令 lane 上的收尾负责，否则连接槽会被提前归还。
+     */
     private fun serveConnection(socket: LocalSocket, isPcm: Boolean) {
-        try {
-            if (isPcm) {
+        if (isPcm) {
+            try {
                 handlePcmConnection(socket)
-            } else {
-                handleControlConnection(socket)
+            } finally {
+                finishConnection(socket, releasesControlSlot = false)
             }
-        } finally {
-            openSockets.remove(socket)
-            closeQuietly(socket)
-            activeConnections.decrementAndGet()
+            return
         }
+        var handedOff = false
+        try {
+            handedOff = serveControlRequest(socket)
+        } catch (io: IOException) {
+            // 单个连接失败只关闭该连接；accept 循环继续。
+        } finally {
+            if (!handedOff) finishConnection(socket, releasesControlSlot = true)
+        }
+    }
+
+    private fun finishConnection(socket: LocalSocket, releasesControlSlot: Boolean) {
+        openSockets.remove(socket)
+        closeQuietly(socket)
+        activeConnections.decrementAndGet()
+        if (releasesControlSlot) lanes.releaseControlSlot()
     }
 
     // ------------------------------------------------------------------ 控制通道
 
-    private fun handleControlConnection(socket: LocalSocket) {
-        try {
-            socket.setSoTimeout(readTimeoutMs)
-            val identity = verifiedIdentity(socket) ?: return
-            val request = when (val result = RpcCodec.readRequestFrame(socket.inputStream)) {
-                is RpcCodec.RequestResult.Rejected -> {
-                    writeError(socket, UNKNOWN_REQUEST_ID, result.code, result.message)
-                    return
-                }
-                is RpcCodec.RequestResult.Accepted -> result.request
+    /** @return true 表示处理权已交给命令 lane（连接清理由命令 lane 负责）。 */
+    private fun serveControlRequest(socket: LocalSocket): Boolean {
+        socket.setSoTimeout(readTimeoutMs)
+        val identity = verifiedIdentity(socket) ?: return false
+        val request = when (val result = RpcCodec.readRequestFrame(socket.inputStream)) {
+            is RpcCodec.RequestResult.Rejected -> {
+                writeError(socket, UNKNOWN_REQUEST_ID, result.code, result.message)
+                return false
             }
-            if (!RolePolicy.authorize(identity, request)) {
-                writeError(
-                    socket,
-                    request.id,
-                    ERROR_FORBIDDEN,
-                    "role " + identity.role.name + " may not call " + request.method,
-                )
-                return
-            }
-            val response = try {
-                handler.handle(identity, request)
-            } catch (t: Exception) {
-                // 不把异常文本回给对端：可能含路径或凭据。
-                RpcResponse(id = request.id, error = RpcError(ERROR_INTERNAL, t.javaClass.simpleName))
-            }
-            writeResponse(socket, response)
-        } catch (io: IOException) {
-            // 单个连接失败只关闭该连接；accept 循环继续。
+            is RpcCodec.RequestResult.Accepted -> result.request
         }
+        if (!RolePolicy.authorize(identity, request)) {
+            writeError(
+                socket,
+                request.id,
+                ERROR_FORBIDDEN,
+                "role " + identity.role.name + " may not call " + request.method,
+            )
+            return false
+        }
+        if (!usesCommandLane(request.method)) {
+            writeResponse(socket, dispatch(identity, request))
+            return false
+        }
+        // 4 s 的 HOOK 结果等待绝不能占住控制 worker：HOOK 心跳必须还能取走排队命令。
+        if (!lanes.tryAdmitCommand()) {
+            writeError(socket, request.id, ERROR_COMMAND_LANE_BUSY, "command lane is saturated")
+            return false
+        }
+        val handedOff = lanes.submitCommandTask {
+            try {
+                writeResponse(socket, dispatch(identity, request))
+            } finally {
+                lanes.releaseCommandSlot()
+                finishConnection(socket, releasesControlSlot = true)
+            }
+        }
+        if (!handedOff) {
+            lanes.releaseCommandSlot()
+            writeError(socket, request.id, ERROR_COMMAND_LANE_BUSY, "command lane is saturated")
+        }
+        return handedOff
+    }
+
+    private fun dispatch(identity: PeerIdentity, request: RpcRequest): RpcResponse = try {
+        handler.handle(identity, request)
+    } catch (t: Exception) {
+        // 不把异常文本回给对端：可能含路径或凭据。
+        RpcResponse(id = request.id, error = RpcError(ERROR_INTERNAL, t.javaClass.simpleName))
     }
 
     // ------------------------------------------------------------------ PCM 通道
@@ -356,9 +400,26 @@ class ControlServer(
         const val ERROR_FORBIDDEN: String = "forbidden"
         const val ERROR_INTERNAL: String = "internal_error"
 
+        /** 命令 lane 饱和：有界失败（APP 可重试），绝不排队等 4 s 再超时。 */
+        const val ERROR_COMMAND_LANE_BUSY: String = "command_lane_busy"
+
         private const val ACCEPT_RETRY_DELAY_MS: Long = 100L
 
         /** 关闭前等待已提交请求写回响应的上限（本地 socket，不需要长等待）。 */
         private const val CLOSE_GRACE_MS: Long = 500L
     }
 }
+
+/**
+ * 会同步等待 HOOK 结果/监督迁移（最长 [org.krvyft.agentcall.bridge.supervision.HookCommandCallControl.DEFAULT_TIMEOUT_MS]）
+ * 的 APP 方法：必须离开控制 worker，改在命令 lane 上执行。
+ *
+ * 只列 APP 侧的接听/命令请求：HOOK 自己的 snapshot/heartbeat 仍走控制 lane，保证
+ * 取命令这条路永远有 worker。任一方法名新增/删除都必须同步本集合与 [ConnectionLanesTest]。
+ */
+internal fun usesCommandLane(method: String): Boolean = method in COMMAND_LANE_METHODS
+
+internal val COMMAND_LANE_METHODS: Set<String> = setOf(
+    RolePolicy.METHOD_SESSION_COMMAND,
+    RolePolicy.METHOD_SESSION_REQUEST,
+)

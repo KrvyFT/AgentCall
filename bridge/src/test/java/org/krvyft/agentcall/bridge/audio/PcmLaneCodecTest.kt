@@ -96,6 +96,20 @@ class PcmLaneCodecTest {
     }
 
     @Test
+    fun zeroAndOneByteLengthFieldsAreRejectedAsInvalidFrameLength() {
+        for (length in listOf(0, 1)) {
+            val header = byteArrayOf(0, 0, 0, length.toByte())
+            val read = PcmLaneCodec.readFrame(ByteArrayInputStream(header))
+            assertTrue("length=" + length, read is PcmLaneRead.Invalid)
+            assertEquals(
+                "length=" + length,
+                PcmLaneCodec.ERROR_FRAME_LENGTH,
+                (read as PcmLaneRead.Invalid).code,
+            )
+        }
+    }
+
+    @Test
     fun emptyStreamReportsClosedAndWriteRefusesOversizedBodies() {
         assertTrue(PcmLaneCodec.readFrame(ByteArrayInputStream(ByteArray(0))) === PcmLaneRead.Closed)
 

@@ -13,6 +13,8 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+import org.krvyft.agentcall.bridge.BridgeWiring
+import org.krvyft.agentcall.bridge.ipc.ControlServer
 import org.krvyft.agentcall.core.model.AudioFormatSpec
 import org.krvyft.agentcall.core.model.PeerIdentity
 import org.krvyft.agentcall.core.model.PeerRole
@@ -58,7 +60,8 @@ class AudioPcmRelayTest {
     fun setUp() {
         owner = MutableOwner()
         links = FakeWorkerLinkFactory(format)
-        relay = AudioPcmRelay(owner, links, clock)
+        // 生产装配点：socket 名必须来自 ControlServer 的 APP lane，不是 root 私有 worker lane。
+        relay = BridgeWiring.audioPcmRelay(owner, links, clock)
     }
 
     @After
@@ -83,7 +86,14 @@ class AudioPcmRelayTest {
         owner.own(sessionA)
         val opened = relay.open(sessionA, appPeer, format)
         assertTrue(opened is PcmOpenResult.Opened)
-        assertEquals(AudioPcmProtocol.SOCKET_NAME, (opened as PcmOpenResult.Opened).socketName)
+        // C1：APP 必须被指向 ControlServer 真正 bind 的 APP lane 字面值；
+        // 共享常量会让“两边一起写成 worker lane”永远通过。
+        assertEquals("org.krvyft.agentcall.pcm", (opened as PcmOpenResult.Opened).socketName)
+        assertEquals(ControlServer.DEFAULT_PCM_SOCKET, opened.socketName)
+        assertFalse(
+            "APP lane 绝不能是 root 私有的 worker lane",
+            opened.socketName == AudioPcmProtocol.SOCKET_NAME,
+        )
         assertEquals(format, opened.format)
     }
 
@@ -115,19 +125,76 @@ class AudioPcmRelayTest {
     }
 
     @Test
-    fun capacityIsBoundedAndExpiredOrReleasedStaleBindingsAreSwept() {
+    fun capacityIsRejectedAtTheExactLimit() {
+        val bounded = (0 until AudioPcmRelay.MAX_SESSIONS).map { SessionId("epoch-1", "call-cap-" + it) }
+        for (id in bounded) {
+            owner.own(id)
+            assertTrue(relay.open(id, appPeer, format) is PcmOpenResult.Opened)
+        }
+        assertEquals(AudioPcmRelay.MAX_SESSIONS, relay.boundSessionCount())
+
+        val overflow = SessionId("epoch-1", "call-cap-overflow")
+        owner.own(overflow)
+        val rejected = relay.open(overflow, appPeer, format)
+        assertTrue(rejected is PcmOpenResult.Rejected)
+        assertEquals("audio_pcm_capacity", (rejected as PcmOpenResult.Rejected).code)
+        // 有界失败：容量没有因为被拒绝而增加，也没有留下半个绑定。
+        assertEquals(AudioPcmRelay.MAX_SESSIONS, relay.boundSessionCount())
+        assertNull(relay.sessionState(overflow))
+
+        // 未过期不回收：刚好等于接入期限仍算有效。
+        clock.now += AudioPcmRelay.ATTACH_DEADLINE_MS
+        val stillFull = relay.open(overflow, appPeer, format)
+        assertEquals("audio_pcm_capacity", (stillFull as PcmOpenResult.Rejected).code)
+    }
+
+    @Test
+    fun expiredBoundBindingsAreSweptButAttachedOnesSurvive() {
         owner.own(sessionA)
-        owner.own(sessionB)
         assertTrue(relay.open(sessionA, appPeer, format) is PcmOpenResult.Opened)
+        // A 是活连接：即使过了接入期限也必须保留。
+        val attached = attach(sessionA, appPeer)
+        attached.awaitOpenOk()
+
+        owner.own(sessionB)
         assertTrue(relay.open(sessionB, appPeer, format) is PcmOpenResult.Opened)
+        clock.now += AudioPcmRelay.ATTACH_DEADLINE_MS + 1
 
         val third = SessionId("epoch-1", "call-C")
         owner.own(third)
-        clock.now += AudioPcmRelay.ATTACH_DEADLINE_MS + 1
-        // 两个过期绑定先被回收，第三个会话才能绑定（容量 2 → 回收后 1）。
-        val opened = relay.open(third, appPeer, format)
-        assertTrue(opened is PcmOpenResult.Opened)
-        assertTrue(relay.boundSessionCount() <= AudioPcmRelay.MAX_SESSIONS)
+        assertTrue(relay.open(third, appPeer, format) is PcmOpenResult.Opened)
+
+        // 过期的 BOUND（B）被回收；ATTACHED（A）与新绑定（C）留下。
+        assertEquals(2, relay.boundSessionCount())
+        assertEquals(PcmRelayState.ATTACHED, relay.sessionState(sessionA))
+        assertNull(relay.sessionState(sessionB))
+        assertNotNull(relay.sessionState(third))
+    }
+
+    @Test
+    fun reopeningABindingWithADifferentFormatIsRejectedAndKeepsTheBoundFormat() {
+        owner.own(sessionA)
+        assertTrue(relay.open(sessionA, appPeer, format) is PcmOpenResult.Opened)
+
+        val rejected = relay.open(sessionA, appPeer, AudioFormatSpec(sampleRate = 48_000))
+        assertTrue(rejected is PcmOpenResult.Rejected)
+        assertEquals("audio_pcm_format_mismatch", (rejected as PcmOpenResult.Rejected).code)
+
+        // 绑定仍以第一次的格式为准：同格式可再次拿到 open（握手必须重复该格式）。
+        val again = relay.open(sessionA, appPeer, format)
+        assertTrue(again is PcmOpenResult.Opened)
+        assertEquals(format, (again as PcmOpenResult.Opened).format)
+    }
+
+    @Test
+    fun openFailsClosedOnceTheRelayIsClosed() {
+        owner.own(sessionA)
+        relay.close()
+
+        val rejected = relay.open(sessionA, appPeer, format)
+        assertTrue(rejected is PcmOpenResult.Rejected)
+        assertEquals("audio_pcm_closed", (rejected as PcmOpenResult.Rejected).code)
+        assertEquals(0, relay.boundSessionCount())
     }
 
     // ------------------------------------------------------------------ 接入
@@ -277,6 +344,58 @@ class AudioPcmRelayTest {
         assertEquals(PcmLaneCodec.ERROR_FRAME_TOO_LARGE, a.lastErrorCode)
         a.thread.join(2_000)
         assertFalse(a.thread.isAlive)
+    }
+
+    @Test
+    fun secondControlFrameFromAppMustBeStopOtherwiseControlInvalid() {
+        owner.own(sessionA)
+        assertTrue(relay.open(sessionA, appPeer, format) is PcmOpenResult.Opened)
+        val a = attach(sessionA, appPeer)
+        a.awaitOpenOk()
+
+        // 接通之后再发 open 握手：控制帧语义不合法，必须机器码失败并关链路。
+        a.appInput.feed(
+            frameBytes(PcmLaneType.CONTROL, PcmLaneCodec.encodeOpen(sessionA, format)),
+        )
+        a.awaitControlError()
+        assertEquals("audio_pcm_control_invalid", a.lastErrorCode)
+        a.thread.join(2_000)
+        assertFalse(a.thread.isAlive)
+    }
+
+    @Test
+    fun workerBoundFrameTypesFromAppAreRejected() {
+        owner.own(sessionA)
+        assertTrue(relay.open(sessionA, appPeer, format) is PcmOpenResult.Opened)
+        val a = attach(sessionA, appPeer)
+        a.awaitOpenOk()
+
+        // APP 只能发控制/上行；下行（0x02）与 ACK（0x04）都是 worker 方向。
+        a.appInput.feed(frameBytes(PcmLaneType.DOWNLINK, byteArrayOf(1, 2)))
+        a.awaitControlError()
+        assertEquals("audio_pcm_frame_type_invalid", a.lastErrorCode)
+        a.thread.join(2_000)
+        assertFalse(a.thread.isAlive)
+    }
+
+    @Test
+    fun sweepDisownedReleasesBindingsForSessionsTheSupervisorNoLongerOwns() {
+        owner.own(sessionA)
+        assertTrue(relay.open(sessionA, appPeer, format) is PcmOpenResult.Opened)
+        val a = attach(sessionA, appPeer)
+        a.awaitOpenOk()
+
+        // 监督端仍持有：不得误删活绑定。
+        assertEquals(0, relay.sweepDisowned())
+        assertEquals(PcmRelayState.ATTACHED, relay.sessionState(sessionA))
+
+        // 故障终止/断开后所有权消失：轮询必须释放绑定并关掉活连接。
+        owner.disown(sessionA)
+        assertEquals(1, relay.sweepDisowned())
+        assertNull(relay.sessionState(sessionA))
+        a.thread.join(2_000)
+        assertFalse(a.thread.isAlive)
+        awaitCondition("worker link closed") { a.link.isClosed }
     }
 
     // ------------------------------------------------------------------ 停止/重启

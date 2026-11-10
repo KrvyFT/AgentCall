@@ -109,20 +109,86 @@ class HookCallInboxTest {
     @Test
     fun awaitedResultIsMatchedBySessionAndCommand() = runBlocking {
         val inbox = HookCallInbox()
+        val wait = waitFor(inbox, session, CallCommand.Answer)
         inbox.recordResult(other, CallCommand.Answer, CommandResult.Accepted)
         inbox.recordResult(session, CallCommand.Hangup, CommandResult.Accepted)
         inbox.recordResult(session, CallCommand.Answer, CommandResult.Rejected(RejectReason.NOT_RINGING))
 
-        val result = inbox.awaitResult(session, CallCommand.Answer, timeoutMs = 50)
+        val outcome = inbox.awaitResult(wait, timeoutMs = 50)
 
-        assertEquals(CommandResult.Rejected(RejectReason.NOT_RINGING), result)
-        assertNull("匹配项被消费后不得重复返回", inbox.awaitResult(session, CallCommand.Answer, timeoutMs = 10))
+        assertEquals(
+            CommandResult.Rejected(RejectReason.NOT_RINGING),
+            (outcome as HookCallInbox.AwaitOutcome.Delivered).result,
+        )
+        inbox.endWait(wait)
+        // 匹配项被消费后不得重复返回。
+        val second = waitFor(inbox, session, CallCommand.Answer)
+        assertEquals(HookCallInbox.AwaitOutcome.TimedOut, inbox.awaitResult(second, timeoutMs = 10))
+        inbox.endWait(second)
     }
 
     @Test
     fun missingResultTimesOutAsAmbiguous() = runBlocking {
         val inbox = HookCallInbox()
-        assertNull(inbox.awaitResult(session, CallCommand.Hangup, timeoutMs = 20))
+        val wait = waitFor(inbox, session, CallCommand.Hangup)
+        assertEquals(HookCallInbox.AwaitOutcome.TimedOut, inbox.awaitResult(wait, timeoutMs = 20))
+        inbox.endWait(wait)
+    }
+
+    /**
+     * I3：上一次入队超时后才到的结果必须只属于上一次入队——新的等待者不能把它当成
+     * 自己的 Accepted（否则会把一条根本没下发的命令报成成功）。
+     */
+    @Test
+    fun resultsRecordedBeforeTheWaitAreStaleAndNeverDelivered() = runBlocking {
+        val inbox = HookCallInbox()
+        // 上一次等待已超时，结果现在才落进 inbox。
+        inbox.recordResult(session, CallCommand.Answer, CommandResult.Accepted)
+
+        val wait = waitFor(inbox, session, CallCommand.Answer)
+        assertEquals(HookCallInbox.AwaitOutcome.TimedOut, inbox.awaitResult(wait, timeoutMs = 30))
+        inbox.endWait(wait)
+    }
+
+    /**
+     * I2：同一 (session, command) 的结果只能有一个权威等待者。监督端（session.request 的
+     * Answer）可以抢占 APP 的等待者；被抢占方必须立刻得到 Superseded，而不是超时。
+     */
+    @Test
+    fun supervisorWaitSupersedesTheAppWaiterForTheSameCommand() = runBlocking {
+        val inbox = HookCallInbox()
+        val appWait = waitFor(inbox, session, CallCommand.Answer)
+        val supervisorWait = inbox.beginSupervisorWait(session, CallCommand.Answer)
+        assertTrue(inbox.awaitResult(appWait, timeoutMs = 200) is HookCallInbox.AwaitOutcome.Superseded)
+        inbox.endWait(appWait)
+
+        inbox.recordResult(session, CallCommand.Answer, CommandResult.Accepted)
+        val outcome = inbox.awaitResult(supervisorWait, timeoutMs = 200)
+        assertEquals(CommandResult.Accepted, (outcome as HookCallInbox.AwaitOutcome.Delivered).result)
+        inbox.endWait(supervisorWait)
+    }
+
+    @Test
+    fun appAnswerWaitIsDeniedWhileASupervisorAnswerIsInFlight() {
+        val inbox = HookCallInbox()
+        inbox.beginSupervisorAnswer(session)
+        assertTrue(inbox.supervisorAnswerInFlight(session))
+        assertEquals(
+            HookCallInbox.AppWait.SupervisorInFlight,
+            inbox.beginAppWait(session, CallCommand.Answer),
+        )
+        inbox.endSupervisorAnswer(session)
+        assertTrue(inbox.beginAppWait(session, CallCommand.Answer) is HookCallInbox.AppWait.Started)
+    }
+
+    private fun waitFor(
+        inbox: HookCallInbox,
+        session: SessionId,
+        command: CallCommand,
+    ): HookCallInbox.Wait {
+        val started = inbox.beginAppWait(session, command)
+        assertTrue("wait must start: " + started, started is HookCallInbox.AppWait.Started)
+        return (started as HookCallInbox.AppWait.Started).wait
     }
 
     @Test

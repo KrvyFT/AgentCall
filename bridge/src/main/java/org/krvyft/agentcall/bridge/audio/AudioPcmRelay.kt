@@ -119,7 +119,13 @@ class AudioPcmRelay(
     private val owner: PcmSessionOwner,
     private val workerLinks: PcmWorkerLinkFactory,
     private val clock: MonotonicClock,
-    private val socketName: String = AudioPcmProtocol.SOCKET_NAME,
+    /**
+     * audio.channel 返回给 APP 的 PCM lane 名：**必须是 APP 可达的哪个 socket**，
+     * 由调用方注入（生产装配点 [org.krvyft.agentcall.bridge.BridgeWiring]）。
+     * 没有默认值：默认成 root 私有的 worker lane（[AudioPcmProtocol.SOCKET_NAME]）会让
+     * APP 连到一个只接受 uid 0 的 socket，端到端音频直接死掉（评审 C1）。
+     */
+    private val socketName: String,
     private val maxSessions: Int = MAX_SESSIONS,
     private val uplinkQueueCapacity: Int = UPLINK_QUEUE_CAPACITY,
     private val attachDeadlineMs: Long = ATTACH_DEADLINE_MS,
@@ -175,6 +181,14 @@ class AudioPcmRelay(
                 if (existing.uid != peer.uid) {
                     return PcmOpenResult.Rejected(ERROR_SESSION_DENIED, "session is bound to another APP identity")
                 }
+                // 绑定以第一次 audio.channel 的格式为准：改格式不是"重开"，而是换一条流。
+                // fail closed（拒绝），而不是悄悄换成新格式让握手对不上。
+                if (existing.format != format) {
+                    return PcmOpenResult.Rejected(
+                        ERROR_FORMAT_MISMATCH,
+                        "session is already bound to a different audio format",
+                    )
+                }
                 if (existing.attaching || existing.state == PcmRelayState.ATTACHED) {
                     return PcmOpenResult.Rejected(ERROR_ALREADY_ATTACHED, "session already has a live PCM connection")
                 }
@@ -225,6 +239,32 @@ class AudioPcmRelay(
             collected
         }
         for (hook in hooks) runCatching { hook() }
+    }
+
+    /**
+     * 释放监督端已不再拥有的会话绑定（BOUND/ATTACHED/STALE 都算），并关闭活连接。
+     *
+     * 生产由监督轮询循环每轮调用（BridgeRuntime 的 poll 线程）：故障终止、断开确认、
+     * 人工交还之后不依赖"下一次 audio.channel"来惰性回收，也不会让 4 条容量被已结束的
+     * 通话长期占住。返回本次释放的绑定数。
+     */
+    fun sweepDisowned(): Int {
+        val hooks = ArrayList<() -> Unit>()
+        val removed = synchronized(lock) {
+            val iterator = bindings.entries.iterator()
+            var count = 0
+            while (iterator.hasNext()) {
+                val entry = iterator.next()
+                if (owner.owns(entry.key)) continue
+                entry.value.closeHook?.let(hooks::add)
+                entry.value.closeHook = null
+                iterator.remove()
+                count++
+            }
+            count
+        }
+        for (hook in hooks) runCatching { hook() }
+        return removed
     }
 
     // ------------------------------------------------------------------ PCM 连接

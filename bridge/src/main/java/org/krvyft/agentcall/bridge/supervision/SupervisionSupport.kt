@@ -496,6 +496,11 @@ class SupervisionLoop(
     private val clock: MonotonicClock,
     private val intervalMs: Long = DEFAULT_POLL_INTERVAL_MS,
     private val actionSink: (List<SupervisorAction>) -> Unit = {},
+    /**
+     * 每轮轮询前的旁路清理（例如释放监督端已不再拥有的 APP 音频绑定）。
+     * 只做本地、有界的资源回收；异常绝不能打断轮询驱动。
+     */
+    private val beforePoll: () -> Unit = {},
 ) {
     init {
         require(intervalMs > 0L) { "intervalMs must be positive" }
@@ -511,6 +516,11 @@ class SupervisionLoop(
 
     suspend fun run(shouldStop: () -> Boolean = { false }) {
         while (!shouldStop()) {
+            try {
+                beforePoll()
+            } catch (t: Throwable) {
+                // 清理失败不影响轮询：故障窗口/心跳超时仍必须被驱动。
+            }
             try {
                 pollOnce()
             } catch (cancelled: kotlinx.coroutines.CancellationException) {
@@ -571,7 +581,11 @@ class SupervisionGraph(
  */
 object SupervisorProductionGraph {
 
-    fun build(platform: SupervisionPlatform): SupervisionGraph {
+    fun build(
+        platform: SupervisionPlatform,
+        /** 每轮轮询前的旁路清理；生产用于释放监督端已不再拥有的 APP 音频绑定。 */
+        beforePoll: () -> Unit = {},
+    ): SupervisionGraph {
         val audio = platform.supervisedAudio()
         val store = platform.stateStore()
         val clock = platform.clock()
@@ -592,6 +606,7 @@ object SupervisorProductionGraph {
         val loop = SupervisionLoop(
             poll = supervisor::poll,
             clock = clock,
+            beforePoll = beforePoll,
         )
         return SupervisionGraph(supervisor, recovery, loop)
     }

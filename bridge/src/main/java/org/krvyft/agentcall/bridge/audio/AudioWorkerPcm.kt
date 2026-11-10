@@ -237,9 +237,7 @@ class LocalSocketPcmWorkerLink(
             } catch (io: IOException) {
                 null
             }
-            if (serverUid != AudioPcmProtocol.ROOT_UID) {
-                throw AudioPcmLinkException(ERROR_UNTRUSTED_SERVER, "audio PCM server uid is not root")
-            }
+            requireRootServer(serverUid)
             socket.soTimeout = AudioPcmProtocol.HANDSHAKE_TIMEOUT_MS
         } catch (error: AudioPcmLinkException) {
             runCatching { socket.close() }
@@ -265,6 +263,16 @@ class LocalSocketPcmWorkerLink(
     companion object {
         const val ERROR_UNREACHABLE: String = "audio_pcm_worker_unavailable"
         const val ERROR_UNTRUSTED_SERVER: String = "audio_pcm_worker_untrusted"
+
+        /**
+         * 对端 uid 信任判定（纯函数，JVM 可测）：abstract socket 名字可能被非 root 进程
+         * 抢先绑定，因此连接之后、发送任何字节之前必须核对对端是 uid 0，否则 fail closed。
+         */
+        internal fun requireRootServer(serverUid: Int?) {
+            if (serverUid != AudioPcmProtocol.ROOT_UID) {
+                throw AudioPcmLinkException(ERROR_UNTRUSTED_SERVER, "audio PCM server uid is not root")
+            }
+        }
     }
 }
 

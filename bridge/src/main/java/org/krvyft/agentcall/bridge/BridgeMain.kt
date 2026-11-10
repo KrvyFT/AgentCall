@@ -38,7 +38,6 @@ import org.krvyft.agentcall.bridge.supervision.CallStateProbe
 import org.krvyft.agentcall.bridge.supervision.EmergencyCallControl
 import org.krvyft.agentcall.bridge.supervision.HookCallInbox
 import org.krvyft.agentcall.bridge.supervision.HookCommandCallControl
-import org.krvyft.agentcall.bridge.supervision.HookCommandResultDecoder
 import org.krvyft.agentcall.bridge.supervision.HookSnapshotDecoder
 import org.krvyft.agentcall.bridge.supervision.ReflectiveTelecomTermination
 import org.krvyft.agentcall.bridge.supervision.SnapshotCallStateProbe
@@ -157,9 +156,30 @@ internal object BridgeRuntime {
         // 监督角色：生产图由唯一装配点构造（C1）；训练/测试不得另写一套逻辑。
         val hookCommands = HookCommandRouter()
         val inbox = HookCallInbox()
-        val supervision = buildSupervision(root, hookCommands, inbox, calibration, environment)
+        // PCM 中继必须先于监督图存在（轮询的旁路清理要引用它），它的 owner 谓词读监督端
+        // 实时快照；读取只发生在 [supervisionRef] 赋值之后（dispatcher/轮询线程都在其后）。
+        var supervisionRef: SupervisionGraph? = null
+        val pcmRelay = BridgeWiring.audioPcmRelay(
+            owner = PcmSessionOwner { id -> supervisionRef?.supervisor?.snapshot()?.ownedSession == id },
+            workerLinks = PcmWorkerLinkFactory { LocalSocketPcmWorkerLink().also { it.connect() } },
+            clock = AndroidAudioPlatform.clock(),
+        )
+        val supervision = buildSupervision(
+            root = root,
+            hookCommands = hookCommands,
+            inbox = inbox,
+            calibration = calibration,
+            environment = environment,
+            // 每轮轮询前释放监督端已不再拥有的 APP 音频绑定（断开/故障终止/交还）。
+            beforePoll = { pcmRelay.sweepDisowned() },
+        )
+        supervisionRef = supervision
         val bootOutcome = runBlocking { supervision.recovery.recover() }
         supervision.supervisor.start()
+
+        val shutdown = CountDownLatch(1)
+        var server: ControlServer? = null
+        val supervisionRpc = SupervisorRpcPort(supervision.supervisor, inbox)
         val pollRunning = AtomicBoolean(true)
         val pollThread = Thread(
             { runBlocking { supervision.loop.run { !pollRunning.get() } } },
@@ -168,17 +188,6 @@ internal object BridgeRuntime {
             isDaemon = true
             start()
         }
-
-        val shutdown = CountDownLatch(1)
-        var server: ControlServer? = null
-        val supervisionRpc = SupervisorRpcPort(supervision.supervisor, inbox)
-        // APP ↔ bridge ↔ audio worker 的 PCM 中继：会话归属只看监督端快照的 ownedSession，
-        // worker 链路是独立的 root 私有 socket（绝不与 AudioRole 生命周期通道混用）。
-        val pcmRelay = AudioPcmRelay(
-            owner = PcmSessionOwner { id -> supervision.supervisor.snapshot().ownedSession == id },
-            workerLinks = PcmWorkerLinkFactory { LocalSocketPcmWorkerLink().also { it.connect() } },
-            clock = AndroidAudioPlatform.clock(),
-        )
         val dispatcher = ControlDispatcher(
             store = store,
             packages = packages,
@@ -203,6 +212,8 @@ internal object BridgeRuntime {
             verifier = verifier,
             handler = dispatcher,
             pcmSession = pcmRelay,
+            // 与 audio.channel 返回给 APP 的名字同源：两处都由 BridgeWiring 决定。
+            pcmSocketName = BridgeWiring.pcmSocketName(),
         )
         server = controlServer
         try {
@@ -271,6 +282,8 @@ internal object BridgeRuntime {
         inbox: HookCallInbox,
         calibration: CalibrationStore,
         environment: EnvironmentKey,
+        /** 每轮轮询前的旁路清理（生产：释放已不归监督端的 APP 音频绑定）。 */
+        beforePoll: () -> Unit = {},
     ): SupervisionGraph {
         val clock: MonotonicClock = AndroidAudioPlatform.clock()
         val stateStore = SupervisionStateStore(root)
@@ -297,8 +310,38 @@ internal object BridgeRuntime {
                 // 接听结果不明确时必须能核验真实状态：生产来源是 Hook 快照收件箱。
                 override fun callState(): CallStateProbe = SnapshotCallStateProbe(inbox)
             },
+            beforePoll = beforePoll,
         )
     }
+}
+
+/**
+ * APP 音频 lane 的唯一生产装配点。
+ *
+ * audio.channel 返回给 APP 的 socket 名必须**就是** [ControlServer] 真正 bind 的 APP lane
+ * 名字（[ControlServer.DEFAULT_PCM_SOCKET] = `org.krvyft.agentcall.pcm`）。桥接 ↔ 音频工作
+ * 进程之间另有一条 root 私有的 lane（[AudioPcmProtocol.SOCKET_NAME] =
+ * `org.krvyft.agentcall.audio-pcm`），它只接受 uid 0，APP 连不上——绝不能把它写进
+ * audio.channel 的响应（评审 C1：7B 会照着连，然后被拒）。
+ *
+ * 装配点集中在这里，测试断言的是生产装配的字面值，而不是两处共用同一个常量
+ * （共用常量会让"两边一起写错"永远通过）。
+ */
+internal object BridgeWiring {
+
+    /** APP 可达的 PCM lane 名（ControlServer 在 binding 时使用的那个）。 */
+    fun pcmSocketName(): String = ControlServer.DEFAULT_PCM_SOCKET
+
+    fun audioPcmRelay(
+        owner: PcmSessionOwner,
+        workerLinks: PcmWorkerLinkFactory,
+        clock: MonotonicClock,
+    ): AudioPcmRelay = AudioPcmRelay(
+        owner = owner,
+        workerLinks = workerLinks,
+        clock = clock,
+        socketName = pcmSocketName(),
+    )
 }
 
 /**
@@ -371,6 +414,11 @@ internal class ControlDispatcher(
      * method_not_implemented，绝不假装成功）；生产装配由 BridgeRuntime 注入。
      */
     private val audioPcm: AudioPcmRelay? = null,
+    /**
+     * session.command 等待 HOOK 结果的硬上限。默认就是与监督端同源的
+     * [APP_COMMAND_TIMEOUT_MS]（4000 ms）；显式参数只用于测试缩短等待。
+     */
+    private val commandTimeoutMs: Long = APP_COMMAND_TIMEOUT_MS,
 ) : RpcHandler {
 
     /**
@@ -380,10 +428,6 @@ internal class ControlDispatcher(
      */
     fun enqueueHookCommand(session: SessionId, command: CallCommand): Boolean =
         hookCommands.enqueueCommand(session, command)
-
-    /** 取走 Hook 已回报的命令结果（每条只返回一次）。 */
-    fun takeHookCommandResults(): List<HookCommandRouter.HookCommandOutcome> =
-        hookCommands.takeResults()
 
     override fun handle(peer: PeerIdentity, request: RpcRequest): RpcResponse = try {
         // 任何已鉴权请求都证明该角色此刻活着；存活按会话归属记录（I1）。
@@ -428,8 +472,15 @@ internal class ControlDispatcher(
         if (request.payload.isNotEmpty() && request.payload.length > MAX_SESSION_REQUEST_CHARS) {
             return failure(request, "payload_invalid", "session.request payload is too large")
         }
-        val result = runBlocking { supervision.prepareAnswer(session) }
-        return ok(request, encodeCommandResult(result))
+        // I2：整个 prepareAnswer 窗口内 APP 都不许再发 Answer——否则两条等待会抢同一条
+        // 结果，监督端可能把"结果被抢走"误判成超时并进入不明确的接管路径。
+        hookInbox.beginSupervisorAnswer(session)
+        try {
+            val result = runBlocking { supervision.prepareAnswer(session) }
+            return ok(request, encodeCommandResult(result))
+        } finally {
+            hookInbox.endSupervisorAnswer(session)
+        }
     }
 
     /**
@@ -477,16 +528,41 @@ internal class ControlDispatcher(
                 "session.command payload must be {\"command\":\"answer\"|\"hangup\"}",
             )
         }
-        if (!hookCommands.enqueueCommand(session, command)) {
-            return failure(request, ERROR_COMMAND_NOT_QUEUED, "hook command queue rejected the command")
-        }
-        val result = runBlocking { hookInbox.awaitResult(session, command, APP_COMMAND_TIMEOUT_MS) }
-            ?: return failure(
+        // I2/I3：先建立（或抢不到）一个专属等待凭据，再入队。监督端正在接听时 APP 的
+        // answer 直接 answer_in_flight；同一个 (session, command) 也绝不允许两个 APP 等待者。
+        val wait = when (val started = hookInbox.beginAppWait(session, command)) {
+            is HookCallInbox.AppWait.Started -> started.wait
+            HookCallInbox.AppWait.SupervisorInFlight -> return failure(
                 request,
-                ERROR_COMMAND_TIMEOUT,
-                "no hook command result within " + APP_COMMAND_TIMEOUT_MS + " ms",
+                inFlightCode(command),
+                "the supervisor is already waiting for this command result",
             )
-        return ok(request, encodeCommandResult(result))
+            HookCallInbox.AppWait.WaiterInFlight -> return failure(
+                request,
+                inFlightCode(command),
+                "another APP request is already waiting for this command result",
+            )
+        }
+        try {
+            if (!hookCommands.enqueueCommand(session, command)) {
+                return failure(request, ERROR_COMMAND_NOT_QUEUED, "hook command queue rejected the command")
+            }
+            return when (val outcome = runBlocking { hookInbox.awaitResult(wait, commandTimeoutMs) }) {
+                is HookCallInbox.AwaitOutcome.Delivered -> ok(request, encodeCommandResult(outcome.result))
+                HookCallInbox.AwaitOutcome.TimedOut -> failure(
+                    request,
+                    ERROR_COMMAND_TIMEOUT,
+                    "no hook command result within " + commandTimeoutMs + " ms",
+                )
+                HookCallInbox.AwaitOutcome.Superseded -> failure(
+                    request,
+                    inFlightCode(command),
+                    "the supervisor took over this command result",
+                )
+            }
+        } finally {
+            hookInbox.endWait(wait)
+        }
     }
 
     /**
@@ -548,6 +624,12 @@ internal class ControlDispatcher(
         return ok(request, json.toString())
     }
 
+    /** "结果归属"拒绝码：Answer 与 Hangup 各自机器可读，7B 可据此区分重试策略。 */
+    private fun inFlightCode(command: CallCommand): String = when (command) {
+        CallCommand.Answer -> ERROR_ANSWER_IN_FLIGHT
+        CallCommand.Hangup -> ERROR_COMMAND_IN_FLIGHT
+    }
+
     private fun encodeCommandResult(result: CommandResult): String {
         val json = JsonObject()
         when (result) {
@@ -582,12 +664,20 @@ internal class ControlDispatcher(
         val decoded = HookSnapshotDecoder.decode(session, payload) ?: return
         supervision.recordSnapshotState(session, decoded.state)
         if (decoded.handbackReason != null) {
-            runBlocking { supervision.onManualTakeover(session) }
+            val outcome = runBlocking { supervision.onManualTakeover(session) }
+            // 监督端已撤销所有权（确认交还/恢复失败）：APP 的音频绑定必须立刻释放。
+            if (outcome is TakeoverOutcome.Confirmed || outcome is TakeoverOutcome.RestoreFailed) {
+                audioPcm?.release(session)
+            }
             return
         }
         when (decoded.state) {
             CallState.ACTIVE -> runBlocking { supervision.onCallActive(session) }
-            CallState.DISCONNECTED -> runBlocking { supervision.onCallDisconnected(session) }
+            CallState.DISCONNECTED -> {
+                runBlocking { supervision.onCallDisconnected(session) }
+                // 断开确认即"非所有权"：不需要等下一次 audio.channel/轮询才回收绑定。
+                audioPcm?.release(session)
+            }
             else -> Unit
         }
     }
@@ -596,13 +686,11 @@ internal class ControlDispatcher(
     private fun hookCommandResult(request: RpcRequest): RpcResponse {
         val session = request.sessionId
             ?: return failure(request, "payload_invalid", "hook calls must carry a session id")
-        val decoded = HookCommandResultDecoder.decode(session, request.payload)
+        // 唯一解析点（路由器固定字段校验）→ 唯一结果通路（监督端收件箱）。
+        // 没有第二个结果缓冲区：超过任意条数也不会开始拒绝真实结果（评审 I4）。
+        val outcome = hookCommands.parseResult(session, request.payload)
             ?: return failure(request, "payload_invalid", "command result payload is invalid")
-        if (!hookCommands.recordResult(session, request.payload)) {
-            return failure(request, "payload_invalid", "command result payload is invalid")
-        }
-        // 监督端只取自己等待的那一条；路由器仍把结果留给 APP 侧。
-        supervision.recordCommandResult(session, decoded.command, decoded.result)
+        supervision.recordCommandResult(session, outcome.command, outcome.result)
         return ok(request, "")
     }
 
@@ -773,7 +861,7 @@ internal class ControlDispatcher(
         data object Invalid : AppCommandDecode
     }
 
-    private companion object {
+    internal companion object {
         val PACKAGE_PATTERN = Regex("[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)+")
         const val MAX_SESSION_REQUEST_CHARS: Int = 1024
         const val MAX_ERROR_TEXT_CHARS: Int = 200
@@ -787,6 +875,15 @@ internal class ControlDispatcher(
 
         /** 负载不是固定字段表/受限命令时的机器可读错误（与既有 RPC 错误码同名）。 */
         const val ERROR_PAYLOAD_INVALID: String = "payload_invalid"
+
+        /**
+         * 监督端正在准备/等待同一条 Answer 的结果：APP 的 answer 被拒绝（不入队）。
+         * 这是"结果归属"仲裁，不是超时，绝不能把监督端的结果让给 APP。
+         */
+        const val ERROR_ANSWER_IN_FLIGHT: String = "answer_in_flight"
+
+        /** 同一 (session, command) 已有另一个 APP 等待者：有界拒绝，不入队。 */
+        const val ERROR_COMMAND_IN_FLIGHT: String = "command_in_flight"
 
         /** 命令结构合法，但不在 APP 允许的受限命令表里。 */
         const val ERROR_UNSUPPORTED_COMMAND: String = "unsupported_command"

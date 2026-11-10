@@ -355,6 +355,29 @@ class SupervisionLoopTest {
     }
 
     @Test
+    fun runInvokesBeforePollEachIterationAndSurvivesItsFailure() = runBlocking {
+        var polls = 0
+        var cleanups = 0
+        val loop = SupervisionLoop(
+            poll = {
+                polls++
+                emptyList()
+            },
+            clock = SupportClock(),
+            intervalMs = 1L,
+            beforePoll = {
+                cleanups++
+                error("cleanup failure must never stop the poll driver")
+            },
+        )
+
+        loop.run { polls >= 3 }
+
+        assertEquals(3, polls)
+        assertTrue("每轮都必须尝试清理（实际 " + cleanups + " 次）", cleanups >= 3)
+    }
+
+    @Test
     fun runStopsWhenPredicateSaysSo() = runBlocking {
         var polls = 0
         val loop = SupervisionLoop(
