@@ -113,8 +113,9 @@ class RolePolicyTest {
     fun appCannotUseRootOrHookOnlyCommands() {
         assertFalse(RolePolicy.authorize(appPeer(), request(RolePolicy.METHOD_CONFIG_WRITE)))
         assertFalse(RolePolicy.authorize(appPeer(), request(RolePolicy.METHOD_PAIR)))
-        assertFalse(RolePolicy.authorize(appPeer(), request(RolePolicy.METHOD_DIAGNOSE)))
         assertFalse(RolePolicy.authorize(appPeer(), request(RolePolicy.METHOD_SHUTDOWN)))
+        // status/diagnose 自 Task 7C 起对 APP 只读开放（真实 APK 必须能读到桥接状态与
+        // 诊断），但写入/配对/关闭仍然只属于 CLI_ROOT。
         assertFalse(RolePolicy.authorize(appPeer(), request(RolePolicy.METHOD_HOOK_SNAPSHOT, session)))
         assertFalse(RolePolicy.authorize(appPeer(), request(RolePolicy.METHOD_HOOK_HEARTBEAT, session)))
     }
@@ -145,7 +146,7 @@ class RolePolicyTest {
     @Test
     fun fixedRoleMethodTableIsExact() {
         // 固定表必须逐项相等：多一个方法（例如把 HOOK 命令暴露给 APP）就是权限回归，
-        // 少一个方法就是 Task 7 的 APP→bridge 命令/心跳通道被悄悄删掉。
+        // 少一个方法就是 Task 7 的 APP→bridge 命令/心跳/事件通道被悄悄删掉。
         assertEquals(
             setOf(
                 RolePolicy.METHOD_SESSION_REQUEST,
@@ -155,6 +156,10 @@ class RolePolicyTest {
                 RolePolicy.METHOD_HANDOVER,
                 RolePolicy.METHOD_SESSION_HEARTBEAT,
                 RolePolicy.METHOD_SESSION_COMMAND,
+                // Task 7C：APP 的只读状态/诊断与 APP 事件流（协议版本仍为 1）。
+                RolePolicy.METHOD_STATUS,
+                RolePolicy.METHOD_DIAGNOSE,
+                RolePolicy.METHOD_SESSION_EVENTS,
             ),
             RolePolicy.methodsFor(PeerRole.APP),
         )
@@ -229,6 +234,52 @@ class RolePolicyTest {
         // 配置/状态类方法不绑定会话。
         assertTrue(RolePolicy.authorize(appPeer(), request(RolePolicy.METHOD_CONFIG_READ)))
         assertTrue(RolePolicy.authorize(rootPeer(), request(RolePolicy.METHOD_STATUS)))
+    }
+
+    @Test
+    fun appCanReadStatusAndDiagnoseButNoAppMethodWritesTheConfig() {
+        // Task 7C：APP 必须能读 status/diagnose（否则真实 APK 永远无法 READY），
+        // 但这两个方法都是只读的，APP 永远拿不到任何写入能力。
+        assertTrue(RolePolicy.authorize(appPeer(), request(RolePolicy.METHOD_STATUS)))
+        assertTrue(RolePolicy.authorize(appPeer(), request(RolePolicy.METHOD_DIAGNOSE)))
+        assertFalse(RolePolicy.authorize(appPeer(), request(RolePolicy.METHOD_CONFIG_WRITE)))
+        assertFalse(RolePolicy.authorize(appPeer(), request(RolePolicy.METHOD_PAIR)))
+        assertFalse(RolePolicy.authorize(appPeer(), request(RolePolicy.METHOD_SHUTDOWN)))
+
+        // 未核验身份的 APP 也读不到：status/diagnose 不是匿名诊断口。
+        assertFalse(
+            RolePolicy.authorize(PeerIdentity(10_250, PeerRole.APP), request(RolePolicy.METHOD_STATUS)),
+        )
+        assertFalse(
+            RolePolicy.authorize(PeerIdentity(10_250, PeerRole.APP), request(RolePolicy.METHOD_DIAGNOSE)),
+        )
+    }
+
+    @Test
+    fun sessionEventsIsAppOnlyAndNeedsNoSession() {
+        // APP 事件流是 APP 发现新通话的唯一入口：不需要 sessionId（新通话的 ID 正是它要
+        // 读出来的东西），也不在 SESSION_METHODS 里。
+        assertTrue(RolePolicy.authorize(appPeer(), request(RolePolicy.METHOD_SESSION_EVENTS)))
+
+        // HOOK 与 CLI_ROOT 都不能读 APP 的事件流（即使伪造会话 ID）。
+        assertFalse(RolePolicy.authorize(hookPeer(), request(RolePolicy.METHOD_SESSION_EVENTS, session)))
+        assertFalse(RolePolicy.authorize(rootPeer(), request(RolePolicy.METHOD_SESSION_EVENTS, session)))
+        assertFalse(RolePolicy.methodsFor(PeerRole.HOOK).contains(RolePolicy.METHOD_SESSION_EVENTS))
+        assertFalse(RolePolicy.methodsFor(PeerRole.CLI_ROOT).contains(RolePolicy.METHOD_SESSION_EVENTS))
+
+        // 未核验身份/伪造 uid 0 的 APP 也不能读事件流。
+        assertFalse(
+            RolePolicy.authorize(PeerIdentity(10_250, PeerRole.APP), request(RolePolicy.METHOD_SESSION_EVENTS)),
+        )
+        assertFalse(
+            RolePolicy.authorize(
+                PeerIdentity(0, PeerRole.APP, "org.krvyft.agentcall", appSignature),
+                request(RolePolicy.METHOD_SESSION_EVENTS),
+            ),
+        )
+
+        // 事件流不带会话，但既有会话方法仍然必须带会话。
+        assertFalse(RolePolicy.authorize(appPeer(), request(RolePolicy.METHOD_SESSION_REQUEST)))
     }
 
     @Test

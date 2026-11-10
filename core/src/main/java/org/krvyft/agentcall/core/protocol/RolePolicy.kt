@@ -14,7 +14,7 @@ import org.krvyft.agentcall.core.model.RpcRequest
  *
  * | 角色 | 允许的方法 |
  * | --- | --- |
- * | APP | session.request、session.heartbeat、session.command、config.read、config.secret.read、audio.channel、handover |
+ * | APP | session.request、session.heartbeat、session.command、session.events、status、diagnose、config.read、config.secret.read、audio.channel、handover |
  * | HOOK | hook.snapshot、hook.heartbeat、call.command.result |
  * | CLI_ROOT | status、config.read、config.write、pair、diagnose、shutdown |
  *
@@ -22,6 +22,11 @@ import org.krvyft.agentcall.core.model.RpcRequest
  * 监督阶段；`session.command` 只允许经 HOOK 执行的受限命令（answer/hangup），由 bridge
  * 排入同一份 HookCommandRouter 并等待真实结果。两者都必须携带 SessionId，且只有 APP
  * 能调用：HOOK 不能借 APP 通道下发命令，CLI_ROOT 也不能。
+ *
+ * `status`/`diagnose` 对 APP 也是**只读**：真实 APK 必须能读到桥接状态与诊断（否则永远
+ * 到不了 READY），但 APP 永远拿不到 config.write/pair/shutdown。`session.events` 是 APP
+ * 轮询的会话事件流（发现新通话的唯一入口），因此它**不**在会话方法表里：新通话的
+ * SessionId 正是这条通道要读出来的东西。
  *
  * 密钥读取只对 APP 开放（远程 API 在 APK 进程内）；HOOK 与 CLI 都拿不到密钥，
  * CLI 只能写密钥状态，不能读回原值。
@@ -45,6 +50,13 @@ object RolePolicy {
     const val METHOD_HOOK_HEARTBEAT: String = "hook.heartbeat"
     const val METHOD_CALL_COMMAND_RESULT: String = "call.command.result"
 
+    /**
+     * APP 轮询的会话事件流（Task 7C）：HOOK 快照 / 监督端交还/断开的真实事实，按进程内
+     * 单调 seq 排列。**不需要** SessionId——新通话的 SessionId 正是这条通道要读出来的
+     * 东西，因此它不在 [SESSION_METHODS] 里。
+     */
+    const val METHOD_SESSION_EVENTS: String = "session.events"
+
     const val METHOD_STATUS: String = "status"
     const val METHOD_CONFIG_WRITE: String = "config.write"
     const val METHOD_PAIR: String = "pair"
@@ -63,6 +75,11 @@ object RolePolicy {
             METHOD_CONFIG_SECRET_READ,
             METHOD_AUDIO_CHANNEL,
             METHOD_HANDOVER,
+            // Task 7C：真实 APK 必须能读桥接状态/诊断并轮询会话事件，否则永远到不了 READY。
+            // 三者都是只读/只读投影；写入能力仍然只属于 CLI_ROOT。
+            METHOD_STATUS,
+            METHOD_DIAGNOSE,
+            METHOD_SESSION_EVENTS,
         ),
         PeerRole.HOOK to setOf(
             METHOD_HOOK_SNAPSHOT,
@@ -79,7 +96,11 @@ object RolePolicy {
         ),
     )
 
-    /** 必须携带 [RpcRequest.sessionId] 的方法：所有会话内动作都不能作用于“当前通话”。 */
+    /**
+     * 必须携带 [RpcRequest.sessionId] 的方法：所有会话内动作都不能作用于“当前通话”。
+     *
+     * `session.events` 刻意不在其中：它是 APP 发现新会话的入口，自身没有会话参数。
+     */
     private val SESSION_METHODS: Set<String> = setOf(
         METHOD_SESSION_REQUEST,
         METHOD_SESSION_HEARTBEAT,

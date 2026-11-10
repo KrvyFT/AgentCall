@@ -40,6 +40,7 @@ import org.krvyft.agentcall.bridge.supervision.HookCallInbox
 import org.krvyft.agentcall.bridge.supervision.HookCommandCallControl
 import org.krvyft.agentcall.bridge.supervision.HookSnapshotDecoder
 import org.krvyft.agentcall.bridge.supervision.ReflectiveTelecomTermination
+import org.krvyft.agentcall.bridge.supervision.SessionEventBus
 import org.krvyft.agentcall.bridge.supervision.SnapshotCallStateProbe
 import org.krvyft.agentcall.bridge.supervision.SupervisionGraph
 import org.krvyft.agentcall.bridge.supervision.SupervisionPlatform
@@ -179,6 +180,9 @@ internal object BridgeRuntime {
         supervision.supervisor.start()
 
         val shutdown = CountDownLatch(1)
+        // 每进程一份的 APP 事件流（Task 7C）：由 HOOK 快照路径与监督端交还/断开事实喂入，
+        // 只有 APP 能轮询；容量固定，慢消费者不会让内存增长。
+        val sessionEvents = SessionEventBus()
         var server: ControlServer? = null
         val supervisionRpc = SupervisorRpcPort(supervision.supervisor, inbox)
         val pollRunning = AtomicBoolean(true)
@@ -205,6 +209,7 @@ internal object BridgeRuntime {
             },
             dialerDefaultRole = dialerDefaultRole,
             audioPcm = pcmRelay,
+            sessionEvents = sessionEvents,
         )
 
         // PCM 通道由 ControlServer 独立 bind（PCM lane）；音频工作角色负责真实 PCM
@@ -416,6 +421,12 @@ internal class ControlDispatcher(
      */
     private val audioPcm: AudioPcmRelay? = null,
     /**
+     * APP 轮询的会话事件流（Task 7C）。**每进程一份**：生产装配由 [BridgeRuntime] 显式
+     * 注入同一个实例；本分派器是唯一的写入者（HOOK 快照路径 + 监督端交还/断开事实）
+     * 与唯一读取者（session.events）。默认值只服务于不经事件通道的测试构造点。
+     */
+    private val sessionEvents: SessionEventBus = SessionEventBus(),
+    /**
      * session.command 等待 HOOK 结果的硬上限。默认就是与监督端同源的
      * [APP_COMMAND_TIMEOUT_MS]（4000 ms）；显式参数只用于测试缩短等待。
      */
@@ -447,6 +458,7 @@ internal class ControlDispatcher(
             RolePolicy.METHOD_SESSION_REQUEST -> sessionRequest(request)
             RolePolicy.METHOD_SESSION_HEARTBEAT -> sessionHeartbeat(request)
             RolePolicy.METHOD_SESSION_COMMAND -> sessionCommand(request)
+            RolePolicy.METHOD_SESSION_EVENTS -> sessionEventsPoll(request)
             RolePolicy.METHOD_HANDOVER -> handover(request)
             RolePolicy.METHOD_HOOK_SNAPSHOT,
             RolePolicy.METHOD_HOOK_HEARTBEAT,
@@ -625,6 +637,54 @@ internal class ControlDispatcher(
         return ok(request, json.toString())
     }
 
+    /**
+     * session.events：APP 轮询会话事件流（Task 7C）。
+     *
+     * 只读、无会话参数、单次最多 [SessionEventBus.MAX_BATCH] 条。负载
+     * `{"sinceSeq":N}`（可省略/空负载 = 0）；游标超前返回机器码
+     * [ERROR_CURSOR_AHEAD]，其余一律是可用批次（陈旧游标不报错）。
+     */
+    private fun sessionEventsPoll(request: RpcRequest): RpcResponse {
+        val sinceSeq = when (val decoded = decodeSinceSeq(request.payload)) {
+            is SinceSeqDecode.Cursor -> decoded.sinceSeq
+            SinceSeqDecode.Invalid -> return failure(
+                request,
+                ERROR_PAYLOAD_INVALID,
+                "session.events payload must be {\"sinceSeq\":<long>}",
+            )
+        }
+        return when (val poll = sessionEvents.poll(sinceSeq)) {
+            is SessionEventBus.Poll.Available -> ok(request, SessionEventBus.encode(poll.batch))
+            SessionEventBus.Poll.CursorAhead -> failure(
+                request,
+                ERROR_CURSOR_AHEAD,
+                "sinceSeq is ahead of the newest recorded event",
+            )
+        }
+    }
+
+    /**
+     * 解析 `{"sinceSeq":N}`：空负载/`{}` = 0；除此之外键集合必须是 `{"sinceSeq"}`，
+     * 值必须是非负**整数**（小数、字符串、null、负数、未知键都整体拒绝）。
+     */
+    private fun decodeSinceSeq(payload: String): SinceSeqDecode {
+        if (payload.isEmpty()) return SinceSeqDecode.Cursor(0L)
+        if (payload.length > MAX_SESSION_EVENTS_PAYLOAD_CHARS) return SinceSeqDecode.Invalid
+        val parsed = runCatching { JsonParser.parseString(payload) }.getOrNull()
+            ?: return SinceSeqDecode.Invalid
+        if (!parsed.isJsonObject) return SinceSeqDecode.Invalid
+        val json = parsed.asJsonObject
+        if (!json.keySet().all { it == SESSION_EVENTS_CURSOR_KEY }) return SinceSeqDecode.Invalid
+        if (!json.has(SESSION_EVENTS_CURSOR_KEY)) return SinceSeqDecode.Cursor(0L)
+        val element = json.get(SESSION_EVENTS_CURSOR_KEY)
+        if (!element.isJsonPrimitive || !element.asJsonPrimitive.isNumber) return SinceSeqDecode.Invalid
+        val asDouble = element.asDouble
+        val asLong = element.asLong
+        if (!asDouble.isFinite() || asDouble != asLong.toDouble()) return SinceSeqDecode.Invalid
+        if (asLong < 0L) return SinceSeqDecode.Invalid
+        return SinceSeqDecode.Cursor(asLong)
+    }
+
     /** "结果归属"拒绝码：Answer 与 Hangup 各自机器可读，7B 可据此区分重试策略。 */
     private fun inFlightCode(command: CallCommand): String = when (command) {
         CallCommand.Answer -> ERROR_ANSWER_IN_FLIGHT
@@ -663,9 +723,19 @@ internal class ControlDispatcher(
 
     private fun feedSnapshot(session: SessionId, payload: String) {
         val decoded = HookSnapshotDecoder.decode(session, payload) ?: return
+        // 事件先入队，再做监督迁移：seq 顺序就是真实事实的到达顺序（无补发、无重排）。
+        // 只记录已解码的真实快照——伪造/损坏/别人的快照在 decode 处就被丢弃。
+        sessionEvents.recordSnapshot(session, decoded)
         supervision.recordSnapshotState(session, decoded.state)
         if (decoded.handbackReason != null) {
             val outcome = runBlocking { supervision.onManualTakeover(session) }
+            // 监督端的上交还结果也是 APP 必须看见的事实：撤销/恢复失败绝不能显示成成功。
+            sessionEvents.recordHandback(
+                session,
+                decoded.state,
+                decoded.handbackReason,
+                handbackOutcomeCode(outcome),
+            )
             // 监督端已撤销所有权（确认交还/恢复失败）：APP 的音频绑定必须立刻释放。
             if (outcome is TakeoverOutcome.Confirmed || outcome is TakeoverOutcome.RestoreFailed) {
                 audioPcm?.release(session)
@@ -677,10 +747,18 @@ internal class ControlDispatcher(
             CallState.DISCONNECTED -> {
                 runBlocking { supervision.onCallDisconnected(session) }
                 // 断开确认即"非所有权"：不需要等下一次 audio.channel/轮询才回收绑定。
+                sessionEvents.recordDisconnect(session, decoded.state)
                 audioPcm?.release(session)
             }
             else -> Unit
         }
+    }
+
+    private fun handbackOutcomeCode(outcome: TakeoverOutcome): String = when (outcome) {
+        TakeoverOutcome.Confirmed -> SessionEventBus.OUTCOME_HANDBACK_CONFIRMED
+        TakeoverOutcome.NotOwned -> SessionEventBus.OUTCOME_HANDBACK_NOT_OWNED
+        is TakeoverOutcome.RevokeFailed -> SessionEventBus.OUTCOME_HANDBACK_REVOKE_FAILED
+        is TakeoverOutcome.RestoreFailed -> SessionEventBus.OUTCOME_HANDBACK_RESTORE_FAILED
     }
 
     /** call.command.result：解析并暂存真实结果，供监督端与 APP 侧 CallControl 取走。 */
@@ -853,6 +931,13 @@ internal class ControlDispatcher(
             error = RpcError(code, message.take(ControlServer.MAX_ERROR_MESSAGE_CHARS)),
         )
 
+    /** session.events 游标的解析结果：合法（缺省 0）或整体非法。 */
+    private sealed interface SinceSeqDecode {
+        data class Cursor(val sinceSeq: Long) : SinceSeqDecode
+
+        data object Invalid : SinceSeqDecode
+    }
+
     /** session.command 负载的解析结果：合法受限命令、结构合法但不受支持、结构非法。 */
     private sealed interface AppCommandDecode {
         data class Supported(val command: CallCommand) : AppCommandDecode
@@ -870,6 +955,18 @@ internal class ControlDispatcher(
 
         /** APP session.command 的唯一线格式字段表：多一个键就是 payload_invalid。 */
         val APP_COMMAND_KEYS = setOf("command")
+
+        /** APP session.events 的唯一负载键；空负载/`{}` 等价于 sinceSeq=0。 */
+        const val SESSION_EVENTS_CURSOR_KEY: String = "sinceSeq"
+
+        /** 事件游标负载的长度上限：只可能是 {"sinceSeq":<long>}。 */
+        const val MAX_SESSION_EVENTS_PAYLOAD_CHARS: Int = 128
+
+        /**
+         * 游标晚于本进程已记录的最大 seq：调用方状态来自别的进程/已损坏。必须与
+         * “暂时没有新事件”区分开（后者是 200 + 空 events 批次）。
+         */
+        const val ERROR_CURSOR_AHEAD: String = "cursor_ahead"
 
         /** APP 未携带会话 ID 或会话 ID 不是可上线 token 时的机器可读错误。 */
         const val ERROR_SESSION_REQUIRED: String = "session_required"

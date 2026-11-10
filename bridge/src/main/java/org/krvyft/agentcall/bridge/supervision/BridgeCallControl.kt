@@ -4,8 +4,10 @@ import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import kotlinx.coroutines.delay
 import org.krvyft.agentcall.core.model.CallCommand
+import org.krvyft.agentcall.core.model.CallDirection
 import org.krvyft.agentcall.core.model.CallState
 import org.krvyft.agentcall.core.model.CommandResult
+import org.krvyft.agentcall.core.model.Presentation
 import org.krvyft.agentcall.core.model.RejectReason
 import org.krvyft.agentcall.core.model.SessionId
 import org.krvyft.agentcall.core.port.CallControl
@@ -13,14 +15,36 @@ import org.krvyft.agentcall.core.port.CallControl
 /**
  * Hook 快照（hook.snapshot）固定字段 JSON 的消费侧（spec §6.4，任务 4 的线格式）。
  *
- * 只解析监督端需要的字段（state、handbackReason），并强制会话字段与请求会话一致：
- * 别人的快照绝不能推动本监督端的状态机。
+ * 强制会话字段与请求会话一致：别人的快照绝不能推动本监督端的状态机，也不能变成
+ * APP 事件流里的条目。
+ *
+ * [Decoded.state] 与 [Decoded.handbackReason] 是监督端状态机的判定字段（严格解析）；
+ * 其余字段是给 APP 事件流（Task 7C）的**观测值**：缺失或类型不符就是 null，绝不补
+ * false/0/1 之类的默认值（spec §8“缺一项就保留原响铃”）。
  */
 object HookSnapshotDecoder {
 
-    data class Decoded(val state: CallState, val handbackReason: String?)
+    /**
+     * 一次已解码的快照。
+     *
+     * @property source HOOK 声明的动作来源（ActionSource：MODULE/USER/UNKNOWN）。桥接不
+     *   依赖 app 模块的类型，因此只接受机器码形状的短字符串并原样透传。
+     */
+    data class Decoded(
+        val state: CallState,
+        val handbackReason: String?,
+        val source: String? = null,
+        val presentation: Presentation? = null,
+        val direction: CallDirection? = null,
+        val phoneAccount: String? = null,
+        val isEmergency: Boolean? = null,
+        val isConference: Boolean? = null,
+        val activeCallCount: Int? = null,
+        val number: String? = null,
+    )
 
     private const val MAX_PAYLOAD_CHARS = 4096
+    private const val MAX_SOURCE_CHARS = 32
 
     fun decode(expected: SessionId, payload: String): Decoded? {
         if (payload.isEmpty() || payload.length > MAX_PAYLOAD_CHARS) return null
@@ -30,7 +54,18 @@ object HookSnapshotDecoder {
         if (string(json, "processEpoch") != expected.processEpoch) return null
         if (string(json, "callId") != expected.callId) return null
         val state = CallState.entries.firstOrNull { it.name == string(json, "state") } ?: return null
-        return Decoded(state, optionalString(json, "handbackReason"))
+        return Decoded(
+            state = state,
+            handbackReason = optionalString(json, "handbackReason"),
+            source = decodeSource(json),
+            presentation = Presentation.entries.firstOrNull { it.name == optionalString(json, "presentation") },
+            direction = CallDirection.entries.firstOrNull { it.name == optionalString(json, "direction") },
+            phoneAccount = optionalString(json, "phoneAccount"),
+            isEmergency = optionalBoolean(json, "isEmergency"),
+            isConference = optionalBoolean(json, "isConference"),
+            activeCallCount = optionalPositiveInt(json, "activeCallCount"),
+            number = optionalString(json, "number"),
+        )
     }
 
     private fun string(json: JsonObject, name: String): String? {
@@ -44,6 +79,34 @@ object HookSnapshotDecoder {
         if (element.isJsonNull) return null
         if (!element.isJsonPrimitive || !element.asJsonPrimitive.isString) return null
         return element.asString
+    }
+
+    /** 动作来源只接受短机器码（不含控制字符/引号），未知值一律 null（不猜）。 */
+    private fun decodeSource(json: JsonObject): String? {
+        val value = optionalString(json, "source") ?: return null
+        if (value.isEmpty() || value.length > MAX_SOURCE_CHARS) return null
+        if (value.any { it.isISOControl() || it.isWhitespace() || it == '"' }) return null
+        return value
+    }
+
+    private fun optionalBoolean(json: JsonObject, name: String): Boolean? {
+        val element = json.get(name) ?: return null
+        if (!element.isJsonPrimitive || !element.asJsonPrimitive.isBoolean) return null
+        return element.asBoolean
+    }
+
+    /**
+     * 活动通话数：模型契约要求至少 1（0 是异常快照）。非整数/小于 1 一律 null，
+     * 绝不把异常值收敛成“1 路”从而放行第二路电话。
+     */
+    private fun optionalPositiveInt(json: JsonObject, name: String): Int? {
+        val element = json.get(name) ?: return null
+        if (!element.isJsonPrimitive || !element.asJsonPrimitive.isNumber) return null
+        val asDouble = element.asDouble
+        val asInt = element.asInt
+        if (!asDouble.isFinite() || asDouble != asInt.toDouble()) return null
+        if (asInt < 1) return null
+        return asInt
     }
 }
 
