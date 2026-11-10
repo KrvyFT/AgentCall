@@ -8,9 +8,11 @@ unverifiable APK or a stale SHA256SUMS all exit non-zero.  DEX coverage is
 validated against the container manifest embedded in the ZIP (the attestation
 emitted by :bridge:packageRuntime), never against the app APK.  It reports the
 structure, sizes, SHA-256 digests and the APK signer so release notes can label
-the artifact honestly; --expected-signer turns the signer label into a check,
-and --allow-unverified-signing is the only way to accept an APK whose signature
-could not be verified (for example when the SDK build-tools are absent).
+the artifact honestly; --expected-signer turns the signer label into a check.
+--allow-unverified-signing only suppresses signature verification: versionName,
+versionCode and applicationId are still read with the SDK aapt2, so a machine
+without SDK build-tools cannot pass the check at all (the flag is not a
+substitute for the SDK, and the report still prints the signing warning).
 """
 
 import argparse
@@ -218,7 +220,8 @@ def inspect_package(zip_path, apk_path, sha_sums_path="auto",
                 else:
                     manifest_path = Path(workspace) / "dex-manifest.json"
                     manifest_path.write_bytes(archive.read(package.DEX_MANIFEST_ENTRY))
-                    problems.extend(package.verify_dex_coverage(jar_path, manifest_path))
+                    problems.extend(package.verify_dex_coverage(
+                        jar_path, manifest_path, expected_version=module_version))
                 try:
                     facts["dex_entries"] = package.list_dex_entries(jar_path)
                 except package.PackagingError as exc:
@@ -354,8 +357,10 @@ def main(argv=None, version_reader=None, signing_probe=None, package_reader=None
                         help="fail unless this substring appears in the signer description "
                              "(e.g. 'CN=Your Name')")
     parser.add_argument("--allow-unverified-signing", action="store_true",
-                        help="accept an APK whose signing could not be checked (no SDK build-tools); "
-                             "the report still prints the warning")
+                        help="only suppresses signature verification (the warning is still "
+                             "reported); versionName/versionCode/applicationId still require "
+                             "the SDK build-tools, so this flag cannot make a build-tools-free "
+                             "run pass")
     args = parser.parse_args(argv)
 
     if args.zip:

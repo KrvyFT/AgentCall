@@ -99,14 +99,27 @@ object PcmLaneCodec {
     /** 长度字段允许的最大值（类型 + 正文）。 */
     const val MAX_BODY_BYTES: Int = MAX_FRAME_BYTES - FRAME_HEADER_BYTES
 
-    /** 下行 PCM 单帧上限。 */
-    const val MAX_PCM_BYTES: Int = MAX_BODY_BYTES
+    /**
+     * 下行 PCM 单帧上限。
+     *
+     * 帧长字段覆盖“类型 + 正文”，所以正文（= PCM）必须满足 body + 1 <= [MAX_BODY_BYTES]，
+     * 即 PCM <= 32763；PCM16 必须偶数 → 32762。取 32764 会让 32765 的帧长被
+     * [writeFrame] 拒绝，链路随后关闭。
+     */
+    const val MAX_PCM_BYTES: Int = ((MAX_BODY_BYTES - 1) / 2) * 2
 
     /** 上行帧序号前缀字节数。 */
     const val UPLINK_SEQ_BYTES: Int = 4
 
-    /** 上行 PCM 单帧上限（正文扣掉序号）。 */
-    const val MAX_UPLINK_PCM_BYTES: Int = MAX_BODY_BYTES - UPLINK_SEQ_BYTES
+    /**
+     * 上行 PCM 单帧上限。
+     *
+     * 上行正文 = 4 字节序号 + PCM，帧长字段再覆盖 1 字节类型，因此
+     * PCM <= [MAX_BODY_BYTES] - [UPLINK_SEQ_BYTES] - 1 = 32759；PCM16 必须偶数 → 32758。
+     * APP 的 BridgeClient 使用同一推导（32758）；32760 的帧长是 32765，会被
+     * [writeFrame] 的 body.size + 1 > MAX_BODY_BYTES 拒绝。
+     */
+    const val MAX_UPLINK_PCM_BYTES: Int = ((MAX_BODY_BYTES - UPLINK_SEQ_BYTES - 1) / 2) * 2
 
     const val ERROR_FRAME_TOO_LARGE: String = "pcm_frame_too_large"
     const val ERROR_FRAME_TRUNCATED: String = "pcm_frame_truncated"

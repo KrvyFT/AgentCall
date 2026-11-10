@@ -14,8 +14,11 @@
 | `dist/SHA256SUMS` | 两个产物的 SHA-256 |
 
 版本单一来源是 APK 的 `versionName/versionCode`；ZIP 内 `module.prop` 由它渲染，不一致时打包直接失败。
-ZIP 里的 `bridge/agentcall-bridge.dex-manifest.json` 记录容器每个 dex 的名称/SHA-256/大小与
-bridge APK 摘要；打包与检查器只按它校验 DEX 覆盖，不用 app APK。
+桥接容器也读同一来源：`:bridge` 在构建时从 `:app` 的 `defaultConfig` 生成 `BuildConfig.VERSION_NAME`
+（`BridgeInfo.VERSION`）并把同一对版本写进 dex manifest 的 `bridgeVersion`；打包比对 app APK，
+检查器比对 `module.prop`，因此桥上报版本、模块版本与 APK 版本三者不可能各写一份而漂移。
+ZIP 里的 `bridge/agentcall-bridge.dex-manifest.json` 记录容器每个 dex 的名称/SHA-256/大小、
+bridge APK 摘要与 `bridgeVersion`；打包与检查器只按它校验 DEX 覆盖，不用 app APK。
 
 先校验产物完整性（拿到 dist/ 后第一步）：
 
@@ -40,8 +43,10 @@ cd ..
 python3 tools/check_package.py --dist dist --expected-signer 'CN=你的发布证书'
 ```
 
-没有 SDK build-tools（无法验证签名）时检查器默认 **FAIL**；只有明确接受未验证签名才加
-`--allow-unverified-signing`（报告仍打印 warning）。
+没有 SDK build-tools 时检查器 **必然 FAIL**：签名无法验证（默认 FAIL），`versionName/versionCode`
+与 `applicationId` 也仍要用 SDK 的 `aapt2` 读取（缺 SDK 时同样 FAIL）。
+`--allow-unverified-signing` **只**关闭签名校验（报告仍打印 warning），不改变版本/包名读取，
+因此它不能让“没有 SDK build-tools”的机器通过检查；该场景只能在装有 SDK build-tools 的环境运行。
 
 前提（未验证 = 未在本仓库验证）：Android 16/17（`minSdk 36`，目标与唯一验证 ROM 为已知 API 37 Xperia）、
 已安装 KernelSU、已安装 LSPosed 或 Vector、已安装官方 Google 电话 `com.google.android.dialer`。

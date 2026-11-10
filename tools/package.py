@@ -4,7 +4,11 @@
 Single version source: the built app APK.  The module manifest written into the
 ZIP is rendered from the APK versionName/versionCode, so the module, the ZIP file
 name and the APK cannot drift apart; a hand-edited module.prop that disagrees is
-a packaging failure, not something to paper over.
+a packaging failure, not something to paper over.  The bridge runtime container
+reports the same version: :bridge:packageRuntime reads it from :app's
+defaultConfig (BridgeInfo.VERSION is BuildConfig.VERSION_NAME) and records it in
+the dex manifest as bridgeVersion, which packaging compares against the app
+version, and the checker compares against module.prop.
 
 The bridge runtime container is the AGP *bridge* release APK's own dex set,
 copied entry by entry into bridge/build/outputs/agentcall/agentcall-bridge.jar
@@ -54,7 +58,8 @@ EXPECTED_APPLICATION_ID = "org.krvyft.agentcall"
 # APK; packaging and the checker validate the container against it and never
 # against the app APK (a different artifact with a different dex set).
 DEX_MANIFEST_ENTRY = "bridge/agentcall-bridge.dex-manifest.json"
-DEX_MANIFEST_SCHEMA = 1
+# schema 2 adds bridgeVersion: the app version the container was built from.
+DEX_MANIFEST_SCHEMA = 2
 
 # Fixed DOS timestamp for deterministic archives (1980-01-01T00:00:00).
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
@@ -370,15 +375,17 @@ def _dex_entries_with_bytes(path):
     return sorted(entries.items(), key=lambda item: dex_sort_key(item[0]))
 
 
-def write_dex_manifest(container_path, manifest_path, source_apk_path=None):
+def write_dex_manifest(container_path, manifest_path, version, source_apk_path=None):
     """Write the JSON dex manifest for a container (tests + tooling).
 
     :bridge:packageRuntime emits the same schema from the bridge release APK;
     this writer exists so the format is defined next to its reader and can be
-    exercised hermetically.
+    exercised hermetically.  version is the single version source (:app
+    versionName/versionCode) the container was built from.
     """
     manifest = {
         "schema": DEX_MANIFEST_SCHEMA,
+        "bridgeVersion": {"name": version.name, "code": version.code},
         "dex": [
             {
                 "name": name,
@@ -418,6 +425,23 @@ def read_dex_manifest(manifest_path):
         raise PackagingError(
             "dex manifest " + str(manifest_path) + " has unsupported schema "
             + repr(manifest.get("schema")))
+    reported = manifest.get("bridgeVersion")
+    if not isinstance(reported, dict):
+        raise PackagingError(
+            "dex manifest " + str(manifest_path) + " has no bridgeVersion object "
+            "(the container does not name the app version it was built from)")
+    reported_name = reported.get("name")
+    reported_code = reported.get("code")
+    if (not isinstance(reported_name, str) or not reported_name
+            or any(character in reported_name for character in "/\\:")):
+        raise PackagingError(
+            "dex manifest " + str(manifest_path) + " has a bad bridgeVersion name "
+            + repr(reported_name))
+    if (not isinstance(reported_code, int) or isinstance(reported_code, bool)
+            or reported_code < 0):
+        raise PackagingError(
+            "dex manifest " + str(manifest_path) + " has a bad bridgeVersion code "
+            + repr(reported_code))
     entries = manifest.get("dex")
     if not isinstance(entries, list) or not entries:
         raise PackagingError("dex manifest " + str(manifest_path) + " declares no dex entries")
@@ -444,7 +468,11 @@ def read_dex_manifest(manifest_path):
                 "dex manifest " + str(manifest_path) + " has a bad size for " + name)
         normalized.append({"name": name, "sha256": digest, "size": size})
     normalized.sort(key=lambda entry: dex_sort_key(entry["name"]))
-    result = {"schema": DEX_MANIFEST_SCHEMA, "dex": normalized}
+    result = {
+        "schema": DEX_MANIFEST_SCHEMA,
+        "bridgeVersion": {"name": reported_name, "code": reported_code},
+        "dex": normalized,
+    }
     source = manifest.get("sourceApk")
     if source is not None:
         if (not isinstance(source, dict) or not isinstance(source.get("name"), str)
@@ -456,12 +484,15 @@ def read_dex_manifest(manifest_path):
     return result
 
 
-def verify_dex_coverage(container_path, manifest_path):
+def verify_dex_coverage(container_path, manifest_path, expected_version=None):
     """The container must be exactly the dex set the bridge manifest attests.
 
     The app APK is intentionally not an input: it is a different artifact with
     its own dex layout, so comparing against it is vacuous when both are single
     dex and wrong when the app becomes multidex.
+
+    expected_version pins the manifest's bridgeVersion to the single version
+    source (the app APK when packaging, module.prop when checking a ZIP).
     """
     problems = []
     try:
@@ -469,6 +500,14 @@ def verify_dex_coverage(container_path, manifest_path):
         container = dict(_zip_dex_entries(container_path))
     except PackagingError as exc:
         return [str(exc)]
+    if expected_version is not None:
+        reported = manifest["bridgeVersion"]
+        if Version(reported["name"], reported["code"]) != expected_version:
+            problems.append(
+                "bridge-reported version " + reported["name"] + " ("
+                + str(reported["code"]) + ") does not match versionName "
+                + expected_version.name + " (" + str(expected_version.code)
+                + ") declared by the app APK or module.prop")
     declared = {entry["name"]: entry for entry in manifest["dex"]}
     if "classes.dex" not in declared:
         problems.append("dex manifest " + str(manifest_path) + " declares no classes.dex")
@@ -786,6 +825,9 @@ def _write_sha256sums(dist_dir, names):
         lines.append(_sha256(dist_dir / name) + "  " + name)
     path = Path(dist_dir) / "SHA256SUMS"
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # write_text() honours the caller's umask (0600 under umask 077); a release
+    # checksum file, like the ZIP/APK it describes, must stay world-readable.
+    path.chmod(0o644)
     return path
 
 
@@ -840,7 +882,7 @@ def package_artifact(
             "module.prop version " + source_version.name + " (" + str(source_version.code)
             + ") does not match app versionName " + version.name + " (" + str(version.code) + ")")
 
-    problems = verify_dex_coverage(bridge_jar, bridge_manifest)
+    problems = verify_dex_coverage(bridge_jar, bridge_manifest, expected_version=version)
     problems.extend(verify_container(bridge_jar))
     if bridge_apk is not None:
         problems.extend(verify_bridge_apk(bridge_manifest, bridge_apk))

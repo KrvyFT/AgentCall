@@ -4,6 +4,7 @@ import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -135,6 +136,34 @@ class PcmLaneCodecTest {
         assertNull(PcmLaneCodec.encodeUplink(1, ByteArray(PcmLaneCodec.MAX_UPLINK_PCM_BYTES + 2)))
         assertNull(PcmLaneCodec.decodeUplink(byteArrayOf(0, 0, 0, 1, 9)))
         assertNull(PcmLaneCodec.decodeUplink(byteArrayOf(0, 0, 0)))
+    }
+
+    @Test
+    fun pcmFrameBoundariesMatchTheWireLimitExactly() {
+        // 帧长 = 类型 + 正文；正文上限 32764，因此下行 PCM ≤ 32763，且 PCM16 必须偶数。
+        assertEquals(32762, PcmLaneCodec.MAX_PCM_BYTES)
+        assertEquals(32758, PcmLaneCodec.MAX_UPLINK_PCM_BYTES)
+
+        // 下行 32758/32760/32762 都能成帧；32764 的帧长是 32765，必须被拒绝。
+        for (size in listOf(32758, 32760, 32762)) {
+            val output = ByteArrayOutputStream()
+            assertTrue("downlink body " + size, PcmLaneCodec.writeFrame(output, PcmLaneType.DOWNLINK, ByteArray(size)))
+            assertTrue("frame " + size, output.size() <= PcmLaneCodec.MAX_FRAME_BYTES)
+        }
+        val rejected = ByteArrayOutputStream()
+        assertFalse(PcmLaneCodec.writeFrame(rejected, PcmLaneType.DOWNLINK, ByteArray(32764)))
+        assertEquals(0, rejected.size())
+
+        // 上行 32758 合法（4 字节序号 + 32758 = 正文 32762，帧长 32763）；32760 起被拒绝。
+        val body = PcmLaneCodec.encodeUplink(1, ByteArray(32758))
+        assertNotNull(body)
+        val output = ByteArrayOutputStream()
+        assertTrue(PcmLaneCodec.writeFrame(output, PcmLaneType.UPLINK, body!!))
+        val read = PcmLaneCodec.readFrame(ByteArrayInputStream(output.toByteArray()))
+        assertTrue(read is PcmLaneRead.Frame)
+        assertEquals(32758, (read as PcmLaneRead.Frame).frame.body.size - PcmLaneCodec.UPLINK_SEQ_BYTES)
+        assertNull(PcmLaneCodec.encodeUplink(1, ByteArray(32760)))
+        assertNull(PcmLaneCodec.encodeUplink(1, ByteArray(32762)))
     }
 
     @Test

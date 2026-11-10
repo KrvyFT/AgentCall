@@ -112,6 +112,8 @@ class AudioPcmSessionService(
                     var offset = 0
                     while (offset < chunk.data.size && !stopped.get()) {
                         val remaining = chunk.data.size - offset
+                        // MAX_PCM_BYTES 已包含“帧长 = 类型 + 正文”的 -1；这里再取偶，
+                        // 保证每个切片本身是合法 PCM16 且 body+1 不超过正文上限。
                         val count = minOf(PcmLaneCodec.MAX_PCM_BYTES, remaining) and 0x7FFFFFFE
                         if (count <= 0) break
                         val slice = chunk.data.copyOfRange(offset, offset + count)

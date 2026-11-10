@@ -119,6 +119,33 @@ class AudioWorkerPcmServiceTest {
     }
 
     @Test
+    fun downlinkSlicesStayInsideTheFrameBodyLimit() {
+        armAndOpen(format)
+        val side = start()
+        side.feedOpenHandshake(format)
+        side.awaitOpenOk()
+
+        // 32764 = 旧的 MAX_PCM_BYTES：作为单帧正文，帧长会是 32765 > 32764，被 framing 拒绝。
+        val chunk = ByteArray(PcmLaneCodec.MAX_PCM_BYTES + 2) { (it % 251).toByte() }
+        opened.chunks.trySend(PcmChunk(chunk, format))
+
+        side.collector.await("限制内的下行切片") { frames ->
+            frames.filter { it.type == PcmLaneType.DOWNLINK }.sumOf { it.body.size } >= chunk.size
+        }
+        val downlink = side.collector.ofType(PcmLaneType.DOWNLINK)
+        assertTrue(
+            "每个下行正文都必须满足 body+1 <= MAX_BODY_BYTES",
+            downlink.all { it.body.size + 1 <= PcmLaneCodec.MAX_BODY_BYTES },
+        )
+        assertTrue(downlink.all { it.body.size <= PcmLaneCodec.MAX_PCM_BYTES })
+        assertEquals(
+            listOf(PcmLaneCodec.MAX_PCM_BYTES, chunk.size - PcmLaneCodec.MAX_PCM_BYTES),
+            downlink.map { it.body.size },
+        )
+        assertArrayEquals(chunk, downlink.flatMap { it.body.toList() }.toByteArray())
+    }
+
+    @Test
     fun uplinkIsAckedOnlyAfterPlaybackHasCompleted() {
         armAndOpen(format)
         val side = start()

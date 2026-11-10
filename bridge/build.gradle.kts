@@ -1,4 +1,5 @@
 import com.android.build.api.artifact.SingleArtifact
+import com.android.build.api.dsl.ApplicationExtension
 import java.io.BufferedOutputStream
 import java.io.File
 import java.security.MessageDigest
@@ -12,6 +13,8 @@ import org.gradle.api.DefaultTask
 import org.gradle.api.GradleException
 import org.gradle.api.file.DirectoryProperty
 import org.gradle.api.file.RegularFileProperty
+import org.gradle.api.provider.Property
+import org.gradle.api.tasks.Input
 import org.gradle.api.tasks.InputDirectory
 import org.gradle.api.tasks.OutputFile
 import org.gradle.api.tasks.TaskAction
@@ -20,6 +23,26 @@ plugins {
     // AGP 内置 Kotlin：不应用 kotlin-android 插件。
     // :bridge 只作为特权运行容器的 DEX 打包载体，不作为第二个用户应用安装。
     alias(libs.plugins.android.application)
+}
+
+// 单一版本来源（Task 9）：:app 的 defaultConfig 是唯一权威版本。桥接容器由
+// app_process 加载，没有自己的 AndroidManifest 版本可用，所以在构建时把同一对
+// versionName/versionCode 写进 :bridge 的 BuildConfig 和运行时容器 manifest；
+// BridgeInfo、dex manifest、module.prop 因此不可能各写一份而漂移。
+val nonProductionVersionName = "0.0.0-dev"
+val nonProductionVersionCode = 0
+evaluationDependsOn(":app")
+val appDefaultConfig = project(":app").extensions
+    .getByType(ApplicationExtension::class.java)
+    .defaultConfig
+// 显式兜底只用于非生产构建：:app 未声明版本时（裁剪过的测试构建）用 dev 占位。
+// 发布打包会拿它与 module.prop 比对，占位值不可能进入发布产物。
+val appVersionName: String = appDefaultConfig.versionName ?: nonProductionVersionName
+val appVersionCode: Int = appDefaultConfig.versionCode ?: nonProductionVersionCode
+if (appDefaultConfig.versionName == null || appDefaultConfig.versionCode == null) {
+    logger.warn(
+        ":app has no versionName/versionCode; :bridge uses the non-production fallback "
+            + appVersionName + " (" + appVersionCode + ")")
 }
 
 android {
@@ -32,8 +55,18 @@ android {
         applicationId = "org.krvyft.agentcall.bridge"
         minSdk = 36
         targetSdk = 37
+        // 与 :app 同源；桥接 APK 只是容器载体，但版本也不再是第二份真相。
+        versionName = appVersionName
+        versionCode = appVersionCode
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // BridgeInfo.VERSION 读这里，而不是 BridgeMain 里的字面量。
+        buildConfigField("String", "VERSION_NAME", "\"" + appVersionName + "\"")
+    }
+
+    buildFeatures {
+        buildConfig = true
     }
 
     compileOptions {
@@ -75,13 +108,22 @@ dependencies {
  * 输出是确定性的未压缩 JAR；ART 的 PathClassLoader 只从 classpath JAR 根部的
  * classes.dex 加载类，因此多 dex 时只用 classes.dex 能解析，其余 dex 作为证据保留。
  *
- * 同时写出 dex manifest（schema 1，JSON）：每个 classes*.dex 的 name/sha256/size
- * 加来源 APK 的 name/sha256。打包与 check_package 只用这个 manifest 校验容器，
- * 绝不用 app APK（那是另一个产物，dex 集合与容器无关）。
+ * 同时写出 dex manifest（schema 2，JSON）：bridgeVersion（来自 :app 的
+ * versionName/versionCode）加每个 classes*.dex 的 name/sha256/size，以及来源 APK 的
+ * name/sha256。打包与 check_package 只用这个 manifest 校验容器，绝不用 app APK
+ *（那是另一个产物，dex 集合与容器无关）。
  */
 abstract class PackageRuntimeTask : DefaultTask() {
     @get:InputDirectory
     abstract val apkDirectory: DirectoryProperty
+
+    /** :app 的 versionName（构建时注入，manifest 据此与 module.prop 对账）。 */
+    @get:Input
+    abstract val bridgeVersionName: Property<String>
+
+    /** :app 的 versionCode。 */
+    @get:Input
+    abstract val bridgeVersionCode: Property<Int>
 
     @get:OutputFile
     abstract val containerJar: RegularFileProperty
@@ -148,7 +190,10 @@ abstract class PackageRuntimeTask : DefaultTask() {
         val manifestTemporary = File(manifestTarget.parentFile, manifestTarget.name + ".tmp")
         val manifest = StringBuilder()
         manifest.append("{\n")
-        manifest.append("  \"schema\": 1,\n")
+        manifest.append("  \"schema\": 2,\n")
+        manifest.append("  \"bridgeVersion\": {\"name\": \"")
+        manifest.append(bridgeVersionName.get())
+        manifest.append("\", \"code\": ").append(bridgeVersionCode.get()).append("},\n")
         manifest.append("  \"sourceApk\": {\"name\": \"").append(apk.name)
         manifest.append("\", \"sha256\": \"").append(sha256(apk.readBytes())).append("\"},\n")
         manifest.append("  \"dex\": [\n")
@@ -220,6 +265,8 @@ androidComponents {
             group = "build"
             description = "Collect the release APK dex entries into the app_process runtime container"
             apkDirectory.set(releaseApk)
+            bridgeVersionName.set(appVersionName)
+            bridgeVersionCode.set(appVersionCode)
             containerJar.set(layout.buildDirectory.file("outputs/agentcall/agentcall-bridge.jar"))
             dexManifest.set(layout.buildDirectory.file(
                 "outputs/agentcall/agentcall-bridge.dex-manifest.json"))

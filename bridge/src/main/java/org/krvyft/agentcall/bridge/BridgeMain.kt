@@ -68,11 +68,12 @@ import org.krvyft.agentcall.core.protocol.RpcCodec
 import org.krvyft.agentcall.core.port.MonotonicClock
 
 /**
- * 特权运行容器版本。容器由 app_process 加载，没有 AndroidManifest 版本可用；
- * 任务 9 统一版本来源时只改这一处。
+ * 特权运行容器版本。容器由 app_process 加载，没有 AndroidManifest 版本可用，
+ * 因此版本由 :bridge 构建脚本从 :app 的 defaultConfig 生成为 BuildConfig.VERSION_NAME
+ * （单一版本来源）；这里不再保存任何字面版本。
  */
 internal object BridgeInfo {
-    const val VERSION: String = "1.0"
+    val VERSION: String = BuildConfig.VERSION_NAME
 }
 
 /**

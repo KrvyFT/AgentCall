@@ -14,7 +14,9 @@ layout independent of it.
 
 import contextlib
 import hashlib
+import json
 import io
+import os
 import shutil
 import struct
 import sys
@@ -172,14 +174,17 @@ def write_container(path, dex_layout):
     write_zip(path, {name: minimal_dex(classes) for name, classes in dex_layout.items()})
 
 
-def write_manifest(container, manifest, source_apk=None):
+def write_manifest(container, manifest, source_apk=None, version=None):
     return package.write_dex_manifest(
-        container, manifest, source_apk_path=source_apk)
+        container, manifest,
+        version=version if version is not None else package.Version("1.0", 1),
+        source_apk_path=source_apk)
 
 
-def write_container_with_manifest(container, manifest, dex_layout, source_apk=None):
+def write_container_with_manifest(container, manifest, dex_layout, source_apk=None,
+                                  version=None):
     write_container(container, dex_layout)
-    return write_manifest(container, manifest, source_apk=source_apk)
+    return write_manifest(container, manifest, source_apk=source_apk, version=version)
 
 
 def rebuild_zip(source, target, drop=(), replace=None, add=None):
@@ -258,8 +263,9 @@ class PackagingFixture(unittest.TestCase):
         write_bridge_apk(self.bridge_apk, {"classes.dex": all_classes()})
         self.jar = self.tmp / "agentcall-bridge.jar"
         write_container(self.jar, {"classes.dex": all_classes()})
+        self.version = package.Version("1.0", 1)
         self.manifest = self.tmp / "agentcall-bridge.dex-manifest.json"
-        write_manifest(self.jar, self.manifest, source_apk=self.bridge_apk)
+        write_manifest(self.jar, self.manifest, source_apk=self.bridge_apk, version=self.version)
         self.dist = self.tmp / "dist"
 
         def signer(source, target):
@@ -267,7 +273,6 @@ class PackagingFixture(unittest.TestCase):
             return "test-signer"
 
         self.signer = signer
-        self.version = package.Version("1.0", 1)
 
     def package(self, **overrides):
         kwargs = dict(
@@ -348,9 +353,15 @@ class PackagingTests(PackagingFixture):
             self.assertEqual(expected[name], digest)
         self.assertEqual(result.sha256["agentcall-1.0.zip"], expected["agentcall-1.0.zip"])
 
-    def test_module_zip_and_sums_are_world_readable(self):
-        self.package()
+    def test_artifacts_are_world_readable_even_under_a_restrictive_umask(self):
+        # umask 077 (a hardened shell) must not leak into release artifact modes.
+        previous = os.umask(0o077)
+        try:
+            self.package()
+        finally:
+            os.umask(previous)
         self.assertEqual((self.dist / "agentcall-1.0.zip").stat().st_mode & 0o777, 0o644)
+        self.assertEqual((self.dist / "agentcall-1.0.apk").stat().st_mode & 0o777, 0o644)
         self.assertEqual((self.dist / "SHA256SUMS").stat().st_mode & 0o777, 0o644)
 
     def test_module_scripts_are_executable_and_data_files_are_not(self):
@@ -401,6 +412,19 @@ class PackagingTests(PackagingFixture):
     def test_version_mismatch_fails(self):
         write_module(self.module, version="2.0", version_code=2)
         self.assert_packaging_fails("does not match")
+
+    # --- the bridge-reported version is the same single source (Task 9B) ---
+
+    def test_bridge_version_mismatch_fails(self):
+        write_manifest(self.jar, self.manifest, source_apk=self.bridge_apk,
+                       version=package.Version("0.9", 9))
+        self.assert_packaging_fails("bridge-reported version")
+
+    def test_manifest_without_bridge_version_fails(self):
+        manifest = package.read_dex_manifest(self.manifest)
+        manifest.pop("bridgeVersion")
+        self.manifest.write_text(json.dumps(manifest), encoding="utf-8")
+        self.assert_packaging_fails("bridgeVersion")
 
     def test_leaked_private_key_fails(self):
         (self.module / "webroot" / "leaked.pem").write_text(
@@ -526,6 +550,20 @@ class CheckPackageTests(PackagingFixture):
         inspection = self.inspect(version_reader=lambda path: package.Version("9.9", 9))
         self.assertFalse(inspection.ok)
         self.assertTrue(any("version" in problem for problem in inspection.problems))
+
+    def test_checker_detects_bridge_version_mismatch_in_the_embedded_manifest(self):
+        self.package()
+        embedded = json.loads(read_zip_entry(
+            self.dist / "agentcall-1.0.zip", package.DEX_MANIFEST_ENTRY).decode("utf-8"))
+        embedded["bridgeVersion"] = {"name": "0.9", "code": 9}
+        rebuilt = rebuild_zip(
+            self.dist / "agentcall-1.0.zip", self.tmp / "rebuilt.zip",
+            replace={package.DEX_MANIFEST_ENTRY:
+                     json.dumps(embedded).encode("utf-8")})
+        inspection = self.inspect_rebuilt(rebuilt, sha_sums_path=None)
+        self.assertFalse(inspection.ok)
+        self.assertTrue(any("bridge-reported version" in problem
+                            for problem in inspection.problems))
 
     def test_version_read_failure_is_reported_without_traceback(self):
         self.package()
@@ -653,6 +691,31 @@ class CheckPackageCliTests(PackagingFixture):
             package_reader=lambda path: APPLICATION_ID)
         self.assertEqual(code, 0, output + errors)
         self.assertIn("Status: PASS", output)
+
+    def test_allow_unverified_signing_cannot_bypass_missing_sdk_reads(self):
+        self.package()
+
+        def no_sdk(path):
+            raise package.PackagingError(
+                "Android SDK not found; set ANDROID_HOME or sdk.dir in local.properties")
+
+        inspection = self.inspect(
+            signing_probe=lambda path: check_package.SIGNING_UNVERIFIED,
+            version_reader=no_sdk,
+            package_reader=no_sdk,
+            allow_unverified_signing=True)
+        self.assertFalse(inspection.ok)
+        self.assertTrue(any("cannot read the packaged APK version" in problem
+                            for problem in inspection.problems))
+        self.assertTrue(any("cannot read the packaged APK applicationId" in problem
+                            for problem in inspection.problems))
+
+    def test_help_states_the_flag_only_suppresses_signature_verification(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout), self.assertRaises(SystemExit) as raised:
+            check_package.main(["--help"])
+        self.assertEqual(0, raised.exception.code)
+        self.assertIn("only suppresses signature verification", stdout.getvalue())
 
     def test_main_returns_one_for_tampered_package(self):
         self.package()
