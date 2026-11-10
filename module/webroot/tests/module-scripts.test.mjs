@@ -212,7 +212,7 @@ function serviceHarness() {
       "#!/bin/sh",
       'case "$*" in',
       "  *BridgeMain*)",
-      '    if [ "${AGENTCALL_FAKE_BRIDGE_STAY:-0}" = "1" ]; then sleep 300; else sleep 1; fi',
+      '    if [ "${AGENTCALL_FAKE_BRIDGE_STAY:-0}" = "1" ]; then while :; do sleep 1; done; else sleep 1; fi',
       "    exit 0",
       "    ;;",
       "esac",
