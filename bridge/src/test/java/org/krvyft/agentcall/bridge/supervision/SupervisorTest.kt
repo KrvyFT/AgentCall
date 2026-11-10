@@ -417,6 +417,7 @@ class SupervisorTest {
         assertTrue(f.worker.microphoneIsolated)
         assertEquals("未确认断开绝不能恢复麦克风", 0, f.isolation.restoreCalls)
         assertEquals(SupervisorPhase.ENDED, f.supervisor.snapshot().phase)
+        assertNull("关闭后内存所有权必须清空（粘性标记单独保护下一次启动）", f.supervisor.snapshot().ownedSession)
         assertEquals(Supervisor.SHUTDOWN_CALL_UNRESOLVED, f.supervisor.snapshot().lastFault)
     }
 

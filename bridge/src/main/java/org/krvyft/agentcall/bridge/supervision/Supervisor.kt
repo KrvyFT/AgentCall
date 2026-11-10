@@ -1036,8 +1036,11 @@ class Supervisor(
         }
 
         // 期限已到仍无法确认：保持隔离、失败关闭；绝不能以干净关闭收尾。
+        // ownedSession 清空（进程即将退出）但粘性标记保持 true：下一次启动仍然 fail closed。
         synchronized(stateMonitor) {
             lastFault = SHUTDOWN_CALL_UNRESOLVED
+            ownershipMayBeLive = true
+            ownedSession = null
             handoffDeadlineMs = null
             phase = SupervisorPhase.ENDED
             started = false
