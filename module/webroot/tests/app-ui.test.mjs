@@ -284,6 +284,39 @@ test("概览的默认拨号角色/Hook 连通性：真实布尔按值渲染，�
 });
 
 
+test("status 刷新失败时清除实时值，不再回显上一次的“已连接/已设为默认”", async () => {
+  const holder = {};
+  const handlers = defaultHandlers(holder, { dialerDefaultRole: true, hookConnected: true });
+  const okStatus = handlers.status;
+  let statusCalls = 0;
+  handlers.status = () => {
+    statusCalls += 1;
+    if (statusCalls === 1) return okStatus();
+    return {
+      errno: 1,
+      stdout: JSON.stringify({ error: { code: "transport_failed", message: "unreachable" } }),
+      stderr: "",
+    };
+  };
+  const fake = fakeManager({ handlers });
+  holder.current = fake;
+  const { app, doc } = await boot({ fake });
+
+  assert.equal(doc.getElementById("ov-dialer-role").textContent, "已设为默认拨号器");
+  assert.equal(doc.getElementById("ov-hook-state").textContent, "已连接");
+
+  await app.loadAll();
+  await tick(20);
+
+  assert.equal(app.state.status, null, "status 失败必须清除上一次的实时状态");
+  assert.match(doc.getElementById("ov-bridge-state").textContent, /不可达/);
+  assert.match(doc.getElementById("ov-dialer-role").textContent, /未知/);
+  assert.match(doc.getElementById("ov-hook-state").textContent, /未知/);
+  assert.doesNotMatch(doc.getElementById("ov-dialer-role").textContent, /已设为|未设为/);
+  assert.doesNotMatch(doc.getElementById("ov-hook-state").textContent, /已连接|未连接/);
+});
+
+
 test("移动端顶部布局：tabs 不再硬编码 56px 偏移，头部与 tabs 同处一个 sticky 容器", () => {
   const webroot = dirname(fileURLToPath(import.meta.url)) + "/..";
   const css = readFileSync(join(webroot, "styles.css"), "utf8");

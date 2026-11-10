@@ -2,6 +2,7 @@ package org.krvyft.agentcall.bridge.ipc
 
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
+import com.google.gson.JsonPrimitive
 import java.io.File
 import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
@@ -9,6 +10,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.krvyft.agentcall.bridge.ControlDispatcher
@@ -96,30 +98,47 @@ class BridgeStatusLiveValuesTest {
         return JsonParser.parseString(response.payload).asJsonObject
     }
 
+    /**
+     * 线程类型断言：Gson 的 asBoolean 会把字符串 "true"/"unknown" 静默强制转换
+     * （"unknown" → false），只断言值会放过“把 unknown 写成字符串再被读成 false”的回归。
+     * 因此这里同时锁住 JsonPrimitive 的 isBoolean/isString 类型。
+     */
+    private fun booleanField(json: JsonObject, name: String): Boolean {
+        val element = json.get(name)
+        assertTrue("$name 必须序列化为 JSON 布尔而不是字符串/其它类型：$element", element is JsonPrimitive && element.isBoolean)
+        return (element as JsonPrimitive).asBoolean
+    }
+
+    private fun stringField(json: JsonObject, name: String): String {
+        val element = json.get(name)
+        assertTrue("$name 必须序列化为 JSON 字符串：$element", element is JsonPrimitive && element.isString)
+        return (element as JsonPrimitive).asString
+    }
+
     @Test
     fun statusReportsExplicitUnknownWhenNoSourceCanDecide() {
         port.statusValue = null
         val json = statusJson()
-        assertEquals("unknown", json.get("hookConnected").asString)
-        assertEquals("unknown", json.get("dialerDefaultRole").asString)
+        assertEquals("unknown", stringField(json, "hookConnected"))
+        assertEquals("unknown", stringField(json, "dialerDefaultRole"))
     }
 
     @Test
     fun hookConnectedFollowsSupervisionHeartbeatPresence() {
         port.statusValue = status(hookConnected = true)
-        assertEquals(true, statusJson().get("hookConnected").asBoolean)
+        assertEquals(true, booleanField(statusJson(), "hookConnected"))
 
         port.statusValue = status(hookConnected = false)
-        assertEquals(false, statusJson().get("hookConnected").asBoolean)
+        assertEquals(false, booleanField(statusJson(), "hookConnected"))
     }
 
     @Test
     fun dialerDefaultRoleIsBooleanOnlyWhenDeterminable() {
         port.statusValue = status(hookConnected = true)
 
-        assertEquals(true, statusJson { DialerDefaultRole.GOOGLE_DIALER_IS_DEFAULT }.get("dialerDefaultRole").asBoolean)
-        assertEquals(false, statusJson { DialerDefaultRole.GOOGLE_DIALER_IS_NOT_DEFAULT }.get("dialerDefaultRole").asBoolean)
-        assertEquals("unknown", statusJson { DialerDefaultRole.UNKNOWN }.get("dialerDefaultRole").asString)
+        assertEquals(true, booleanField(statusJson { DialerDefaultRole.GOOGLE_DIALER_IS_DEFAULT }, "dialerDefaultRole"))
+        assertEquals(false, booleanField(statusJson { DialerDefaultRole.GOOGLE_DIALER_IS_NOT_DEFAULT }, "dialerDefaultRole"))
+        assertEquals("unknown", stringField(statusJson { DialerDefaultRole.UNKNOWN }, "dialerDefaultRole"))
     }
 
     @Test

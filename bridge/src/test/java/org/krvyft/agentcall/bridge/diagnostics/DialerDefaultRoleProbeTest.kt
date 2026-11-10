@@ -70,6 +70,37 @@ class DialerDefaultRoleProbeTest {
     }
 
     @Test
+    fun unavailableRoleMechanismIsUnknownNotNegativeEvidence() {
+        // 系统不支持 ROLE_DIALER：机制不可用 ≠ Google 电话不是默认拨号器。
+        // 即使默认处理器明确是别的应用，也不能据此给“否”——角色机制本身没有裁决能力。
+        assertEquals(
+            DialerDefaultRole.UNKNOWN,
+            DialerDefaultRoleProbe(
+                roleHolders = { emptyList() },
+                dialHandlerPackage = { "com.other.dialer" },
+                roleMechanismAvailable = { false },
+            ).inspect(),
+        )
+        // 机制可用性未知（查询抛错）时不短路：仍按持有者/处理器事实判定。
+        assertEquals(
+            DialerDefaultRole.GOOGLE_DIALER_IS_DEFAULT,
+            DialerDefaultRoleProbe(
+                roleHolders = { listOf("com.google.android.dialer") },
+                dialHandlerPackage = { null },
+                roleMechanismAvailable = { throw IllegalStateException("role manager") },
+            ).inspect(),
+        )
+        assertEquals(
+            DialerDefaultRole.GOOGLE_DIALER_IS_NOT_DEFAULT,
+            DialerDefaultRoleProbe(
+                roleHolders = { null },
+                dialHandlerPackage = { "com.other.dialer" },
+                roleMechanismAvailable = { null },
+            ).inspect(),
+        )
+    }
+
+    @Test
     fun wireValueIsBooleanOrExplicitUnknown() {
         assertEquals(java.lang.Boolean.TRUE, DialerDefaultRole.GOOGLE_DIALER_IS_DEFAULT.definite)
         assertEquals(java.lang.Boolean.FALSE, DialerDefaultRole.GOOGLE_DIALER_IS_NOT_DEFAULT.definite)

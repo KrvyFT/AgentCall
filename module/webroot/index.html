@@ -390,7 +390,7 @@
       <div class="card-label">已知限制（未验证）</div>
       <ul class="limits">
         <li>真实桥接路径未在真机 KernelSU WebView 中验证（当前环境无设备）。</li>
-        <li>默认拨号角色、Hook 心跳、真实 API 连通性由 APK 侧检查，本页不伪造结论。</li>
+        <li>默认拨号角色与 Hook 心跳来自桥接 status 的实时字段（无法确定时显示“未知”；status 刷新失败会清除上一次的值，不回显过期结论）；真实 API 连通性由 APK 诊断页检查。本页不伪造结论。</li>
         <li>日志读取依赖管理器的文件接口；接口不可用时本页显示只读提示而不是假数据。</li>
       </ul>
     </div>

@@ -199,8 +199,9 @@ su -c /data/adb/modules/agentcall/bin/agentcallctl diagnose
 2. KernelSU 管理器 → 模块 → 移除 AgentCall → 重启。
    移除时 `uninstall.sh` 只能**请求**停止桥接进程，并按 PID 文件核验后结束残留的桥接与
    音频工作进程（两个 PID 文件都是首行单个十进制 PID；cmdline 不匹配就不猜、不杀），
-   最后才删除 `/data/adb/agentcall`。KernelSU 会先写 `remove`/`disable` 标记，
-   `service.sh` 在每次重启前重新检查该标记，因此不会在卸载过程中把模块重新拉起；
+   最后才删除 `/data/adb/agentcall`。按 KernelSU 的标记语义，卸载会先写 `remove`/`disable`
+   标记（设备上的实际卸载时序未验证）；`service.sh` 在每次重启前重新检查该标记，
+   标记存在时不会在卸载过程中把模块重新拉起；
    若手动在无标记时对进程执行 TERM，约 5 s 后可能被重启循环拉起。
    它**不能终止或交还正在进行的 AI 通话**（脚本头部已声明该边界），如卸载时正在 AI 通话，
    请先在 Google 电话中手动结束。它不改写 Google 电话角色或系统音频配置。

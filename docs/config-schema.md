@@ -394,8 +394,9 @@ WebUI 不加载任何在线 CDN、不发起 fetch/XHR、不用 `innerHTML` 渲�
      `module-scripts.test.mjs` 绑定到 `service.sh`（首行 + 仅十进制数字）。
 
   **重启语义**：`service.sh` 的重启循环默认在 `RESTART_DELAY_SECONDS=5` 后重新拉起
-  桥接/音频工作进程。KernelSU 移除模块会先写 `remove`/`disable` 标记；`service.sh`
-  在**每次重启前**重新检查该标记，标记存在时不再拉起（不会复活已移除模块）。
+  桥接/音频工作进程。按 KernelSU 的标记语义，移除模块会先写 `remove`/`disable` 标记
+  （设备上的实际卸载时序未验证）；`service.sh` 在**每次重启前**重新检查该标记，
+  标记存在时不再拉起（不会复活已移除模块）。
   在没有标记的情况下手动对进程执行 TERM，约 5 s 后可能被重新拉起——脚本会打印这一点。
 
   **诚实边界**：当前桥接没有会话/租约实现（`session.request` 为

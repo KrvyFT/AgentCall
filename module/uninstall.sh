@@ -7,13 +7,14 @@
 #   shutdown 只关闭配置服务与 abstract socket，不保证任何通话被交还。
 # - 如卸载时正在 AI 通话，请在 Google 电话中手动结束该通话，再继续清理。
 #
-# 停止顺序：
+# 停止顺序（与脚本末尾的实际执行顺序一致）：
 # 1. 分别探测 abstract socket 是否存在、固定 CLI 是否可执行（两者不是一回事）。
 # 2. socket 存在且 CLI 可执行：执行固定 CLI 的 shutdown，并在上限内等待 socket 消失。
-# 3. CLI 不可执行或等待超时：回退到 PID 文件，核验进程身份后 TERM → 有界等待 → KILL。
-# 4. 音频工作进程是独立 app_process（PID 文件 audio-worker.pid，由 service.sh 写入）：
-#    同样核验 cmdline 后 TERM → 有界等待 → KILL，避免移除模块后残留持有麦克风隔离的
+# 3. 音频工作进程是独立 app_process（PID 文件 audio-worker.pid，由 service.sh 写入）：
+#    核验 cmdline 后 TERM → 有界等待 → KILL，避免移除模块后残留持有麦克风隔离的
 #    root 音频进程。
+# 4. bridge 的 CLI 不可执行/等待超时/无 socket 时：回退到 PID 文件，核验进程身份后
+#    TERM → 有界等待 → KILL。
 # 5. 无论是否确认停止，最后才删除 /data/adb/agentcall（配置、密钥、配对、日志、临时文件）。
 # - 不改 Google 电话默认角色，不动 vendor 音频配置，不重置系统属性；Hook 自动控制
 #   随模块移除退出，Google 电话仍是默认应用。
@@ -35,7 +36,9 @@ case "$0" in
         ;;
 esac
 
-DATA_ROOT=/data/adb/agentcall
+# 测试/诊断注入点（与 service.sh 同名）：默认值就是真机路径；覆盖只改变本脚本读取
+# 的 PID 文件与探测路径，删除仍受下面的固定路径守卫限制（覆盖值永远不会被 rm -rf）。
+DATA_ROOT=${AGENTCALL_DATA_ROOT:-/data/adb/agentcall}
 CONTROL_SOCKET=@org.krvyft.agentcall.control
 CTL=$MODDIR/bin/agentcallctl
 PID_FILE=$DATA_ROOT/bridge.pid
@@ -58,10 +61,13 @@ verified_pid_from_file() {
     file=$1
     shift
     [ -f "$file" ] || return 1
-    candidate=$(head -n 1 "$file" 2>/dev/null | tr -cd '0-9')
-    case "$candidate" in
+    # 先校验原始首行，再做数字规范化：否则 "12 34" 会被 tr 静默拼成 1234，
+    # 损坏内容分支永远不可达（还可能误杀与拼接结果同号的无关进程）。
+    raw=$(head -n 1 "$file" 2>/dev/null)
+    case "$raw" in
         ''|*[!0-9]*) return 1 ;;
     esac
+    candidate=$(printf '%s' "$raw" | tr -cd '0-9')
     [ "$candidate" -gt 1 ] || return 1
     [ -d "/proc/$candidate" ] || return 1
     cmdline=$(tr '\0' ' ' < "/proc/$candidate/cmdline" 2>/dev/null)
@@ -111,7 +117,9 @@ wait_pid_gone() {
 }
 
 # 有界终止：TERM → 最多 KILL_WAIT_SECONDS 秒 → KILL → 再等待上限。
-# 只在确认进程消失后返回 0；每杀一次前都由调用方重新从 PID 文件核验身份。
+# 只在确认进程消失后返回 0。调用方在每次开始终止前从 PID 文件重新核验身份；
+# TERM→KILL 升级沿用同一个已核验 PID（在 ≤KILL_WAIT_SECONDS 的窗口内不再读文件，
+# 这是同一进程的强制终止，不是重新挑选目标）。
 terminate_verified_pid() {
     target=$1
     label=$2
@@ -187,7 +195,7 @@ say "  本脚本无法终止或交还正在进行的 AI 通话；shutdown 只关
 say "  如卸载时正在 AI 通话，请在 Google 电话中手动结束后再清理。"
 say "! 本脚本无法确认任何 AI 通话已被交还（桥接没有会话/租约能力）；如正在通话请先在 Google 电话中手动结束"
 say "! TERM 只结束当前进程：service.sh 的重启循环默认在 5 s（RESTART_DELAY_SECONDS）后重新拉起进程。"
-say "  KernelSU 移除模块会先写 remove/disable 标记，service.sh 每次重启前重新检查标记；标记存在时不再拉起。"
+say "  按 KernelSU 的标记语义，移除模块会先写 remove/disable 标记（真机卸载时序未验证）；service.sh 每次重启前重新检查标记，标记存在时不再拉起。"
 say "  若在没有 remove/disable 标记的情况下手动执行本脚本，桥接可能在约 5 s 内被重新拉起。"
 
 # 只允许删除固定的私有目录；解析后的绝对路径必须完全一致，避免误删。

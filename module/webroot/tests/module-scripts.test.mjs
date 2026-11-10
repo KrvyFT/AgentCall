@@ -422,7 +422,9 @@ test("uninstall.sh：按 service.sh 的 PID 文件契约结束音频工作进程
 
   assert.match(service, /^PID_FILE=\$DATA_ROOT\/bridge\.pid$/m, "service.sh 的桥接 PID 文件路径");
   assert.match(service, /^AUDIO_PID_FILE=\$DATA_ROOT\/audio-worker\.pid$/m, "service.sh 的音频 PID 文件路径");
-  assert.match(uninstall, /^DATA_ROOT=\/data\/adb\/agentcall$/m);
+  // 真机路径必须是默认值；允许 service.sh 同名的测试/诊断注入（删除守卫仍是固定路径）。
+  assert.match(uninstall, /^DATA_ROOT=(\/data\/adb\/agentcall|\$\{AGENTCALL_DATA_ROOT:-\/data\/adb\/agentcall\})$/m);
+  assert.match(uninstall, /case "\$DATA_ROOT" in[\s\S]*?\/data\/adb\/agentcall\)/, "删除守卫必须只接受固定路径");
   assert.match(uninstall, /^PID_FILE=\$DATA_ROOT\/bridge\.pid$/m, "uninstall 必须读同一个桥接 PID 文件");
   assert.match(uninstall, /^AUDIO_PID_FILE=\$DATA_ROOT\/audio-worker\.pid$/m, "uninstall 必须读同一个音频 PID 文件");
 
@@ -448,10 +450,124 @@ test("uninstall.sh：按 service.sh 的 PID 文件契约结束音频工作进程
   assert.match(uninstall, /terminate_verified_pid/, "音频与桥接必须共用核验终止路径");
   assert.match(uninstall, /kill -KILL/, "必须有有界 TERM→KILL");
 
-  const audioAt = uninstall.indexOf("AudioWorkerMain");
+  // 顺序断言必须锚定“从 audio-worker.pid 核验后终止”的真实调用点。
+  // 不能用 AudioWorkerMain 的首次出现：那是 audio_pid_from_file 的函数定义。
+  const fnAt = uninstall.indexOf("audio_pid_from_file() {");
+  const call = /audio_pid=\$\(audio_pid_from_file[\s\S]{0,240}?terminate_verified_pid "\$audio_pid"/.exec(uninstall);
+  assert.ok(fnAt > -1, "必须有音频 PID 核验函数");
+  assert.ok(call, "必须有真实调用点：读 audio-worker.pid 并终止该 PID（只断言路径/存在性不算）");
+  const callAt = call.index;
+  const guardAt = uninstall.indexOf('case "$DATA_ROOT" in');
   const cleanupAt = uninstall.indexOf('rm -rf "$DATA_ROOT"');
-  assert.ok(audioAt > -1 && cleanupAt > audioAt, "音频工作进程必须在删除数据目录之前结束");
+  assert.ok(callAt > fnAt, "调用点必须位于函数定义之后");
+  assert.ok(guardAt > -1 && cleanupAt > -1);
+  assert.ok(callAt < guardAt, "音频工作进程必须在删除数据目录的判断之前结束");
+  assert.ok(callAt < cleanupAt, "音频工作进程必须在 rm -rf 之前结束");
   assert.match(uninstall, /AudioWorkerMain[\s\S]*?Google 电话/, "仍保留“无法交还通话”的诚实说明");
+});
+
+// 真实执行 uninstall.sh：用宿主进程替身证明 PID 文件里的音频工作进程真的被结束，
+// 且结束发生在固定的删除守卫之前（替身数据目录永远不会被 rm -rf）。
+function startFakeAudioWorker(root) {
+  const script = join(root, "agentcall-audio-worker.sh");
+  writeFileSync(script, "#!/bin/sh\nwhile :; do sleep 1; done\n");
+  const launched = spawnSync(
+    "sh",
+    [
+      "-c",
+      '"sh" "$1" org.krvyft.agentcall.bridge.audio.AudioWorkerMain agentcall-audio-worker >/dev/null 2>&1 & echo $!',
+      "sh",
+      script,
+    ],
+    { encoding: "utf8" },
+  );
+  assert.equal(launched.status, 0, "无法启动音频工作进程替身：" + launched.stderr);
+  const pid = Number(launched.stdout.trim());
+  assert.ok(pid > 1, "音频工作进程替身必须有 PID");
+  return pid;
+}
+
+test(
+  "uninstall.sh：真实执行时结束 audio-worker.pid 指向的进程，并拒绝删除非固定数据目录",
+  { timeout: 60000 },
+  async () => {
+    const root = mkdtempSync(join(tmpdir(), "agentcall-uninstall-"));
+    const moduleDir = join(root, "module");
+    const dataRoot = join(root, "data");
+    mkdirSync(moduleDir, { recursive: true });
+    mkdirSync(dataRoot, { recursive: true });
+    // 只复制脚本本身：模块目录没有可执行 CLI，脚本不会在宿主上调用 shutdown。
+    copyFileSync(join(MODULE, "uninstall.sh"), join(moduleDir, "uninstall.sh"));
+
+    const workerPid = startFakeAudioWorker(root);
+    try {
+      await sleep(100);
+      assert.equal(processAlive(workerPid), true, "音频工作进程替身必须存活");
+      writeFileSync(join(dataRoot, "audio-worker.pid"), workerPid + "\n");
+
+      const result = spawnSync("sh", [join(moduleDir, "uninstall.sh")], {
+        env: { ...process.env, AGENTCALL_DATA_ROOT: dataRoot },
+        encoding: "utf8",
+        timeout: 20000,
+      });
+      const stdout = result.stdout + result.stderr;
+
+      // 替身数据目录不是固定路径：删除守卫拒绝并 exit 1。这同时证明脚本已经走完音频
+      // 终止并到达删除判断（若终止被删除或挪到删除之后，进程会仍然存活）。
+      assert.equal(result.status, 1, "非固定数据目录必须被拒绝删除：" + stdout);
+      assert.match(stdout, /音频工作 进程 \d+ 已终止/, "真实执行必须走核验终止路径：" + stdout);
+      assert.match(stdout, /数据目录不是预期路径/, "终止后必须到达删除守卫：" + stdout);
+      assert.equal(processAlive(workerPid), false, "PID 文件里的音频工作进程必须真的被结束");
+      assert.equal(existsSync(join(dataRoot, "audio-worker.pid")), false, "确认终止后才删除 PID 文件");
+      assert.equal(existsSync(dataRoot), true, "固定路径守卫必须阻止删除替身数据目录");
+    } finally {
+      try {
+        if (processAlive(workerPid)) process.kill(workerPid, "SIGKILL");
+      } catch {
+        // 测试清理：进程已退出时忽略。
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test("uninstall.sh：PID 文件首行在规范化之前校验，损坏内容不会变成另一个 PID", () => {
+  const uninstall = read("uninstall.sh");
+  const fn = functionBody(uninstall, "verified_pid_from_file") + "\n}\n";
+  const dir = mkdtempSync(join(tmpdir(), "agentcall-pid-"));
+  const pidFile = join(dir, "pid");
+  try {
+    for (const [label, content] of [
+      ["带空格的数字", "12 34\n"],
+      ["负号", "-12\n"],
+      ["数字混字母", "123abc\n"],
+      ["空首行", "\n"],
+      ["cmdline 不匹配", process.pid + "\n"],
+    ]) {
+      writeFileSync(pidFile, content);
+      const result = spawnSync("sh", ["-c", fn + '\nverified_pid_from_file "$1" VerifiedPidMarker\n', "sh", pidFile], {
+        encoding: "utf8",
+      });
+      assert.equal(result.status, 1, label + " 必须被拒绝（不得规范化成别的 PID）");
+      assert.equal(result.stdout.trim(), "", label + " 不得输出任何 PID");
+    }
+
+    // 合法 PID 仍必须通过：用 sh 自己的 PID，其 cmdline 含下面的标记。
+    const valid = spawnSync(
+      "sh",
+      [
+        "-c",
+        fn + '\nprintf \'%s\\n\' "$$" > "$1"\nverified_pid_from_file "$1" VerifiedPidMarker\n',
+        "sh",
+        pidFile,
+      ],
+      { encoding: "utf8" },
+    );
+    assert.equal(valid.status, 0, "合法 PID 必须通过：" + valid.stderr);
+    assert.match(valid.stdout.trim(), /^\d+$/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("uninstall.sh：说明 TERM 之后约 5 s 可能被 service.sh 重新拉起，remove/disable 标记存在时不复活", () => {

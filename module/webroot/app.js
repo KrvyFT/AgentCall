@@ -512,7 +512,7 @@
     } else {
       setText($("ov-dialer-role"), "未知（后端无法确定）");
       setBadge($("ov-dialer-badge"), "未知", "neutral");
-      setText($("ov-dialer-note"), "桥接无法在特权进程可靠确定默认拨号器角色（返回 unknown）：只显示“未知”，不显示猜测结论。");
+      setText($("ov-dialer-note"), "桥接没有给出确定的默认拨号器角色（status 不可达或返回 unknown）：只显示“未知”，不显示猜测结论。");
     }
 
     var hook = liveStatusValue("hookConnected");
@@ -538,6 +538,9 @@
     setText($("ov-protocol-version"), "—");
     setText($("ov-uptime"), "—");
     setText($("ov-connections"), "—");
+    // status 刷新失败后不得继续回显上一次的实时值（否则死掉的桥接仍显示“已连接/
+    // 已设为默认拨号器”）。清空后 renderLiveOverview 统一显示“未知”。
+    state.status = null;
     renderLiveOverview();
   }
 
