@@ -222,31 +222,34 @@ class RedactedConfigProbe(
 ) : ConfigProbe {
 
     override suspend fun read(): ConfigFacts {
-        val payload = readRedacted() ?: return ConfigFacts.UNAVAILABLE
-        val config = parseConfigObject(payload) ?: return ConfigFacts.UNAVAILABLE
-        val parsed = RpcCodec.decodeAgentConfig(config.toString()) ?: return ConfigFacts.UNAVAILABLE
+        val parsed = parseRedactedAgentConfig(readRedacted()) ?: return ConfigFacts.UNAVAILABLE
         return ConfigFacts(
             enabled = parsed.enabled,
             valid = ConfigValidator.validate(parsed).isValid,
         )
     }
+}
 
-    private fun parseConfigObject(payload: String): JsonObject? {
-        if (payload.isBlank()) return null
-        val element = runCatching { JsonParser.parseString(payload) }.getOrNull() ?: return null
-        if (!element.isJsonObject) return null
-        val config = element.asJsonObject.get("config") ?: return null
-        if (!config.isJsonObject) return null
-        val json = config.asJsonObject
-        // 只接受桥接真实发出的完整公开配置：缺字段说明负载不可信，不能按默认值解释。
-        val required = listOf(
-            "enabled", "mode", "blacklist", "whitelist", "region", "handleUnknownNumbers",
-            "answerDelayMs", "maxCallDurationMs", "enabledPhoneAccounts", "asr", "llm", "tts",
-            "voice", "speed", "openingLine", "prompt", "revision",
-        )
-        if (!json.keySet().containsAll(required)) return null
-        return json
-    }
+/**
+ * 解析桥接 `config.read` 的脱敏负载（`{"config":{...},"secrets":{...}}`）。
+ *
+ * 只接受**完整**的公开配置字段集合：缺字段说明负载不可信，绝不拿宽松默认值猜测“已启用”。
+ * 返回的 [AgentConfig] 只含公开字段；密钥状态不参与解析。
+ */
+internal fun parseRedactedAgentConfig(payload: String?): AgentConfig? {
+    if (payload.isNullOrBlank()) return null
+    val element = runCatching { JsonParser.parseString(payload) }.getOrNull() ?: return null
+    if (!element.isJsonObject) return null
+    val config = element.asJsonObject.get("config") ?: return null
+    if (!config.isJsonObject) return null
+    val json: JsonObject = config.asJsonObject
+    val required = listOf(
+        "enabled", "mode", "blacklist", "whitelist", "region", "handleUnknownNumbers",
+        "answerDelayMs", "maxCallDurationMs", "enabledPhoneAccounts", "asr", "llm", "tts",
+        "voice", "speed", "openingLine", "prompt", "revision",
+    )
+    if (!json.keySet().containsAll(required)) return null
+    return RpcCodec.decodeAgentConfig(json.toString())
 }
 
 /**
