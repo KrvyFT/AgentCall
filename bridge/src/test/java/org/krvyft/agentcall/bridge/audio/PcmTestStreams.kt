@@ -81,8 +81,16 @@ class FakeOutputStream : OutputStream() {
     @Volatile
     private var blockFrom: Int = Int.MAX_VALUE
 
+    @Volatile
+    private var failing: Boolean = false
+
     fun blockFromCurrentSize() {
         blockFrom = size()
+    }
+
+    /** 之后的所有写入都抛 IOException（模拟 APP 读者已消失/链路已断）。 */
+    fun failWrites() {
+        failing = true
     }
 
     fun unblockWrites() {
@@ -111,6 +119,7 @@ class FakeOutputStream : OutputStream() {
     }
 
     override fun write(buffer: ByteArray, offset: Int, length: Int) {
+        if (failing) throw java.io.IOException("fake app stream failed")
         while (blockFrom != Int.MAX_VALUE && size() + length > blockFrom) {
             blocked.countDown()
             try {

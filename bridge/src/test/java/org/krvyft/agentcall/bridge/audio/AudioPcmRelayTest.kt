@@ -55,13 +55,22 @@ class AudioPcmRelayTest {
     private lateinit var links: FakeWorkerLinkFactory
     private lateinit var relay: AudioPcmRelay
     private val attached = ArrayList<Attached>()
+    private val appLaneFaults = ArrayList<Pair<SessionId, String>>()
 
     @Before
     fun setUp() {
         owner = MutableOwner()
         links = FakeWorkerLinkFactory(format)
+        appLaneFaults.clear()
         // 生产装配点：socket 名必须来自 ControlServer 的 APP lane，不是 root 私有 worker lane。
-        relay = BridgeWiring.audioPcmRelay(owner, links, clock)
+        relay = AudioPcmRelay(
+            owner = owner,
+            workerLinks = links,
+            clock = clock,
+            socketName = BridgeWiring.pcmSocketName(),
+            appSinkStallTimeoutMs = 200L,
+            onAppLaneFault = { id, code -> appLaneFaults += id to code },
+        )
     }
 
     @After
@@ -90,6 +99,11 @@ class AudioPcmRelayTest {
         // 共享常量会让“两边一起写成 worker lane”永远通过。
         assertEquals("org.krvyft.agentcall.pcm", (opened as PcmOpenResult.Opened).socketName)
         assertEquals(ControlServer.DEFAULT_PCM_SOCKET, opened.socketName)
+        assertEquals(
+            "生产装配点必须继续返回 ControlServer 真正 bind 的 APP lane 名",
+            ControlServer.DEFAULT_PCM_SOCKET,
+            BridgeWiring.pcmSocketName(),
+        )
         assertFalse(
             "APP lane 绝不能是 root 私有的 worker lane",
             opened.socketName == AudioPcmProtocol.SOCKET_NAME,
@@ -376,6 +390,77 @@ class AudioPcmRelayTest {
         assertEquals("audio_pcm_frame_type_invalid", a.lastErrorCode)
         a.thread.join(2_000)
         assertFalse(a.thread.isAlive)
+    }
+
+    // ------------------------------------------------------------------ 有界写 / I3
+
+    /**
+     * I3：APP 读者卡死时，下行写入必须由专用写线程 + 有界队列承担；看门狗在无进展阈值后
+     * 关闭连接、走 fault()/outcome 通路（STALE）并把音频故障上报给监督端。
+     */
+    @Test
+    fun stalledAppWriterIsClosedByTheWatchdogAndReportedAsAnAudioFault() {
+        owner.own(sessionA)
+        assertTrue(relay.open(sessionA, appPeer, format) is PcmOpenResult.Opened)
+        val a = attach(sessionA, appPeer)
+        a.awaitOpenOk()
+
+        a.appOutput.blockFromCurrentSize()
+        a.link.fromWorker.feed(frameBytes(PcmLaneType.DOWNLINK, byteArrayOf(1, 2)))
+        assertTrue("写线程必须真的卡在 APP 输出流上", a.appOutput.awaitBlocked(2_000))
+
+        clock.now += 201
+        awaitCondition("看门狗必须关闭卡死的连接", 3_000) {
+            !a.thread.isAlive && relay.sessionState(sessionA) == PcmRelayState.STALE
+        }
+        assertEquals(
+            listOf(sessionA to AudioPcmRelay.ERROR_APP_STREAM_STALLED),
+            appLaneFaults.toList(),
+        )
+        a.appOutput.unblockWrites()
+    }
+
+    /**
+     * I3：APP 写入卡死时，工作进程的 error/closed 帧仍必须能被读取线程消费：
+     * 不能因为一个卡死的 APP 读者把整条连接（和 worker 故障）永久遮住。
+     */
+    @Test
+    fun workerClosedFrameIsConsumedWhileTheAppWriterIsStalled() {
+        owner.own(sessionA)
+        assertTrue(relay.open(sessionA, appPeer, format) is PcmOpenResult.Opened)
+        val a = attach(sessionA, appPeer)
+        a.awaitOpenOk()
+
+        a.appOutput.blockFromCurrentSize()
+        a.link.fromWorker.feed(frameBytes(PcmLaneType.DOWNLINK, byteArrayOf(3, 4)))
+        assertTrue(a.appOutput.awaitBlocked(2_000))
+
+        a.link.fromWorker.feed(frameBytes(PcmLaneType.CONTROL, PcmLaneCodec.encodeClosed("worker_closed")))
+        awaitCondition("工作进程 closed 帧必须被读取并按 SESSION_ENDED 收尾", 2_000) {
+            relay.sessionState(sessionA) == null
+        }
+        a.appOutput.unblockWrites()
+    }
+
+    /** I3：APP 输出流直接写失败时必须有界收尾，不能等看门狗阈值。 */
+    @Test
+    fun failingAppWriterClosesTheConnectionWithoutWaitingForTheWatchdog() {
+        owner.own(sessionA)
+        assertTrue(relay.open(sessionA, appPeer, format) is PcmOpenResult.Opened)
+        val a = attach(sessionA, appPeer)
+        a.awaitOpenOk()
+        a.appOutput.failWrites()
+
+        val startedAt = System.currentTimeMillis()
+        a.link.fromWorker.feed(frameBytes(PcmLaneType.DOWNLINK, byteArrayOf(9, 9)))
+        awaitCondition("写失败的连接必须有界关闭", 1_500) { !a.thread.isAlive }
+        val elapsed = System.currentTimeMillis() - startedAt
+        assertTrue("写失败不得等 2 s 看门狗（实际 " + elapsed + " ms）", elapsed < 1_500)
+        assertEquals(
+            "写失败是可重试的 APP 断开，不是工作进程丢失",
+            PcmRelayState.BOUND,
+            relay.sessionState(sessionA),
+        )
     }
 
     @Test

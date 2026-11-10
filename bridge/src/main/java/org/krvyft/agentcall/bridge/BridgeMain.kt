@@ -174,6 +174,12 @@ internal object BridgeRuntime {
             owner = PcmSessionOwner { id -> supervisionRef?.supervisor?.snapshot()?.ownedSession == id },
             workerLinks = PcmWorkerLinkFactory { LocalSocketPcmWorkerLink().also { it.connect() } },
             clock = AndroidAudioPlatform.clock(),
+            // I3：APP 下行写卡死按音频通路故障处理，监督端据此停音频/开人工接管窗口。
+            onAppLaneFault = { id, code ->
+                supervisionRef?.let { graph ->
+                    runBlocking { graph.supervisor.onAudioFailure(id, code) }
+                }
+            },
         )
         val supervision = buildSupervision(
             root = root,
@@ -351,11 +357,14 @@ internal object BridgeWiring {
         owner: PcmSessionOwner,
         workerLinks: PcmWorkerLinkFactory,
         clock: MonotonicClock,
+        /** I3：APP 音频通路故障上报（生产接监督端 onAudioFailure）。 */
+        onAppLaneFault: (SessionId, String) -> Unit = { _, _ -> },
     ): AudioPcmRelay = AudioPcmRelay(
         owner = owner,
         workerLinks = workerLinks,
         clock = clock,
         socketName = pcmSocketName(),
+        onAppLaneFault = onAppLaneFault,
     )
 }
 

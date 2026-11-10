@@ -129,7 +129,21 @@ class AudioPcmRelay(
     private val maxSessions: Int = MAX_SESSIONS,
     private val uplinkQueueCapacity: Int = UPLINK_QUEUE_CAPACITY,
     private val attachDeadlineMs: Long = ATTACH_DEADLINE_MS,
+    /** APP 下行写队列容量；满即失败，绝不无限堆积（I3）。 */
+    private val appSinkQueueCapacity: Int = APP_SINK_QUEUE_CAPACITY,
+    /** APP 写入无进展看门狗（I3）：超过该时长没有写入进展就关闭连接并走 fault 通路。 */
+    private val appSinkStallTimeoutMs: Long = APP_WRITE_STALL_TIMEOUT_MS,
+    /**
+     * APP 音频通路故障上报（I3）。生产接监督端的 [Supervisor.onAudioFailure]；默认空实现
+     * 只服务于不经监督端构造的测试点。
+     */
+    private val onAppLaneFault: (SessionId, String) -> Unit = { _, _ -> },
 ) : PcmSessionHandler, Closeable {
+
+    init {
+        require(appSinkQueueCapacity > 0) { "appSinkQueueCapacity must be positive" }
+        require(appSinkStallTimeoutMs > 0L) { "appSinkStallTimeoutMs must be positive" }
+    }
 
     private class Binding(
         val session: SessionId,
@@ -141,6 +155,9 @@ class AudioPcmRelay(
         var attaching: Boolean = false
         var closeHook: (() -> Unit)? = null
     }
+
+    /** APP 下行/控制写队列的一帧（I3）。 */
+    private class AppOutbound(val type: Int, val body: ByteArray)
 
     /** 一次接入的结果；决定 finally 里绑定怎么收尾。 */
     private enum class Outcome {
@@ -395,6 +412,15 @@ class AudioPcmRelay(
             runCatching { closeConnection() }
             return
         }
+        // I3：流建立后，APP 下行写入切到专用线程 + 有界队列。看门狗/写失败都走
+        // connection.stop()/fault() 的既有收尾通路，读取线程不再被卡死的 APP 读者占用。
+        sink.startWriter(
+            onStall = {
+                connection.fault(ERROR_APP_STREAM_STALLED)
+                onAppLaneFault(request.session, ERROR_APP_STREAM_STALLED)
+            },
+            onWriteFailure = { connection.stop() },
+        )
         if (!sink.control(PcmLaneCodec.encodeOpenOk(request.format))) {
             connection.stop()
             finish(binding, request.session, connection.outcome.get(), connection.queue)
@@ -487,14 +513,20 @@ class AudioPcmRelay(
         val outcome = AtomicReference(Outcome.APP_DETACHED)
 
         fun stop() {
-            stopped.set(true)
+            // 幂等：看门狗、读取线程与 serve 的 finally 可能并发收尾，只允许第一次执行关闭。
+            if (!stopped.compareAndSet(false, true)) return
+            // 先让 APP 写入器把 error/closed 帧刷出去（有界宽限），再关底层链路。
+            sink.stop()
             runCatching { link.close() }
             runCatching { closeConnection() }
         }
 
-        fun fault() {
+        fun fault(code: String = ERROR_WORKER_LOST) {
+            // 并发收尾（APP 写失败/释放/关闭）已经决定了 outcome：不得把 APP 断开误标成
+            // 工作进程丢失（否则绑定会变成 STALE，拒绝合法重连）。
+            if (stopped.get()) return
             outcome.set(Outcome.WORKER_LOST)
-            sink.error(ERROR_WORKER_LOST, "audio worker PCM lane ended")
+            sink.error(code, "audio PCM lane faulted")
             stop()
         }
 
@@ -538,6 +570,7 @@ class AudioPcmRelay(
                                 }
                             }
                             PcmLaneType.CONTROL -> {
+                                if (stopped.get()) return
                                 when (PcmLaneCodec.decodeControl(read.frame.body)) {
                                     is PcmControl.Closed, is PcmControl.Error -> {
                                         sink.control(read.frame.body)
@@ -557,7 +590,9 @@ class AudioPcmRelay(
                             }
                         }
                         PcmLaneRead.Closed, is PcmLaneRead.Invalid -> {
-                            fault()
+                            // 若本连接已因 APP 断开/写失败/释放而收尾，这里的 EOF 是关闭链路
+                            // 的结果，不是工作进程丢失。
+                            if (!stopped.get()) fault()
                             return
                         }
                     }
@@ -615,10 +650,56 @@ class AudioPcmRelay(
         }
     }
 
-    /** APP 输出流的串行写入器；任何写入失败都让连接收尾。 */
-    private class AppSink(private val output: OutputStream) {
+    /**
+     * APP 输出方向的写入器（I3）。
+     *
+     * 握手/拒绝阶段的少量帧仍同步写出（随后连接立刻关闭）；流建立后切换成**专用写线程 +
+     * 有界队列**：读取线程只入队，绝不在 APP 的输出流上阻塞，因此工作进程的 error/closed
+     * 帧始终能被继续读取。看门狗在超过 [appSinkStallTimeoutMs] 没有写入进展时触发
+     * [onStall]，由连接走 fault()/outcome 通路；写异常则直接 [onWriteFailure] 收尾。
+     */
+    private inner class AppSink(private val output: OutputStream) {
 
-        private val writeLock = Any()
+        private val stopFlag = AtomicBoolean(false)
+        private val stallReported = AtomicBoolean(false)
+
+        @Volatile
+        private var queue: ArrayBlockingQueue<AppOutbound>? = null
+
+        @Volatile
+        private var writer: Thread? = null
+
+        @Volatile
+        private var watchdog: Thread? = null
+
+        @Volatile
+        private var onStall: (() -> Unit)? = null
+
+        @Volatile
+        private var onWriteFailure: (() -> Unit)? = null
+
+        @Volatile
+        private var lastProgressAtMs = 0L
+
+        @Volatile
+        private var writeInProgress = false
+
+        @Synchronized
+        fun startWriter(onStall: () -> Unit, onWriteFailure: () -> Unit) {
+            if (queue != null) return
+            val pending = ArrayBlockingQueue<AppOutbound>(appSinkQueueCapacity)
+            this.onStall = onStall
+            this.onWriteFailure = onWriteFailure
+            queue = pending
+            writer = Thread({ pump(pending) }, "agentcall-pcm-app-writer").apply {
+                isDaemon = true
+                start()
+            }
+            watchdog = Thread({ watch() }, "agentcall-pcm-app-watchdog").apply {
+                isDaemon = true
+                start()
+            }
+        }
 
         fun control(body: ByteArray): Boolean = write(PcmLaneType.CONTROL, body)
 
@@ -634,8 +715,75 @@ class AudioPcmRelay(
             control(PcmLaneCodec.encodeClosed(reason))
         }
 
-        private fun write(type: Int, body: ByteArray): Boolean = synchronized(writeLock) {
-            PcmLaneCodec.writeFrame(output, type, body)
+        fun stop() {
+            if (!stopFlag.compareAndSet(false, true)) return
+            watchdog?.interrupt()
+            val currentWriter = writer
+            if (currentWriter != null && currentWriter !== Thread.currentThread()) {
+                // 有界宽限：让写线程把已入队的 error/closed 帧写完；卡死时最多等这么久。
+                try {
+                    currentWriter.join(APP_SINK_STOP_GRACE_MS)
+                } catch (interrupted: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+            }
+            queue?.clear()
+        }
+
+        private fun write(type: Int, body: ByteArray): Boolean {
+            val pending = queue
+            if (pending == null) {
+                // 握手/拒绝阶段：同步写；调用方随即 closeConnection，不存在长期占用。
+                return try {
+                    PcmLaneCodec.writeFrame(output, type, body)
+                } catch (t: Throwable) {
+                    false
+                }
+            }
+            if (stopFlag.get()) return false
+            return pending.offer(AppOutbound(type, body))
+        }
+
+        private fun pump(pending: ArrayBlockingQueue<AppOutbound>) {
+            try {
+                while (true) {
+                    // 收到 stop 后不再接受新帧（write() 已拒绝），但把已入队的 error/closed
+                    // 帧刷完再退出——工作进程故障必须能送达 APP，而不是被静默丢弃。
+                    val next = pending.poll(APP_SINK_POLL_MS, TimeUnit.MILLISECONDS)
+                    if (next == null) {
+                        if (stopFlag.get()) return
+                        continue
+                    }
+                    writeInProgress = true
+                    lastProgressAtMs = clock.nowMs()
+                    val written = PcmLaneCodec.writeFrame(output, next.type, next.body)
+                    lastProgressAtMs = clock.nowMs()
+                    writeInProgress = false
+                    if (!written) {
+                        onWriteFailure?.invoke()
+                        return
+                    }
+                }
+            } catch (t: Throwable) {
+                writeInProgress = false
+                if (!stopFlag.get()) onWriteFailure?.invoke()
+            }
+        }
+
+        private fun watch() {
+            while (!stopFlag.get()) {
+                try {
+                    Thread.sleep(APP_SINK_WATCHDOG_POLL_MS)
+                } catch (interrupted: InterruptedException) {
+                    return
+                }
+                if (stopFlag.get()) return
+                if (!writeInProgress) continue
+                if (clock.nowMs() - lastProgressAtMs <= appSinkStallTimeoutMs) continue
+                if (!stallReported.compareAndSet(false, true)) return
+                onStall?.invoke()
+                return
+            }
         }
     }
 
@@ -652,7 +800,23 @@ class AudioPcmRelay(
          */
         const val UPLINK_QUEUE_CAPACITY: Int = 16
 
+        /**
+         * APP 下行/控制写队列容量（I3）。32 帧 ≈ 1 MiB/lane：慢读者有界内存，
+         * 写线程卡死时由看门狗关闭连接，而不是让读取线程永久阻塞。
+         */
+        const val APP_SINK_QUEUE_CAPACITY: Int = 32
+
+        /** APP 写入无进展看门狗阈值（I3）：超过即按音频通路故障收尾。 */
+        const val APP_WRITE_STALL_TIMEOUT_MS: Long = 2_000L
+
         private const val UPLINK_POLL_MS: Long = 50L
+
+        private const val APP_SINK_POLL_MS: Long = 20L
+
+        private const val APP_SINK_WATCHDOG_POLL_MS: Long = 50L
+
+        /** 收尾时等待 APP 写线程刷完 error/closed 帧的宽限。 */
+        private const val APP_SINK_STOP_GRACE_MS: Long = 200L
 
         const val REASON_APP_STOP: String = "app_stop"
         const val REASON_SESSION_RELEASED: String = "session_released"
@@ -674,5 +838,8 @@ class AudioPcmRelay(
         const val ERROR_FRAME_INVALID: String = "audio_pcm_frame_invalid"
         const val ERROR_FRAME_TYPE: String = "audio_pcm_frame_type_invalid"
         const val ERROR_CONTROL_INVALID: String = "audio_pcm_control_invalid"
+
+        /** APP 输出方向超过看门狗阈值没有写入进展：按音频通路故障收尾（I3）。 */
+        const val ERROR_APP_STREAM_STALLED: String = "audio_pcm_app_stream_stalled"
     }
 }
