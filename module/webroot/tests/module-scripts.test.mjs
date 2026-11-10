@@ -300,7 +300,11 @@ test(
 
       const log = readFileSync(harness.logFile, "utf8");
       assert.match(log, /service_stop_signal/);
-      assert.match(log, /audio_worker_stopped/, "停止路径必须记录并验证音频工作进程已终止");
+      assert.match(
+        log,
+        new RegExp("audio_worker_stopped pid=" + workerPid + "\\b"),
+        "停止路径必须记录并验证音频工作进程已终止（有界 TERM→KILL 只作用于已核验的 PID）",
+      );
     } finally {
       killQuietly(child);
       rmSync(harness.root, { recursive: true, force: true });
@@ -603,8 +607,16 @@ test(
 
       await waitFor(() => !processAlive(workerPid), 5000, "audio worker termination");
       const log = readFileSync(harness.logFile, "utf8");
-      assert.match(log, /audio_worker_kill/, "TERM 无效时必须升级到 KILL（有界）");
-      assert.match(log, /audio_worker_stopped/);
+      assert.match(
+        log,
+        new RegExp("audio_worker_kill pid=" + workerPid + "\\b"),
+        "TERM 无效时必须升级到 KILL（有界）",
+      );
+      assert.match(
+        log,
+        new RegExp("audio_worker_stopped pid=" + workerPid + "\\b"),
+        "有界 TERM→KILL 必须作用于 PID 文件里那个已核验的音频工作进程",
+      );
     } finally {
       killQuietly(child);
       rmSync(harness.root, { recursive: true, force: true });
@@ -644,6 +656,112 @@ test(
       assert.equal(/bridge_start attempt=2/.test(log), false, "remove 标记存在时不得再次拉起桥接");
     } finally {
       killQuietly(child);
+      rmSync(harness.root, { recursive: true, force: true });
+    }
+  },
+);
+
+// ---------------------------------------------------------------------------------------------
+// 阶段 C：service.sh 遗留缺陷硬化（PID 文件原始行校验、音频 PID 身份核验、有界 TERM→KILL）
+// ---------------------------------------------------------------------------------------------
+
+test("service.sh：read_pid 在数字规范化之前校验原始首行，损坏内容不会变成另一个 PID", () => {
+  const service = read("service.sh");
+  const maxDigits = /^MAX_PID_DIGITS=(\d+)$/m.exec(service);
+  assert.ok(maxDigits, "service.sh 必须声明 PID 位数上限");
+  const fn = "MAX_PID_DIGITS=" + maxDigits[1] + "\n" + functionBody(service, "read_pid") + "\n}\n";
+  const dir = mkdtempSync(join(tmpdir(), "agentcall-service-pid-"));
+  const pidFile = join(dir, "pid");
+  try {
+    for (const [label, content] of [
+      ["带空格的数字", "12 34\n"],
+      ["负号", "-12\n"],
+      ["数字混字母", "123abc\n"],
+      ["空首行", "\n"],
+      ["超出位数上限", "12345678901\n"],
+    ]) {
+      writeFileSync(pidFile, content);
+      const result = spawnSync("sh", ["-c", fn + '\nread_pid "$1"\n', "sh", pidFile], { encoding: "utf8" });
+      assert.equal(result.status, 1, label + " 必须被拒绝（「12 34」不得被 tr 静默拼成 1234）：" + result.stdout);
+      assert.equal(result.stdout.trim(), "", label + " 不得输出任何 PID");
+    }
+
+    writeFileSync(pidFile, "4321\n");
+    const valid = spawnSync("sh", ["-c", fn + '\nread_pid "$1"\n', "sh", pidFile], { encoding: "utf8" });
+    assert.equal(valid.status, 0, "合法 PID 必须通过：" + valid.stderr);
+    assert.equal(valid.stdout.trim(), "4321", "合法 PID 必须原样输出");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("service.sh：stop_audio_worker 与 reclaim_stale_worker 使用同一套 PID 身份核验", () => {
+  const service = read("service.sh");
+  const body = functionBody(service, "stop_audio_worker");
+  assert.match(body, /read_pid "\$AUDIO_PID_FILE"/, "停止路径必须从 PID 文件读取目标");
+  assert.match(body, /is_audio_worker_pid "\$worker"/, "终止前必须按 cmdline 核验音频工作进程身份");
+  assert.match(body, /audio_worker_pid_ignored reason=/, "身份无法核验时必须记录机器可读的拒绝原因");
+  assert.match(body, /terminate_pid "\$worker" "\$STOP_GRACE_SECONDS" audio_worker/, "核验通过后走同一套有界 TERM→KILL");
+  assert.ok(
+    (body.match(/read_pid "\$AUDIO_PID_FILE"/g) || []).length >= 2,
+    "终止之后必须重新读取 PID 文件（监督循环可能在终止窗口内写入新的 PID）",
+  );
+});
+
+test(
+  "service.sh：停止路径拒绝终止 cmdline 不是音频工作进程的 PID（PID 复用防护）",
+  { timeout: 60000 },
+  async () => {
+    const harness = serviceHarness();
+    let child = null;
+    let foreign = null;
+    let workerPid = null;
+    try {
+      child = spawn("sh", [harness.script], {
+        env: serviceEnv(harness, { AGENTCALL_FAKE_BRIDGE_STAY: "1" }),
+        stdio: "ignore",
+      });
+      await waitFor(
+        () => existsSync(harness.audioPidFile) && existsSync(harness.bridgePidFile),
+        20000,
+        "bridge/audio pid files",
+      );
+      workerPid = readPidFile(harness.audioPidFile);
+      assert.equal(processAlive(workerPid), true, "音频工作进程替身必须存活");
+      await sleep(200);
+
+      // 模拟 PID 文件被改写或 PID 复用：文件里是一个 cmdline 与音频工作入口无关的存活进程。
+      foreign = spawn("sh", ["-c", "while :; do sleep 1; done"], { stdio: "ignore" });
+      await sleep(100);
+      assert.equal(processAlive(foreign.pid), true, "无关进程替身必须存活");
+      writeFileSync(harness.audioPidFile, String(foreign.pid) + "\n");
+
+      child.kill("SIGTERM");
+      await waitForExit(child, 20000);
+      await sleep(200);
+
+      assert.equal(
+        processAlive(foreign.pid),
+        true,
+        "cmdline 不匹配的 PID 不得被终止（PID 复用会误杀无关进程）",
+      );
+      const log = readFileSync(harness.logFile, "utf8");
+      assert.match(
+        log,
+        new RegExp("audio_worker_pid_ignored reason=identity_mismatch pid=" + foreign.pid + "\\b"),
+        "拒绝终止必须记录机器可读原因：" + log,
+      );
+      assert.equal(existsSync(harness.audioPidFile), false, "停止后仍须收回音频 PID 文件");
+    } finally {
+      killQuietly(child);
+      killQuietly(foreign);
+      if (workerPid !== null) {
+        try {
+          if (processAlive(workerPid)) process.kill(workerPid, "SIGKILL");
+        } catch {
+          // 测试清理：进程已退出时忽略。
+        }
+      }
       rmSync(harness.root, { recursive: true, force: true });
     }
   },

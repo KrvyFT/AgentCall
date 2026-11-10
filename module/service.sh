@@ -49,11 +49,17 @@ MAX_RESTARTS=3
 RESTART_DELAY_SECONDS=5
 READY_WAIT_SECONDS=20
 MAX_LOG_BYTES=262144
+# PID 文件首行允许的最大位数：Linux/Android 的 pid_max 是 7 位（默认 4194304），
+# 更长的数字串一律按损坏内容处理，不解析成巨大的 PID 去 kill。
+MAX_PID_DIGITS=7
 # 停止/回收的上限：TERM 之后最多等 STOP_GRACE_SECONDS 秒，KILL 之后最多再等
 # KILL_WAIT_SECONDS 秒；两个上限保证 on_stop 不会无限挂住。
 STOP_GRACE_SECONDS=${AGENTCALL_STOP_GRACE_SECONDS:-3}
 STALE_GRACE_SECONDS=${AGENTCALL_STALE_GRACE_SECONDS:-3}
 KILL_WAIT_SECONDS=2
+# 停止音频工作进程时最多重新读取几次 PID 文件：监督循环可能在终止窗口内写入新的 PID，
+# 每轮都要重新核验身份；轮数有界，避免停止路径被拖长。
+MAX_WORKER_STOP_ROUNDS=2
 
 mkdir -p "$DATA_ROOT" "$LOG_DIR" "$INBOX_DIR" 2>/dev/null
 chmod 0700 "$DATA_ROOT" "$LOG_DIR" "$INBOX_DIR" 2>/dev/null
@@ -90,14 +96,17 @@ pid_alive() {
     return 0
 }
 
-# 读取 PID 文件：只接受一个十进制 PID；缺失/损坏/越界一律当作没有。
+# 读取 PID 文件：首行必须是单个十进制 PID（1..MAX_PID_DIGITS 位），缺失/损坏/越界一律当作没有。
+# 先校验原始首行再做数字规范化：否则 "12 34" 会被 tr 静默拼成 1234（与 uninstall.sh 同一纪律）。
 read_pid() {
     file=$1
     [ -f "$file" ] || return 1
-    candidate=$(head -n 1 "$file" 2>/dev/null | tr -cd '0-9')
-    case "$candidate" in
+    raw=$(head -n 1 "$file" 2>/dev/null)
+    case "$raw" in
         ''|*[!0-9]*) return 1 ;;
     esac
+    [ "${#raw}" -le "$MAX_PID_DIGITS" ] || return 1
+    candidate=$(printf '%s' "$raw" | tr -cd '0-9')
     [ "$candidate" -gt 1 ] || return 1
     printf '%s\n' "$candidate"
 }
@@ -185,11 +194,30 @@ stop_audio_worker_supervisor() {
 }
 
 # 再按独立 PID 文件停真正的音频工作 app_process。
+# 与 reclaim_stale_worker 同一纪律：只有 cmdline 核验为音频工作进程时才终止；核验失败
+# 只记录机器可读原因，绝不 kill（PID 可能已被系统分给无关进程）。
+# 每轮都重新读取 PID 文件：终止窗口内监督循环可能写入新的工作进程 PID；轮数有界，
+# 保证停止路径仍是有界等待。
 stop_audio_worker() {
+    rounds=0
     worker=$(read_pid "$AUDIO_PID_FILE" 2>/dev/null) || worker=
-    if [ -n "$worker" ] && pid_alive "$worker"; then
+    while [ -n "$worker" ] && [ "$rounds" -lt "$MAX_WORKER_STOP_ROUNDS" ]; do
+        rounds=$((rounds + 1))
+        if ! pid_alive "$worker"; then
+            break
+        fi
+        if ! is_audio_worker_pid "$worker"; then
+            log_line "audio_worker_pid_ignored reason=identity_mismatch pid=$worker"
+            break
+        fi
         terminate_pid "$worker" "$STOP_GRACE_SECONDS" audio_worker
-    fi
+        # 读回核验：只有 PID 文件出现了不同的 PID（监督循环重启了工作进程）才继续。
+        next=$(read_pid "$AUDIO_PID_FILE" 2>/dev/null) || next=
+        if [ "$next" = "$worker" ]; then
+            break
+        fi
+        worker=$next
+    done
     rm -f "$AUDIO_PID_FILE" 2>/dev/null
 }
 
@@ -239,7 +267,8 @@ reclaim_stale_worker() {
 }
 
 # 模块被禁用或标记移除时不启动/不重启（KernelSU 用 disable/remove 标志文件表达状态）。
-# 重启循环每一轮都要重新检查：KernelSU 先写标记再执行卸载，在飞的循环不得复活桥接。
+# 按 KernelSU 的标记语义，卸载会先写 remove/disable 标记（设备上的实际卸载时序未验证）；
+# 重启循环每一轮都要重新检查，标记存在时在飞的循环不得复活桥接。
 module_marked_stopped() {
     [ -f "$MODDIR/disable" ] || [ -f "$MODDIR/remove" ]
 }
