@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  :bridge 只是 app_process 通过 CLASSPATH 加载的 DEX 容器：
+  没有 Launcher Activity，没有 exported 组件，也不作为常驻 APK 安装。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application android:allowBackup="false" />
+
+</manifest>

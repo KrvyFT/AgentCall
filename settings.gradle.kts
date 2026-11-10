@@ -25,3 +25,4 @@ dependencyResolutionManagement {
 rootProject.name = "AgentCall"
 include(":app")
 include(":core")
+include(":bridge")
