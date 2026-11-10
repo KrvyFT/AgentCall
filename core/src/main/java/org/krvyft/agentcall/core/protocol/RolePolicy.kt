@@ -14,9 +14,14 @@ import org.krvyft.agentcall.core.model.RpcRequest
  *
  * | 角色 | 允许的方法 |
  * | --- | --- |
- * | APP | session.request、config.read、config.secret.read、audio.channel、handover |
+ * | APP | session.request、session.heartbeat、session.command、config.read、config.secret.read、audio.channel、handover |
  * | HOOK | hook.snapshot、hook.heartbeat、call.command.result |
  * | CLI_ROOT | status、config.read、config.write、pair、diagnose、shutdown |
+ *
+ * `session.heartbeat` 只表达“APP 仍在看着这通电话”，是存在性信号，不会触发接听或改变
+ * 监督阶段；`session.command` 只允许经 HOOK 执行的受限命令（answer/hangup），由 bridge
+ * 排入同一份 HookCommandRouter 并等待真实结果。两者都必须携带 SessionId，且只有 APP
+ * 能调用：HOOK 不能借 APP 通道下发命令，CLI_ROOT 也不能。
  *
  * 密钥读取只对 APP 开放（远程 API 在 APK 进程内）；HOOK 与 CLI 都拿不到密钥，
  * CLI 只能写密钥状态，不能读回原值。
@@ -24,6 +29,13 @@ import org.krvyft.agentcall.core.model.RpcRequest
 object RolePolicy {
 
     const val METHOD_SESSION_REQUEST: String = "session.request"
+
+    /** APP 的会话存在性心跳；只记录 presence，不重新准备接听、不改变监督阶段。 */
+    const val METHOD_SESSION_HEARTBEAT: String = "session.heartbeat"
+
+    /** APP 请求一条受限通话命令（answer/hangup），由 bridge 排入 HOOK 命令路由并等待结果。 */
+    const val METHOD_SESSION_COMMAND: String = "session.command"
+
     const val METHOD_CONFIG_READ: String = "config.read"
     const val METHOD_CONFIG_SECRET_READ: String = "config.secret.read"
     const val METHOD_AUDIO_CHANNEL: String = "audio.channel"
@@ -45,6 +57,8 @@ object RolePolicy {
     private val ROLE_METHODS: Map<PeerRole, Set<String>> = mapOf(
         PeerRole.APP to setOf(
             METHOD_SESSION_REQUEST,
+            METHOD_SESSION_HEARTBEAT,
+            METHOD_SESSION_COMMAND,
             METHOD_CONFIG_READ,
             METHOD_CONFIG_SECRET_READ,
             METHOD_AUDIO_CHANNEL,
@@ -68,6 +82,8 @@ object RolePolicy {
     /** 必须携带 [RpcRequest.sessionId] 的方法：所有会话内动作都不能作用于“当前通话”。 */
     private val SESSION_METHODS: Set<String> = setOf(
         METHOD_SESSION_REQUEST,
+        METHOD_SESSION_HEARTBEAT,
+        METHOD_SESSION_COMMAND,
         METHOD_AUDIO_CHANNEL,
         METHOD_HANDOVER,
         METHOD_HOOK_SNAPSHOT,

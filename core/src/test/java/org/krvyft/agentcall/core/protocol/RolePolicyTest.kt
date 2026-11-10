@@ -143,6 +143,77 @@ class RolePolicyTest {
     }
 
     @Test
+    fun fixedRoleMethodTableIsExact() {
+        // 固定表必须逐项相等：多一个方法（例如把 HOOK 命令暴露给 APP）就是权限回归，
+        // 少一个方法就是 Task 7 的 APP→bridge 命令/心跳通道被悄悄删掉。
+        assertEquals(
+            setOf(
+                RolePolicy.METHOD_SESSION_REQUEST,
+                RolePolicy.METHOD_CONFIG_READ,
+                RolePolicy.METHOD_CONFIG_SECRET_READ,
+                RolePolicy.METHOD_AUDIO_CHANNEL,
+                RolePolicy.METHOD_HANDOVER,
+                RolePolicy.METHOD_SESSION_HEARTBEAT,
+                RolePolicy.METHOD_SESSION_COMMAND,
+            ),
+            RolePolicy.methodsFor(PeerRole.APP),
+        )
+        assertEquals(
+            setOf(
+                RolePolicy.METHOD_HOOK_SNAPSHOT,
+                RolePolicy.METHOD_HOOK_HEARTBEAT,
+                RolePolicy.METHOD_CALL_COMMAND_RESULT,
+            ),
+            RolePolicy.methodsFor(PeerRole.HOOK),
+        )
+        assertEquals(
+            setOf(
+                RolePolicy.METHOD_STATUS,
+                RolePolicy.METHOD_CONFIG_READ,
+                RolePolicy.METHOD_CONFIG_WRITE,
+                RolePolicy.METHOD_PAIR,
+                RolePolicy.METHOD_DIAGNOSE,
+                RolePolicy.METHOD_SHUTDOWN,
+            ),
+            RolePolicy.methodsFor(PeerRole.CLI_ROOT),
+        )
+        // 协议版本保持 1：新增方法不改变线协议版本。
+        assertEquals(1, PROTOCOL_VERSION)
+    }
+
+    @Test
+    fun appSessionHeartbeatAndCommandAreAppOnlyAndRequireSession() {
+        // APP 可以在会话内报心跳、下发受限命令。
+        assertTrue(
+            RolePolicy.authorize(appPeer(), request(RolePolicy.METHOD_SESSION_HEARTBEAT, session)),
+        )
+        assertTrue(
+            RolePolicy.authorize(appPeer(), request(RolePolicy.METHOD_SESSION_COMMAND, session)),
+        )
+        // 两个方法都必须携带 SessionId：不能作用于“当前通话”。
+        assertFalse(RolePolicy.authorize(appPeer(), request(RolePolicy.METHOD_SESSION_HEARTBEAT)))
+        assertFalse(RolePolicy.authorize(appPeer(), request(RolePolicy.METHOD_SESSION_COMMAND)))
+
+        // HOOK 与 CLI_ROOT 不能借用 APP 的命令/心跳通道（即使伪造会话 ID）。
+        assertFalse(RolePolicy.methodsFor(PeerRole.HOOK).contains(RolePolicy.METHOD_SESSION_COMMAND))
+        assertFalse(RolePolicy.methodsFor(PeerRole.HOOK).contains(RolePolicy.METHOD_SESSION_HEARTBEAT))
+        assertFalse(RolePolicy.authorize(hookPeer(), request(RolePolicy.METHOD_SESSION_COMMAND, session)))
+        assertFalse(RolePolicy.authorize(hookPeer(), request(RolePolicy.METHOD_SESSION_HEARTBEAT, session)))
+        assertFalse(RolePolicy.authorize(rootPeer(), request(RolePolicy.METHOD_SESSION_COMMAND, session)))
+        assertFalse(RolePolicy.authorize(rootPeer(), request(RolePolicy.METHOD_SESSION_HEARTBEAT, session)))
+        assertFalse(RolePolicy.methodsFor(PeerRole.CLI_ROOT).contains(RolePolicy.METHOD_SESSION_COMMAND))
+        assertFalse(RolePolicy.methodsFor(PeerRole.CLI_ROOT).contains(RolePolicy.METHOD_SESSION_HEARTBEAT))
+
+        // 未核验身份（无包名/签名）的 APP 也不能调用。
+        assertFalse(
+            RolePolicy.authorize(
+                PeerIdentity(10_250, PeerRole.APP),
+                request(RolePolicy.METHOD_SESSION_COMMAND, session),
+            ),
+        )
+    }
+
+    @Test
     fun sessionBoundMethodsRequireSessionId() {
         assertFalse(RolePolicy.authorize(hookPeer(), request(RolePolicy.METHOD_HOOK_SNAPSHOT)))
         assertTrue(RolePolicy.authorize(hookPeer(), request(RolePolicy.METHOD_HOOK_SNAPSHOT, session)))
