@@ -94,6 +94,13 @@ enum class EventKind {
     /** Call 已销毁。 */
     DESTROYED,
 
+    /**
+     * Telecom 报告了一个未映射的瞬时/未知状态（NEW、DIALING、CONNECTING、
+     * SELECT_PHONE_ACCOUNT、AUDIO_PROCESSING…）。注册表必须保留上一次已知状态，
+     * 既不猜测成 ACTIVE，也不因此撤销待执行接听。
+     */
+    UNKNOWN_STATE,
+
     /** 模块动作在主线程二次核验时失败。 */
     ACTION_FAILED,
 }
@@ -139,6 +146,14 @@ interface RegistryListener {
     /** 会话被移除（通话结束、显式移除）。 */
     fun onSessionRemoved(session: SessionId) {
         // 可选。
+    }
+
+    /**
+     * 会话被移除，并带上对应的门面，便于上层清理 Call→门面映射（否则门面会一直
+     * 留在映射里直到 InCallService.onCallRemoved）。默认转调单参数版本。
+     */
+    fun onSessionRemoved(session: SessionId, handle: CallHandle) {
+        onSessionRemoved(session)
     }
 
     /** 模块控制被保守交还人工；[reason] 是机器可读原因。 */

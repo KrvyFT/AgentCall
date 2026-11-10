@@ -1,5 +1,6 @@
 package org.krvyft.agentcall.hook
 
+import android.telecom.Call
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -287,6 +288,202 @@ class CallRegistryTest {
         assertEquals(listOf(session), listener.removed)
         assertEquals(Rejected(STALE_SESSION), registry.answer(session))
         assertEquals(0, handle.answerCount)
+    }
+
+    @Test
+    fun routeChangeOnModuleOwnedActiveCallHandsBackToHuman() {
+        val handle = FakeCallHandle()
+        val listener = RecordingListener()
+        val registry = CallRegistry(listener = listener)
+        val session = registry.observe(handle)
+        assertEquals(CommandResult.Accepted, registry.answer(session))
+        handle.emit(snapshot = ringingSnapshot().copy(state = CallState.ACTIVE), source = ActionSource.MODULE)
+
+        // AI 通话中系统/人工切换音频路由：来源不明，必须保守交还。
+        handle.emit(
+            kind = EventKind.ROUTE_CHANGED,
+            source = ActionSource.UNKNOWN,
+            snapshot = ringingSnapshot().copy(state = CallState.ACTIVE),
+        )
+
+        assertFalse(registry.isPendingAnswer(session))
+        assertTrue(registry.isHandedBack(session))
+        assertEquals(1, listener.handbacks.size)
+        assertEquals("route_change", listener.handbacks[0].third)
+        assertEquals(Rejected(NOT_OWNED), registry.hangup(session))
+        assertEquals(0, handle.disconnectCount)
+    }
+
+    @Test
+    fun moduleSourceRouteChangeKeepsModuleOwnership() {
+        val handle = FakeCallHandle()
+        val listener = RecordingListener()
+        val registry = CallRegistry(listener = listener)
+        val session = registry.observe(handle)
+        assertEquals(CommandResult.Accepted, registry.answer(session))
+        handle.emit(snapshot = ringingSnapshot().copy(state = CallState.ACTIVE), source = ActionSource.MODULE)
+
+        // 模块自己标记的路由动作不算“来源不明”，不能交还。
+        handle.emit(
+            kind = EventKind.ROUTE_CHANGED,
+            source = ActionSource.MODULE,
+            snapshot = ringingSnapshot().copy(state = CallState.ACTIVE),
+        )
+
+        assertFalse(registry.isHandedBack(session))
+        assertTrue(listener.handbacks.isEmpty())
+        assertEquals(CommandResult.Accepted, registry.hangup(session))
+        assertEquals(1, handle.disconnectCount)
+    }
+
+    @Test
+    fun terminalStateEmitsFinalDisconnectedSnapshotBeforeRemoval() {
+        val handle = FakeCallHandle()
+        val listener = RecordingListener()
+        val registry = CallRegistry(listener = listener)
+        val session = registry.observe(handle)
+
+        handle.emit(
+            kind = EventKind.STATE_CHANGED,
+            source = ActionSource.UNKNOWN,
+            snapshot = ringingSnapshot().copy(state = CallState.DISCONNECTED),
+        )
+
+        // 控制器必须收到终态快照，而不是只等心跳超时。
+        val finalSnapshot = listener.snapshots.last()
+        assertEquals(session, finalSnapshot.id)
+        assertEquals(CallState.DISCONNECTED, finalSnapshot.state)
+        assertEquals(listOf(session), listener.removed)
+        assertTrue(registry.liveSessions().isEmpty())
+        assertEquals(1, handle.removeCallbackCount)
+    }
+
+    @Test
+    fun observingAnAlreadyDisconnectedHandleLeavesNoZombieSession() {
+        val handle = FakeCallHandle(current = ringingSnapshot().copy(state = CallState.DISCONNECTED))
+        val listener = RecordingListener()
+        val registry = CallRegistry(listener = listener)
+
+        val session = registry.observe(handle)
+
+        assertTrue(registry.liveSessions().isEmpty())
+        assertNull(registry.snapshot(session))
+        assertEquals(Rejected(STALE_SESSION), registry.answer(session))
+        assertEquals(0, handle.answerCount)
+        assertEquals(1, handle.addCallbackCount)
+        assertEquals(1, handle.removeCallbackCount)
+        assertEquals(listOf(session), listener.removed)
+        assertEquals(CallState.DISCONNECTED, listener.snapshots.single().state)
+    }
+
+    @Test
+    fun duplicateHangupDoesNotDisconnectTelecomTwice() {
+        val handle = FakeCallHandle()
+        val sink = RecordingSink()
+        val registry = CallRegistry(sink = sink)
+        val session = registry.observe(handle)
+        assertEquals(CommandResult.Accepted, registry.answer(session))
+        handle.emit(snapshot = ringingSnapshot().copy(state = CallState.ACTIVE), source = ActionSource.MODULE)
+
+        assertEquals(CommandResult.Accepted, registry.hangup(session))
+        assertEquals(Rejected(NOT_OWNED), registry.hangup(session))
+
+        assertEquals(1, handle.disconnectCount)
+        assertEquals(2, sink.attempts.count { it.command == CallCommand.Hangup })
+    }
+
+    @Test
+    fun moduleAnswerIsClaimedThroughTheProductionSourceDerivation() {
+        val handle = FakeCallHandle()
+        val registry = CallRegistry()
+        val session = registry.observe(handle)
+        assertEquals(CommandResult.Accepted, registry.answer(session))
+
+        // 不硬编码 MODULE：来源由生产用的 claimSource 推导（目标状态匹配 + 窗口内）。
+        val claim = TelecomDecisions.claimSource(
+            telecomState = Call.STATE_ACTIVE,
+            pendingTargetState = Call.STATE_ACTIVE,
+            pendingAtNs = 1_000L,
+            nowNs = 2_000L,
+        )
+        handle.emit(snapshot = ringingSnapshot().copy(state = CallState.ACTIVE), source = claim.source)
+
+        assertEquals(ActionSource.MODULE, claim.source)
+        assertFalse(registry.isPendingAnswer(session))
+        assertFalse(registry.isHandedBack(session))
+        assertEquals(CommandResult.Accepted, registry.hangup(session))
+        assertEquals(1, handle.disconnectCount)
+    }
+
+    @Test
+    fun unknownTransientStateDoesNotCancelPendingAnswer() {
+        val handle = FakeCallHandle()
+        val listener = RecordingListener()
+        val registry = CallRegistry(listener = listener)
+        val session = registry.observe(handle)
+        assertEquals(CommandResult.Accepted, registry.answer(session))
+
+        // 门面把未映射的瞬时状态上报为 UNKNOWN_STATE，快照里的状态是保守映射（ACTIVE）。
+        handle.emit(
+            kind = EventKind.UNKNOWN_STATE,
+            source = ActionSource.UNKNOWN,
+            snapshot = ringingSnapshot().copy(state = CallState.ACTIVE),
+            reason = "telecom_state_unknown_" + 12,
+        )
+
+        assertTrue(registry.isPendingAnswer(session))
+        assertFalse(registry.isHandedBack(session))
+        assertTrue(listener.handbacks.isEmpty())
+        // 不猜测：保留上一次已知状态，绝不因为瞬时状态把待执行接听当成人工接听。
+        assertEquals(CallState.RINGING, registry.snapshot(session)?.state)
+        assertEquals(1, handle.answerCount)
+    }
+
+    @Test
+    fun actionFailureDuringModuleOwnershipHandsBackToHuman() {
+        val handle = FakeCallHandle()
+        val listener = RecordingListener()
+        val registry = CallRegistry(listener = listener)
+        val session = registry.observe(handle)
+        assertEquals(CommandResult.Accepted, registry.answer(session))
+        handle.emit(snapshot = ringingSnapshot().copy(state = CallState.ACTIVE), source = ActionSource.MODULE)
+
+        handle.disconnectOutcome = CommandResult.Failed("disconnect_failed", "SECURITY")
+        assertEquals(CommandResult.Failed("disconnect_failed", "SECURITY"), registry.hangup(session))
+        handle.emit(
+            kind = EventKind.ACTION_FAILED,
+            source = ActionSource.UNKNOWN,
+            snapshot = ringingSnapshot().copy(state = CallState.ACTIVE),
+            reason = "disconnect_precheck_failed",
+        )
+
+        assertTrue(registry.isHandedBack(session))
+        assertEquals("disconnect_precheck_failed", listener.handbacks.single().third)
+        // 所有权已交还：再挂断既不下发 Telecom，也不会掩盖人工通话。
+        assertEquals(Rejected(NOT_OWNED), registry.hangup(session))
+        assertEquals(1, handle.disconnectCount)
+    }
+
+    @Test
+    fun answerSafetyGateRefusesUnsafeCalls() {
+        val unsafe = listOf(
+            "emergency" to ringingSnapshot().copy(isEmergency = true),
+            "conference" to ringingSnapshot().copy(isConference = true),
+            "second_active_call" to ringingSnapshot().copy(activeCallCount = 2),
+            "outgoing" to ringingSnapshot().copy(direction = CallDirection.OUTGOING),
+            "restricted" to ringingSnapshot().copy(presentation = Presentation.RESTRICTED, number = null),
+            "unknown_presentation" to ringingSnapshot().copy(presentation = Presentation.UNKNOWN, number = null),
+            "payphone" to ringingSnapshot().copy(presentation = Presentation.PAYPHONE),
+        )
+        for ((name, snapshot) in unsafe) {
+            val handle = FakeCallHandle(current = snapshot)
+            val registry = CallRegistry()
+            val session = registry.observe(handle)
+
+            assertEquals(name, Rejected(NOT_OWNED), registry.answer(session))
+            assertEquals(name, 0, handle.answerCount)
+            assertFalse(name, registry.isPendingAnswer(session))
+        }
     }
 
     // ------------------------------------------------------------------ fixtures
