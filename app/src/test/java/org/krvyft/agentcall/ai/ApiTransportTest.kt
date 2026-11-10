@@ -19,7 +19,7 @@ import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -649,11 +649,19 @@ internal object TestResources {
     fun text(name: String): String = String(bytes(name), Charsets.UTF_8)
 }
 
-/** 只提供“一句用户语音”的下行会话：用于把真实 HTTP 客户端接进完整回合。 */
+/**
+ * 只提供“一句用户语音”的下行会话：用于把真实 HTTP 客户端接进完整回合。
+ *
+ * 一段完整语音 = 语音分片 + 800 ms 静音分片。
+ *
+ * 分片必须分开送入：VAD 按整片 RMS 判定，把语音与静音拼进同一片会被当成“一直在说话”
+ * 而永远不结束分句（那会依赖已删除的通话结束收尾回合）。
+ */
 private class SingleSegmentAudio : AudioSession {
-    override val downlink: Flow<PcmChunk> = flowOf(
-        PcmChunk(tone(1_000) + silence(800), AudioFormatSpec(16_000)),
-    )
+    override val downlink: Flow<PcmChunk> = flow {
+        emit(PcmChunk(tone(1_000), AudioFormatSpec(16_000)))
+        emit(PcmChunk(silence(800), AudioFormatSpec(16_000)))
+    }
     var writeCount = 0
     var stopCount = 0
 

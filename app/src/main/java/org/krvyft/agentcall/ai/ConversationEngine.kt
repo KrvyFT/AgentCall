@@ -37,7 +37,9 @@ class VoiceTurnTimeoutException(message: String, cause: Throwable? = null) : IOE
  *   取消时在 NonCancellable 中关闭音频会话，取消后不再有 in-flight 结果写上行；
  * - 播放期间关闭新回合触发（accepting=false），播放后再保留 300 ms 回声残留窗口，
  *   期间下行只丢弃不缓冲，因此不承诺也不伪造双工打断；
- * - 每个回合 45 秒（含播放），ASR/LLM/TTS 的 429/5xx 在截止时间内最多重试一次；
+ * - 网络/生成阶段（ASR、LLM、TTS 合成）每个回合 45 秒；播放不占用这个预算，
+ *   而是按音频名义时长 + [PLAYBACK_GRACE_MS] 单独有界等待（仍可被取消立即中断）；
+ *   ASR/LLM/TTS 的 429/5xx 在截止时间内最多重试一次；
  * - 上下文最多 8 轮，每次 run() 独立（通话结束即清空），回复本地截断到 300 字；
  * - 端点不齐（例如只有 chat-compatible 服务）时直接返回，不写任何上行音频。
  */
@@ -97,13 +99,13 @@ class ConversationEngine(
                             accepting.set(true)
                         }
                     }
-                    // 下行正常结束（通话结束）时，把还差最后 800 ms 静音的那一段也交给
-                    // ASR/LLM/TTS，避免丢掉用户最后一句话。取消/异常路径不会执行到这里，
-                    // 因此不会在取消后发起新回合。
+                    // 收尾：只有通话仍然活动时才允许发起新回合。下行结束就是“会话正在
+                    // 关闭”的信号（真实桥上只有 stop()/下行读取结束才会正常关闭下行；
+                    // 挂断/失败是以异常关闭的，根本到不了这里），因此绝不再把 VAD 里剩下的
+                    // 最后一段交给 ASR→LLM/TTS：通话结束后没人听得到这个回合，而播放现在
+                    // 会阻塞到播放结束，它只会把正在关闭的会话再拖住一整轮。
                     accepting.set(false)
-                    vad.flush()?.let { segment ->
-                        handleTurn(segment, audio, config, context)
-                    }
+                    vad.reset()
                 } finally {
                     accepting.set(false)
                     collector.cancel()
@@ -124,7 +126,7 @@ class ConversationEngine(
             callWithRetry("tts-greeting", deadline) { speech.synthesize(openingLine) }
         } ?: throw VoiceTurnTimeoutException("greeting timed out after " + turnTimeoutMs + " ms")
         currentCoroutineContext().ensureActive()
-        audio.writeUplink(pcm)
+        play(audio, pcm)
     }
 
     private suspend fun handleTurn(
@@ -134,39 +136,80 @@ class ConversationEngine(
         context: MutableList<ChatMessage>,
     ) {
         val deadline = Deadline(clock.nowMs() + turnTimeoutMs)
-        // withTimeoutOrNull 只吞掉自己的回合超时；调用方取消原样传播（spec §10）。
-        val completed = withTimeoutOrNull(turnTimeoutMs) {
-            val wav = WavCodec.encode(segment)
-            val transcript = callWithRetry("asr", deadline) {
-                transcriber.transcribe(wav)
-            }.trim()
-            // 迟到的结果不得推进到下一阶段：取消后既不请求 TTS，也不写上行。
-            currentCoroutineContext().ensureActive()
-            if (transcript.isEmpty()) return@withTimeoutOrNull
-            context += ChatMessage(ChatMessage.ROLE_USER, transcript)
-            trimContext(context)
+        // 45 s 预算只覆盖网络/生成阶段（ASR、LLM、TTS 合成）。播放放在这个截止时间之外：
+        // 一段 300 字的 TTS 播放很容易超过 45 s，若把播放包进 withTimeoutOrNull，播放等待
+        // 会被取消并抛出 VoiceTurnTimeoutException，而该异常会逃出 run()、让整通电话的 AI
+        // 引擎停摆。withTimeoutOrNull 只吞掉自己的回合超时；调用方取消原样传播（spec §10）。
+        val generated = withTimeoutOrNull(turnTimeoutMs) {
+            // 用包装类型区分“超时”（withTimeoutOrNull 的 null）与“生成完成但无需回复”。
+            GeneratedReply(generateReply(segment, config, context, deadline))
+        } ?: throw VoiceTurnTimeoutException("turn timed out after " + turnTimeoutMs + " ms")
+        val pcm = generated.pcm ?: return
+        play(audio, pcm)
+        // 播放结束后的回声残留窗口：期间下行只丢弃、绝不开启新回合。
+        delay(ECHO_GUARD_MS)
+    }
 
-            val reply = callWithRetry("llm", deadline) {
-                chat.reply(buildMessages(config, context))
-            }
-            currentCoroutineContext().ensureActive()
-            val trimmed = trimReply(reply)
-            if (trimmed.isEmpty()) return@withTimeoutOrNull
-            context += ChatMessage(ChatMessage.ROLE_ASSISTANT, trimmed)
-            trimContext(context)
+    /** 生成阶段的结果；[pcm] 为 null 表示本回合没有可播报的内容（空转写/空回复）。 */
+    private class GeneratedReply(val pcm: PcmAudio?)
 
-            val pcm = callWithRetry("tts", deadline) { speech.synthesize(trimmed) }
-            // 取消后到达的结果绝不写上行：写之前再检查一次协程仍存活。
-            currentCoroutineContext().ensureActive()
-            if (clock.nowMs() >= deadline.atMs) {
-                throw VoiceTurnTimeoutException("turn deadline reached before playback")
-            }
-            audio.writeUplink(pcm)
-            delay(ECHO_GUARD_MS)
+    /** ASR → LLM → TTS 合成；整个阶段都受 45 s 截止时间（[turnTimeoutMs]）约束。 */
+    private suspend fun generateReply(
+        segment: PcmAudio,
+        config: AgentConfig,
+        context: MutableList<ChatMessage>,
+        deadline: Deadline,
+    ): PcmAudio? {
+        val wav = WavCodec.encode(segment)
+        val transcript = callWithRetry("asr", deadline) {
+            transcriber.transcribe(wav)
+        }.trim()
+        // 迟到的结果不得推进到下一阶段：取消后既不请求 TTS，也不写上行。
+        currentCoroutineContext().ensureActive()
+        if (transcript.isEmpty()) return null
+        context += ChatMessage(ChatMessage.ROLE_USER, transcript)
+        trimContext(context)
+
+        val reply = callWithRetry("llm", deadline) {
+            chat.reply(buildMessages(config, context))
         }
-        if (completed == null) {
-            throw VoiceTurnTimeoutException("turn timed out after " + turnTimeoutMs + " ms")
+        currentCoroutineContext().ensureActive()
+        val trimmed = trimReply(reply)
+        if (trimmed.isEmpty()) return null
+        context += ChatMessage(ChatMessage.ROLE_ASSISTANT, trimmed)
+        trimContext(context)
+
+        val pcm = callWithRetry("tts", deadline) { speech.synthesize(trimmed) }
+        // 取消后到达的结果绝不写上行：写之前再检查一次协程仍存活。
+        currentCoroutineContext().ensureActive()
+        if (clock.nowMs() >= deadline.atMs) {
+            throw VoiceTurnTimeoutException("turn deadline reached before playback")
         }
+        return pcm
+    }
+
+    /**
+     * 播放已生成的音频，直到 [AudioSession.writeUplink] 返回（core 契约：返回即播放结束）。
+     *
+     * 播放不占用 45 s 网络预算，但仍然是**有界**等待：上限是音频名义时长 + [PLAYBACK_GRACE_MS]。
+     * 超过上限只记一条日志并把这段播放视为结束，绝不抛 VoiceTurnTimeoutException（那会让
+     * 引擎在通话中停摆）。调用方取消原样传播：withTimeoutOrNull 只吞掉自己的超时，
+     * 取消会立即中断 writeUplink 内部的播放等待。
+     */
+    private suspend fun play(audio: AudioSession, pcm: PcmAudio) {
+        val boundMs = playbackWaitMs(pcm)
+        val played = withTimeoutOrNull(boundMs) { audio.writeUplink(pcm) }
+        if (played == null) {
+            logger("ai playback wait exceeded " + boundMs + " ms")
+        }
+    }
+
+    /** 播放等待上限：PCM16 单声道名义时长 + 余量（采样率非法时只用余量）。 */
+    private fun playbackWaitMs(pcm: PcmAudio): Long {
+        val sampleRate = pcm.format.sampleRate
+        val frames = pcm.data.size / 2L
+        val nominalMs = if (sampleRate > 0) frames * 1_000L / sampleRate else 0L
+        return nominalMs + PLAYBACK_GRACE_MS
     }
 
     private suspend fun <T> callWithRetry(
@@ -213,8 +256,11 @@ class ConversationEngine(
     }
 
     companion object {
-        /** spec §10：整个回合 45 秒。 */
+        /** spec §10：每个回合 45 秒，只覆盖网络/生成阶段（ASR、LLM、TTS 合成），不含播放。 */
         const val TURN_TIMEOUT_MS = 45_000L
+
+        /** 播放等待在音频名义时长之外的余量；播放预算独立于 45 s 网络预算。 */
+        const val PLAYBACK_GRACE_MS = 15_000L
 
         /** spec §10：最多 8 轮上下文。 */
         const val MAX_CONTEXT_ROUNDS = 8

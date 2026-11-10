@@ -1,5 +1,6 @@
 package org.krvyft.agentcall.ai
 
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.TimeoutCancellationException
@@ -31,8 +32,10 @@ import org.krvyft.agentcall.core.port.MonotonicClock
  * 语音回合引擎与 VAD 的 JVM 测试（kotlinx-coroutines-test 虚拟调度器）。
  *
  * 覆盖：端点齐备才具备语音能力、默认中文开场白、ASR→LLM→TTS→上行链路、300 字截断、
- * 8 轮上下文与通话结束清空、429/5xx 截止时间内只重试一次、45 s 回合超时、
- * 播放期间不触发新回合、取消后 in-flight 结果绝不写上行（writeUplink 次数为 0）。
+ * 8 轮上下文与通话结束清空、429/5xx 截止时间内只重试一次、45 s 网络/生成预算、
+ * 播放不占用 45 s 预算（60 s 播放不抛 VoiceTurnTimeoutException 且引擎仍可用）、
+ * 播放有界等待、播放期间不触发新回合、挂断后不做收尾回合、
+ * 取消后 in-flight 结果绝不写上行（writeUplink 次数为 0）且能立即中断播放等待。
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class ConversationEngineTest {
@@ -228,18 +231,140 @@ class ConversationEngineTest {
     }
 
     @Test
-    fun pendingSpeechIsFlushedWhenTheDownlinkEnds() = runTest {
+    fun pendingSpeechIsNotTurnedIntoATurnAfterTheCallEnds() = runTest {
         val audio = FakeAudioSession()
         val transcriber = FakeTranscriber()
         val speech = FakeSpeech()
         val job = launch { engine(transcriber, chat = FakeChat(), speech = speech).run(session, audio, config()) }
         // 通话在用户说话中途结束：没有 800 ms 静音，只有不足一个完整分句的语音。
+        // 下行结束即会话正在关闭，此后不得再跑 ASR→LLM→TTS 回合（没人听得到，而且
+        // 播放会阻塞到播放结束，只会把正在关闭的会话再拖住一整轮）。
         chunked(tone(1_000)).forEach { audio.chunks.trySend(it) }
         audio.chunks.close()
         testScheduler.advanceUntilIdle()
         job.join()
 
-        assertEquals("the final segment must still be considered", 1, transcriber.calls)
+        assertEquals("no turn may run after the call ended", 0, transcriber.calls)
+        assertEquals(0, speech.calls)
+        assertEquals(0, audio.writeCount)
+        assertEquals(1, audio.stopCount)
+    }
+
+    // ------------------------------------------------------------------ 播放预算（不占网络预算）
+
+    @Test
+    fun longPlaybackOutlivesTheTurnBudgetWithoutFailingTheTurn() = runTest {
+        val audio = FakeAudioSession().apply { playbackMs = 60_000L }
+        val transcriber = FakeTranscriber()
+        val speech = FakeSpeech().apply { result = longReplyAudio() }
+        val job = launch { engine(transcriber, chat = FakeChat(), speech = speech).run(session, audio, config()) }
+        audio.feedSegment()
+
+        // 45 s 网络/生成预算已经过去，但播放不占它：回合不得抛 VoiceTurnTimeoutException。
+        testScheduler.advanceTimeBy(50_000L)
+        assertEquals(1, audio.writeCount)
+        assertTrue("playback must still be running past the 45 s budget", audio.playing)
+        assertTrue("the engine must not be stopped by playback", job.isActive)
+
+        // 播放期间的下行是本机 TTS 回声：绝不开启新回合。
+        audio.feedSegment()
+        testScheduler.advanceTimeBy(10_200L)
+        assertFalse("playback must have completed", audio.playing)
+        assertEquals("echo during playback must never start a turn", 1, transcriber.calls)
+        assertEquals(1, audio.writeCount)
+
+        // 播放结束后 300 ms 回声残留窗口内到达的下行同样丢弃。
+        audio.feedSegment()
+        testScheduler.advanceTimeBy(200L)
+        assertEquals(1, transcriber.calls)
+        testScheduler.advanceTimeBy(200L)
+        testScheduler.advanceUntilIdle()
+        assertEquals(1, transcriber.calls)
+        assertEquals(1, audio.writeCount)
+
+        // 引擎仍然可用：真实用户语音照常开启下一回合。
+        audio.playbackMs = 0L
+        audio.feedSegment()
+        testScheduler.advanceUntilIdle()
+        assertEquals("the engine must stay usable for the next turn", 2, transcriber.calls)
+        assertEquals(2, audio.writeCount)
+        assertTrue(job.isActive)
+        job.cancel()
+    }
+
+    @Test
+    fun playbackWaitIsBoundedAndNeverKillsTheEngine() = runTest {
+        val audio = FakeAudioSession().apply { playbackMs = 600_000L }
+        val transcriber = FakeTranscriber()
+        val speech = FakeSpeech().apply { result = longReplyAudio() }
+        val logs = mutableListOf<String>()
+        val job = launch {
+            engine(transcriber, chat = FakeChat(), speech = speech, logger = { logs += it })
+                .run(session, audio, config())
+        }
+        audio.feedSegment()
+
+        // 播放上限 = 60 s 音频名义时长 + 15 s 余量；超限只放弃这段播放等待，不抛异常。
+        testScheduler.advanceTimeBy(76_000L)
+        assertTrue("the bounded wait must cancel writeUplink", audio.writeCancelled)
+        assertFalse(audio.playing)
+        assertEquals(1, transcriber.calls)
+        assertTrue(job.isActive)
+        assertTrue(logs.any { it.contains("playback wait exceeded") })
+
+        audio.playbackMs = 0L
+        audio.feedSegment()
+        testScheduler.advanceUntilIdle()
+        assertEquals(2, transcriber.calls)
+        assertEquals(2, audio.writeCount)
+        job.cancel()
+    }
+
+    @Test
+    fun cancelDuringLongPlaybackInterruptsItPromptlyWithoutFurtherWrites() = runTest {
+        val audio = FakeAudioSession().apply { playbackMs = 60_000L }
+        val transcriber = FakeTranscriber()
+        val speech = FakeSpeech().apply { result = longReplyAudio() }
+        val job = launch { engine(transcriber, chat = FakeChat(), speech = speech).run(session, audio, config()) }
+        audio.feedSegment()
+        testScheduler.advanceTimeBy(2_000L)
+        assertEquals(1, audio.writeCount)
+        assertTrue(audio.playing)
+
+        job.cancel()
+        testScheduler.advanceTimeBy(1_000L)
+        job.join()
+
+        assertTrue(job.isCancelled)
+        assertTrue("external cancellation must interrupt the playback wait", audio.writeCancelled)
+        assertFalse(audio.playing)
+        assertEquals("no further writes after cancellation", 1, audio.writeCount)
+        assertEquals("cancellation must not start a flush turn", 1, transcriber.calls)
+        assertEquals(1, speech.calls)
+        assertEquals("cancellation must close the audio session", 1, audio.stopCount)
+    }
+
+    @Test
+    fun hangupDuringPlaybackDoesNotStartAFlushTurn() = runTest {
+        val audio = FakeAudioSession().apply { playbackMs = 60_000L }
+        val transcriber = FakeTranscriber()
+        val speech = FakeSpeech().apply { result = longReplyAudio() }
+        val job = launch { engine(transcriber, chat = FakeChat(), speech = speech).run(session, audio, config()) }
+        audio.feedSegment()
+        testScheduler.advanceTimeBy(2_000L)
+        assertEquals(1, audio.writeCount)
+
+        // 播放期间挂断：下行正常结束（真实桥上 stop() 就是这样关闭下行的），
+        // 同时还有一截回声分片到达。
+        audio.feedSegment()
+        audio.chunks.close()
+        testScheduler.advanceTimeBy(70_000L)
+        testScheduler.advanceUntilIdle()
+        job.join()
+
+        assertFalse(job.isCancelled)
+        assertEquals("no flush turn after hangup", 1, transcriber.calls)
+        assertEquals(1, speech.calls)
         assertEquals(1, audio.writeCount)
         assertEquals(1, audio.stopCount)
     }
@@ -543,6 +668,9 @@ class ConversationEngineTest {
         var playbackMs = 0L
         var playing = false
 
+        /** 播放等待被取消（外部取消或引擎的播放上限）时置位。 */
+        var writeCancelled = false
+
         override suspend fun writeUplink(audio: PcmAudio) {
             writeCount += 1
             written += audio
@@ -550,6 +678,9 @@ class ConversationEngineTest {
                 playing = true
                 try {
                     delay(playbackMs)
+                } catch (cancelled: CancellationException) {
+                    writeCancelled = true
+                    throw cancelled
                 } finally {
                     playing = false
                 }
@@ -560,6 +691,9 @@ class ConversationEngineTest {
             stopCount += 1
         }
     }
+
+    /** 60 s 的 PCM16 单声道音频：约等于 300 字回复的真实播放时长（名义时长 60 s）。 */
+    private fun longReplyAudio(): PcmAudio = PcmAudio(tone(60_000), AudioFormatSpec(16_000))
 
     private fun FakeAudioSession.feedSegment() {
         chunked(tone(1_000) + silence(800)).forEach { chunks.trySend(it) }
