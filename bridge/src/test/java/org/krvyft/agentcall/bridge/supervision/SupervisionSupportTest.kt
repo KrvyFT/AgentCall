@@ -452,11 +452,14 @@ class SupervisorProductionGraphTest {
         assertEquals(listOf(session to CallCommand.Hangup), platform.calls.commands.filter { it.second == CallCommand.Hangup })
         assertTrue(platform.audio.microphoneIsolated)
 
-        graph.supervisor.shutdown()
-        assertTrue("关闭监督角色必须保持隔离，不得静默开麦", platform.audio.microphoneIsolated)
+        // Task 11D2a：租约已撤销（上一轮故障终止已接受挂断）→ AI 不再拥有该通话；
+        // 优雅关闭必须恢复麦克风，而不是把系统全局静音留给下一次启动。
+        val result = graph.supervisor.shutdown(deadlineMs = 200)
+        assertTrue("租约撤销/已确认非 AI 所有时关闭必须恢复麦克风", result.clean)
+        assertFalse("关闭后麦克风不得仍然被静音", platform.audio.microphoneIsolated)
         assertEquals(
-            "关闭监督角色不得再调用恢复麦克风（只允许启动恢复那一次）",
-            1,
+            "启动恢复一次 + 关闭交还一次",
+            2,
             platform.audio.restoreCalls,
         )
     }

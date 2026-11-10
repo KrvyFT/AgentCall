@@ -17,6 +17,7 @@ import org.krvyft.agentcall.bridge.audio.MicrophoneIsolation
 import org.krvyft.agentcall.bridge.audio.ProcessFaultDecision
 import org.krvyft.agentcall.core.model.AudioFormatSpec
 import org.krvyft.agentcall.core.model.CallCommand
+import org.krvyft.agentcall.core.model.CallState
 import org.krvyft.agentcall.core.model.CommandResult
 import org.krvyft.agentcall.core.model.PcmAudio
 import org.krvyft.agentcall.core.model.PcmChunk
@@ -51,9 +52,13 @@ class SupervisorTest {
     ) {
         val clock = FakeClock()
         val leases = LeaseRegistry()
-        val isolation = FakeIsolation()
+        /** 终止/恢复的副作用顺序（关闭路径测试断言“先终止、再恢复、后关闭”）。 */
+        val events = mutableListOf<String>()
+        val isolation = FakeIsolation(events)
         val bridge = FakeBridge()
-        val calls = FakeCallControl()
+        val calls = FakeCallControl(events)
+        /** 生产来源是 HOOK 快照；关闭路径用它区分“确认断开”与“无法确认”。 */
+        var callState: CallState? = null
         val permission = FakePermission(permissionGranted)
         val identity = FakeIdentity(
             available = identityAvailable,
@@ -71,6 +76,7 @@ class SupervisorTest {
             authorization = AutoAnswerAuthorization { authorized },
             role = BridgeProcessRole.SUPERVISOR,
             stateSink = stateSink,
+            callState = CallStateProbe { callState },
         )
 
         fun heartbeat() {
@@ -340,7 +346,9 @@ class SupervisorTest {
         f.supervisor.block("test_block")
         assertTrue("block() 不得清掉所有权标记", states.last().ownedCallMayBeLive)
 
-        f.supervisor.shutdown()
+        // 未确认断开：有界等待后失败关闭，粘性标记必须保留（下一次启动仍然 fail closed）。
+        val result = f.supervisor.shutdown(deadlineMs = 25)
+        assertEquals(Supervisor.SHUTDOWN_CALL_UNRESOLVED, result.code)
         assertTrue("关闭进程同样不能假定通话已结束", states.last().ownedCallMayBeLive)
     }
 
@@ -355,6 +363,117 @@ class SupervisorTest {
         f.supervisor.onCallDisconnected(session)
 
         assertFalse("确认断开后必须清除所有权标记", states.last().ownedCallMayBeLive)
+    }
+
+
+    /**
+     * Task 11D2a：优雅关闭必须先终止/交还拥有的通话，确认真实断开后才恢复麦克风。
+     * 顺序断言：终止命令（Hangup）→ 恢复（restore）→ 关闭（ENDED/started=false）。
+     */
+    @Test
+    fun shutdownTerminatesThenRestoresThenClosesAfterConfirmedDisconnect() = runBlocking {
+        val f = Fixture()
+        f.heartbeat()
+        assertEquals(CommandResult.Accepted, f.supervisor.prepareAnswer(session))
+        f.events.clear()
+        f.callState = CallState.DISCONNECTED
+
+        val result = f.supervisor.shutdown(deadlineMs = 2_000)
+
+        assertTrue("已确认断开时必须干净关闭", result.clean)
+        assertEquals(TerminationOutcome.HOOK_ACCEPTED, result.termination)
+        assertTrue(result.ownershipResolved)
+        assertTrue(result.disconnected)
+        assertFalse(result.microphoneIsolated)
+        assertNull(result.code)
+        assertEquals(1, f.isolation.restoreCalls)
+        assertEquals(
+            listOf("command:Hangup", "restore"),
+            f.events.filter { it == "command:Hangup" || it == "restore" },
+        )
+        assertEquals(SupervisorPhase.ENDED, f.supervisor.snapshot().phase)
+        assertFalse("关闭后监督角色不再处于 started", f.supervisor.isStarted())
+    }
+
+    /**
+     * Task 11D2a：期限内无法确认断开时保持隔离、失败关闭，并上报机器码；
+     * 绝不静默留下被静音的麦克风却返回成功。
+     */
+    @Test
+    fun shutdownKeepsIsolationAndReportsUnresolvedWhenDisconnectIsUnconfirmed() = runBlocking {
+        val f = Fixture()
+        f.heartbeat()
+        assertEquals(CommandResult.Accepted, f.supervisor.prepareAnswer(session))
+        f.events.clear()
+
+        val result = f.supervisor.shutdown(deadlineMs = 40)
+
+        assertFalse(result.clean)
+        assertEquals(Supervisor.SHUTDOWN_CALL_UNRESOLVED, result.code)
+        assertEquals(TerminationOutcome.HOOK_ACCEPTED, result.termination)
+        assertFalse(result.ownershipResolved)
+        assertFalse(result.disconnected)
+        assertTrue("无法确认断开时必须保持隔离", result.microphoneIsolated)
+        assertTrue(f.worker.microphoneIsolated)
+        assertEquals("未确认断开绝不能恢复麦克风", 0, f.isolation.restoreCalls)
+        assertEquals(SupervisorPhase.ENDED, f.supervisor.snapshot().phase)
+        assertEquals(Supervisor.SHUTDOWN_CALL_UNRESOLVED, f.supervisor.snapshot().lastFault)
+    }
+
+    /** Task 11D2a：没有拥有的会话时不得伪造终止/恢复，隔离读回保持原样。 */
+    @Test
+    fun shutdownWithoutOwnedSessionLeavesIsolationUntouched() = runBlocking {
+        val f = Fixture()
+        f.worker.isolateMicrophone()
+        assertTrue(f.worker.microphoneIsolated)
+
+        val result = f.supervisor.shutdown(deadlineMs = 100)
+
+        assertTrue(result.clean)
+        assertNull(result.ownedSession)
+        assertNull(result.termination)
+        assertFalse(result.ownershipResolved)
+        assertTrue("没有拥有的会话时必须保持既有隔离事实", result.microphoneIsolated)
+        assertTrue(f.worker.microphoneIsolated)
+        assertTrue("没有拥有的会话时不得下发任何命令", f.calls.commands.isEmpty())
+        assertEquals(0, f.isolation.restoreCalls)
+    }
+
+    /** Task 11D2a：系统读回已经未隔离时，恢复必须是 no-op（不重复 restore）。 */
+    @Test
+    fun shutdownIsANoOpWhenTheMicrophoneIsAlreadyUnmuted() = runBlocking {
+        val f = Fixture()
+        f.heartbeat()
+        assertEquals(CommandResult.Accepted, f.supervisor.prepareAnswer(session))
+        // 系统事实：麦克风已经未隔离（例如用户手动解除）。
+        f.isolation.isolated = false
+        f.callState = CallState.DISCONNECTED
+
+        val result = f.supervisor.shutdown(deadlineMs = 2_000)
+
+        assertTrue(result.clean)
+        assertFalse(result.microphoneIsolated)
+        assertEquals("已经未隔离时不得再次调用 restore", 0, f.isolation.restoreCalls)
+    }
+
+    /** Task 11D2a：恢复失败必须 BLOCKED + 明确机器码，不能报成功关闭。 */
+    @Test
+    fun shutdownRestoreFailureBlocksAndReportsExplicitCode() = runBlocking {
+        val f = Fixture()
+        f.heartbeat()
+        assertEquals(CommandResult.Accepted, f.supervisor.prepareAnswer(session))
+        f.isolation.failRestore = true
+        f.callState = CallState.DISCONNECTED
+
+        val result = f.supervisor.shutdown(deadlineMs = 2_000)
+
+        assertFalse(result.clean)
+        assertEquals(Supervisor.SHUTDOWN_RESTORE_FAILED, result.code)
+        assertTrue(result.microphoneIsolated)
+        assertEquals(1, f.isolation.restoreCalls)
+        val snapshot = f.supervisor.snapshot()
+        assertEquals(SupervisorPhase.BLOCKED, snapshot.phase)
+        assertEquals(Supervisor.SHUTDOWN_RESTORE_FAILED, snapshot.blockedReason)
     }
 
     @Test
@@ -464,10 +583,13 @@ private class FakeClock(var now: Long = 0L) : MonotonicClock {
     }
 }
 
-private class FakeIsolation : MicrophoneIsolation {
+private class FakeIsolation(
+    private val events: MutableList<String>? = null,
+) : MicrophoneIsolation {
     var isolated = false
     var isolateCalls = 0
     var restoreCalls = 0
+    var failRestore = false
 
     override suspend fun isolate(): Boolean {
         isolateCalls++
@@ -477,6 +599,8 @@ private class FakeIsolation : MicrophoneIsolation {
 
     override suspend fun restore(): Boolean {
         restoreCalls++
+        events?.add("restore")
+        if (failRestore) return false
         isolated = false
         return true
     }
@@ -513,13 +637,16 @@ private class FakeSession : AudioSession {
     }
 }
 
-private class FakeCallControl : CallControl {
+private class FakeCallControl(
+    private val events: MutableList<String>? = null,
+) : CallControl {
     val commands = mutableListOf<Pair<SessionId, CallCommand>>()
     var answerResult: CommandResult = CommandResult.Accepted
     var hangupResult: CommandResult = CommandResult.Accepted
 
     override suspend fun send(id: SessionId, command: CallCommand): CommandResult {
         commands += id to command
+        events?.add("command:" + command.toString())
         return when (command) {
             CallCommand.Answer -> answerResult
             CallCommand.Hangup -> hangupResult

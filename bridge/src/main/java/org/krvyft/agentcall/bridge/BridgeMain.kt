@@ -1,14 +1,18 @@
 package org.krvyft.agentcall.bridge
 
 import com.google.gson.JsonArray
+import com.google.gson.JsonNull
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import com.google.gson.JsonPrimitive
+import java.io.Closeable
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.krvyft.agentcall.bridge.audio.AndroidAudioPlatform
 import org.krvyft.agentcall.bridge.audio.AndroidBootId
 import org.krvyft.agentcall.bridge.audio.AudioPcmRelay
@@ -45,6 +49,7 @@ import org.krvyft.agentcall.bridge.supervision.HookCommandCallControl
 import org.krvyft.agentcall.bridge.supervision.HookSnapshotDecoder
 import org.krvyft.agentcall.bridge.supervision.ReflectiveTelecomTermination
 import org.krvyft.agentcall.bridge.supervision.SessionEventBus
+import org.krvyft.agentcall.bridge.supervision.ShutdownResult
 import org.krvyft.agentcall.bridge.supervision.SnapshotCallStateProbe
 import org.krvyft.agentcall.bridge.supervision.SupervisionGraph
 import org.krvyft.agentcall.bridge.supervision.SupervisionPlatform
@@ -54,6 +59,7 @@ import org.krvyft.agentcall.bridge.supervision.SupervisorProductionGraph
 import org.krvyft.agentcall.bridge.supervision.SupervisionRpcPort
 import org.krvyft.agentcall.bridge.supervision.SupervisorRpcPort
 import org.krvyft.agentcall.bridge.supervision.TakeoverOutcome
+import org.krvyft.agentcall.bridge.supervision.TerminationOutcome
 import org.krvyft.agentcall.bridge.supervision.TerminationPermission
 import org.krvyft.agentcall.bridge.supervision.UnverifiedCallIdentityVerifier
 import org.krvyft.agentcall.core.model.CalibrationEvidence
@@ -215,6 +221,14 @@ internal object BridgeRuntime {
             isDaemon = true
             start()
         }
+        // 控制面 shutdown 与进程退出共用同一次优雅关闭：先终止/交还通话、确认后再恢复麦克风。
+        val lifecycle = BridgeLifecycle(
+            supervisor = supervision.supervisor,
+            pcmRelay = pcmRelay,
+            controlServer = { server },
+            pollRunning = pollRunning,
+            pollThread = pollThread,
+        )
         val dispatcher = ControlDispatcher(
             store = store,
             packages = packages,
@@ -233,6 +247,8 @@ internal object BridgeRuntime {
             audioPcm = pcmRelay,
             sessionEvents = sessionEvents,
             calibration = calibration,
+            lifecycle = lifecycle,
+            shutdownCode = { lifecycle.shutdownCode },
         )
 
         // PCM 通道由 ControlServer 独立 bind（PCM lane）；音频工作角色负责真实 PCM
@@ -257,14 +273,9 @@ internal object BridgeRuntime {
         Runtime.getRuntime().addShutdownHook(
             Thread(
                 {
-                    pollRunning.set(false)
-                    pollThread.interrupt()
-                    runBlocking {
-                        supervision.supervisor.shutdown()
-                        supervision.supervisor.close()
-                    }
-                    pcmRelay.close()
-                    controlServer.close()
+                    // SIGTERM/模块停用：优雅关闭会先终止或交还拥有的通话，确认后才恢复麦克风。
+                    runBlocking { lifecycle.shutdown() }
+                    lifecycle.closeResources()
                 },
                 "agentcall-bridge-shutdown",
             ),
@@ -283,14 +294,9 @@ internal object BridgeRuntime {
         } catch (interrupted: InterruptedException) {
             Thread.currentThread().interrupt()
         } finally {
-            pollRunning.set(false)
-            pollThread.interrupt()
-            runBlocking {
-                supervision.supervisor.shutdown()
-                supervision.supervisor.close()
-            }
-            pcmRelay.close()
-            controlServer.close()
+            // 控制面 shutdown 已经跑过时直接复用结论；资源在这里关闭（响应已写回）。
+            runBlocking { lifecycle.shutdown() }
+            lifecycle.closeResources()
         }
         return 0
     }
@@ -341,6 +347,97 @@ internal object BridgeRuntime {
             },
             beforePoll = beforePoll,
         )
+    }
+}
+
+/** 优雅关闭端口：控制面 shutdown 与进程退出共用同一次关闭（幂等）。 */
+fun interface BridgeShutdownPort {
+    suspend fun shutdown(): ShutdownResult
+}
+
+/**
+ * 桥接进程的优雅关闭协调器（Task 11D2a，spec §8）。
+ *
+ * 顺序：停轮询 → [Supervisor.shutdown]（有界终止/交还 + 断开确认 + 允许时才恢复）→
+ * 关闭资源。优雅关闭与资源关闭分开：控制面 `shutdown` 必须先把机器可读结果写回客户端，
+ * 之后 main 的 finally 才关闭 ControlServer（它自带有限刷新宽限）。
+ *
+ * 崩溃/SIGKILL 不经过本类：隔离可能保留，只有优雅关闭路径会终止/交还并恢复麦克风。
+ */
+internal class BridgeLifecycle(
+    private val supervisor: Supervisor,
+    private val pcmRelay: Closeable,
+    private val controlServer: () -> Closeable?,
+    private val pollRunning: AtomicBoolean,
+    private val pollThread: Thread,
+    private val log: (String) -> Unit = { System.err.println(it) },
+) : BridgeShutdownPort {
+
+    private val mutex = Mutex()
+    private var graceful: ShutdownResult? = null
+    private val resourcesClosed = AtomicBoolean(false)
+
+    @Volatile
+    private var lastCode: String? = null
+
+    /** `status.shutdownCode`：最近一次优雅关闭的机器码；未关闭/干净关闭为 null。 */
+    val shutdownCode: String? get() = lastCode
+
+    override suspend fun shutdown(): ShutdownResult = mutex.withLock {
+        graceful ?: performGracefulShutdown()
+    }
+
+    private suspend fun performGracefulShutdown(): ShutdownResult {
+        pollRunning.set(false)
+        pollThread.interrupt()
+        val result = try {
+            supervisor.shutdown()
+        } catch (t: Throwable) {
+            // 关闭路径自身异常必须留下机器码；按“隔离可能仍在”失败关闭。
+            ShutdownResult(
+                ownedSession = null,
+                termination = null,
+                ownershipResolved = false,
+                disconnected = false,
+                microphoneIsolated = true,
+                code = SHUTDOWN_FAILED,
+            )
+        }
+        lastCode = result.code
+        log(
+            "{\"event\":\"bridge_shutdown\",\"clean\":" + result.clean +
+                ",\"owned\":" + (result.ownedSession != null) +
+                ",\"termination\":" + (result.termination?.name ?: "null") +
+                ",\"disconnected\":" + result.disconnected +
+                ",\"microphoneIsolated\":" + result.microphoneIsolated +
+                ",\"code\":" + (result.code?.let { JsonPrimitive(it).toString() } ?: "null") + "}",
+        )
+        return result
+    }
+
+    /** 关闭 PCM/socket/监督角色；在 shutdown 响应写回之后调用。重复调用安全。 */
+    fun closeResources() {
+        if (!resourcesClosed.compareAndSet(false, true)) return
+        try {
+            supervisor.close()
+        } catch (t: Throwable) {
+            log("{\"event\":\"bridge_shutdown_close_failed\",\"component\":\"supervisor\"}")
+        }
+        try {
+            pcmRelay.close()
+        } catch (t: Throwable) {
+            log("{\"event\":\"bridge_shutdown_close_failed\",\"component\":\"pcm\"}")
+        }
+        try {
+            controlServer()?.close()
+        } catch (t: Throwable) {
+            log("{\"event\":\"bridge_shutdown_close_failed\",\"component\":\"control\"}")
+        }
+    }
+
+    companion object {
+        /** 监督角色关闭抛异常：没有可信结论，按失败关闭上报。 */
+        const val SHUTDOWN_FAILED: String = "shutdown_failed"
     }
 }
 
@@ -468,6 +565,13 @@ internal class ControlDispatcher(
      * [ERROR_CALIBRATION_UNAVAILABLE]，绝不假装已验证。生产装配注入真实实例。
      */
     private val calibration: CalibrationStore? = null,
+    /**
+     * 优雅关闭端口（Task 11D2a）。默认 null = 未接线：`shutdown` 只回旧的
+     * `{"stopping":true}` 并触发进程退出，不伪造关闭结论（测试/旧装配）。
+     */
+    private val lifecycle: BridgeShutdownPort? = null,
+    /** `status.shutdownCode` 来源；未接线恒 null。 */
+    private val shutdownCode: () -> String? = { null },
 ) : RpcHandler {
 
     /**
@@ -488,10 +592,7 @@ internal class ControlDispatcher(
             RolePolicy.METHOD_CONFIG_WRITE -> configWrite(request)
             RolePolicy.METHOD_PAIR -> pair(request)
             RolePolicy.METHOD_DIAGNOSE -> ok(request, RpcCodec.encodeCapabilityReport(probe.inspect()))
-            RolePolicy.METHOD_SHUTDOWN -> {
-                shutdown.countDown()
-                ok(request, "{\"stopping\":true}")
-            }
+            RolePolicy.METHOD_SHUTDOWN -> shutdownResponse(request)
             RolePolicy.METHOD_SESSION_REQUEST -> sessionRequest(request)
             RolePolicy.METHOD_SESSION_HEARTBEAT -> sessionHeartbeat(request)
             RolePolicy.METHOD_SESSION_COMMAND -> sessionCommand(request)
@@ -515,6 +616,39 @@ internal class ControlDispatcher(
     } catch (t: Exception) {
         // 其它异常的文本可能含路径：只回类名。
         failure(request, "internal_error", t.javaClass.simpleName)
+    }
+
+    /**
+     * shutdown：先执行一次有界的优雅关闭（终止/交还拥有的通话、必要时恢复麦克风），
+     * 再把机器可读结果写进响应并触发进程退出（main 的 finally 负责关闭资源）。
+     * 未接线时保持旧的 ack 形状，绝不伪造“干净关闭”。
+     */
+    private fun shutdownResponse(request: RpcRequest): RpcResponse {
+        val result = lifecycle?.let { runBlocking { it.shutdown() } }
+        shutdown.countDown()
+        if (result == null) return ok(request, "{\"stopping\":true}")
+        val json = JsonObject()
+        json.addProperty("stopping", true)
+        json.addProperty("clean", result.clean)
+        json.addProperty("shutdownCode", result.code)
+        json.add("supervision", encodeShutdownResult(result))
+        return ok(request, json.toString())
+    }
+
+    /** 关闭裁决的固定机器可读形状（不含会话内容/路径）。 */
+    private fun encodeShutdownResult(result: ShutdownResult): JsonObject = JsonObject().apply {
+        addProperty("clean", result.clean)
+        addProperty("ownedSession", result.ownedSession != null)
+        val termination = result.termination
+        if (termination == null) {
+            add("termination", JsonNull.INSTANCE)
+        } else {
+            addProperty("termination", termination.name)
+        }
+        addProperty("ownershipResolved", result.ownershipResolved)
+        addProperty("disconnected", result.disconnected)
+        addProperty("microphoneIsolated", result.microphoneIsolated)
+        if (result.code == null) add("code", JsonNull.INSTANCE) else addProperty("code", result.code)
     }
 
     /**
@@ -1041,6 +1175,8 @@ internal class ControlDispatcher(
         json.addProperty("microphoneIsolated", state?.microphoneIsolated ?: false)
         json.addProperty("supervisionBlocked", state?.blockedReason)
         json.addProperty("supervisionLastFault", state?.lastFault)
+        // Task 11D2a：优雅关闭的机器码（null = 未发生/干净关闭）；关闭响应同样携带。
+        json.addProperty("shutdownCode", shutdownCode())
         // 阶段 B 概览实时字段：确定为 boolean，无法可靠确定时写字符串 "unknown"。
         addLiveStatus(json, "hookConnected", state?.hookConnected)
         addLiveStatus(json, "dialerDefaultRole", inspectDialerDefaultRole())

@@ -170,13 +170,15 @@ class SessionEventsRpcTest {
             "microphoneIsolated",
             "supervisionBlocked",
             "supervisionLastFault",
+            // Task 11D2a：优雅关闭的机器码（null = 未发生/干净关闭）。
+            "shutdownCode",
             "hookConnected",
             "dialerDefaultRole",
         )) {
             assertTrue("status 缺少字段 " + key, app.has(key))
         }
         assertEquals(1, app.get("protocolVersion").asInt)
-        assertEquals(16, app.keySet().size)
+        assertEquals(17, app.keySet().size)
     }
 
     /**
