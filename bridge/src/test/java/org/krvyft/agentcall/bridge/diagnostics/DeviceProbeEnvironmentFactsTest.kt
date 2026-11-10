@@ -1,6 +1,7 @@
 package org.krvyft.agentcall.bridge.diagnostics
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.krvyft.agentcall.bridge.ipc.PackageIdentitySource
@@ -156,5 +157,51 @@ class DeviceProbeEnvironmentFactsTest {
         )
 
         assertEquals("SIM Carrier", facts.simCarrier())
+    }
+
+    // ------------------------------------- Task 11I：直接类检查的真实返回类型
+
+    @Test
+    fun directClassCheckAcceptsTheIntReturnedByRealLsposedAndEdxposed() {
+        assertEquals(
+            "真实 LSPosed/EdXposed 的 getXposedVersion() 返回 int，必须归一化成有界字符串",
+            "82",
+            reflectiveXposedBridgeVersion(IntVersionXposedBridge::class.java.name),
+        )
+    }
+
+    @Test
+    fun directClassCheckStillAcceptsAStringVersion() {
+        assertEquals("82", reflectiveXposedBridgeVersion(StringVersionXposedBridge::class.java.name))
+    }
+
+    @Test
+    fun directClassCheckKeepsTheUnknownFallbackForUnsupportedReturnTypes() {
+        assertNull(reflectiveXposedBridgeVersion(UnsupportedVersionXposedBridge::class.java.name))
+        assertNull(reflectiveXposedBridgeVersion("de.robv.android.xposed.DoesNotExist"))
+    }
+}
+
+/** 测试替身：真实 LSPosed/EdXposed 的 XposedBridge.getXposedVersion() 返回 int。 */
+class IntVersionXposedBridge {
+    companion object {
+        @JvmStatic
+        fun getXposedVersion(): Int = 82
+    }
+}
+
+/** 测试替身：个别旧分支返回 String。 */
+class StringVersionXposedBridge {
+    companion object {
+        @JvmStatic
+        fun getXposedVersion(): String = "82"
+    }
+}
+
+/** 测试替身：不受支持的返回类型必须保持 UNKNOWN，而不是抛错。 */
+class UnsupportedVersionXposedBridge {
+    companion object {
+        @JvmStatic
+        fun getXposedVersion(): Boolean = true
     }
 }

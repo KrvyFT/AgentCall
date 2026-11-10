@@ -323,12 +323,14 @@ adb shell grep @org.krvyft.agentcall.control /proc/net/unix \
 
 步骤：
 
-1. 采集环境字段：SDK、ROM 指纹、内核、Google 电话版本、框架版本、桥接版本、音频策略摘要、SIM/承载/路由（见第 6 节）。`frameworkVersion`/`simCarrier` 优先由桥接按上表观测；只有观测为 UNKNOWN 的 `transport`/`route`/`frameworkVersion`/`simCarrier` 才由 root 操作员在 `agentcallctl calibrate` 的 `operatorAttestation` 中背书（`manualTestCompleted=true`，前两个用固定词表，后两个用 1..128 字符自由文本）；已观测到的已知值优先，背书不能覆盖。
+1. 采集环境字段：SDK、ROM 指纹、内核、Google 电话版本、框架版本、桥接版本、音频策略摘要、SIM/承载/路由（见第 6 节）。`frameworkVersion`/`simCarrier` 由桥接按上表观测；`transport`/`route` 没有任何观测路径、始终为 UNKNOWN，只能由 root 操作员在 `agentcallctl calibrate` 的 `operatorAttestation` 中背书（`manualTestCompleted=true`，前两个用固定词表）；`frameworkVersion`/`simCarrier` 观测不到时也用 1..128 字符自由文本背书；已观测到的已知值优先，背书不能覆盖。
 2. 依次完成五项：下行识别、对端听到测试语音、麦克风隔离、人工恢复、进程故障注入；每步记录证据。
 3. 检查 `calibration.read`（或 `status.calibration`/`diagnose.calibration`）：五项步骤均为
    true、`calibratedAtMs > 0`、`environmentComplete=true`、`environmentMatchesEvidence=true`、
    `verified=true`；同时确认 APP 侧就绪还要求桥接的 supported/verified/environmentComplete/
-   environmentMatchesEvidence 并叠加本机证据，且不缓存旧值。
+   environmentMatchesEvidence 并叠加本机证据，且不缓存旧值。`supportedApiLevel` 是策略常量
+   37（不是设备 API 等级）；设备 API 36 时 `verified=false` 且 blockers 含
+   `API_LEVEL_UNSUPPORTED`。
 4. 只改变一个字段（例如切 VoWiFi 或换蓝牙路由），确认 `environmentMatchesEvidence=false`、
    `verified=false`、自动接听关闭。
 5. 损坏文件或写入未来 schema，确认 fail closed：读操作报错/`verified=false`，不覆盖原文件。
@@ -352,10 +354,10 @@ adb shell grep @org.krvyft.agentcall.control /proc/net/unix \
 | bridgeVersion | `agentcallctl status`（当前 BridgeInfo.VERSION=1.0） | 未验证 |
 | audioPolicyDigest | `agentcallctl diagnose`（vendor/system audio policy SHA-256） | 未验证 |
 | simCarrier | TelephonyManager 的 SIM 运营商名 → `gsm.sim.operator.alpha` / `gsm.sim.operator.default-name` / `ro.cdma.home.operator.alpha`；仍 UNKNOWN 时可由 root 背书 | 未验证（只有宿主/JVM 证据） |
-| transport | 通话上下文观测承载（VoLTE/VoWiFi/CS）；无上下文为 UNKNOWN，可由 root 操作员按固定词表背书 | 未验证 |
-| route | 通话上下文/`dumpsys audio` 观测路由（手持/蓝牙/耳机）；无上下文为 UNKNOWN，可由 root 操作员按固定词表背书 | 未验证 |
+| transport | **没有观测路径**：桥接从不观测（始终 UNKNOWN），只能由 root 操作员在 calibrate 时按固定词表背书 | 不可作为观测验证（背书未验证） |
+| route | **没有观测路径**：桥接从不观测（始终 UNKNOWN），只能由 root 操作员在 calibrate 时按固定词表背书 | 不可作为观测验证（背书未验证） |
 
-注意：`CalibrationPolicy.isComplete()` 会拒绝 `UNKNOWN`。11H1 起（最终 HEAD）`frameworkVersion` 与 `simCarrier` 有真实观测源（见上表），不再默认 UNKNOWN；`transport`/`route` 在无通话上下文时仍为 UNKNOWN。只有观测为 UNKNOWN 的 `transport`/`route`/`frameworkVersion`/`simCarrier` 才由 root 操作员在 `agentcallctl calibrate` 的 `operatorAttestation` 中背书：`transport` ∈ CELLULAR/VOWIFI/UNKNOWN，`route` ∈ EARPIECE/SPEAKER/HEADSET/BLUETOOTH/UNKNOWN，`frameworkVersion`/`simCarrier` 为 1..128 字符、前后无空白（已 trim）、无控制字符且 ≠ UNKNOWN；`manualTestCompleted=true` 必填。桥接已观测到的已知值永远优先，背书不能覆盖；`UNKNOWN` 不能解锁完整环境。其余环境字段与时间戳仍由服务端采集/写入，APP/HOOK 不能背书。没有完整且一致的环境时自动接听保持关闭；这是 fail closed 的预期行为。观测/背书都只有宿主/JVM 证据，尚未在真机确认。
+注意：`CalibrationPolicy.isComplete()` 会拒绝 `UNKNOWN`。11H1 起（最终 HEAD）`frameworkVersion` 与 `simCarrier` 有真实观测源（见上表），不再默认 UNKNOWN；`transport`/`route` 没有任何观测路径、始终为 UNKNOWN（不是“无通话上下文时”才未知）。`transport`/`route` 只能由 root 操作员在 `agentcallctl calibrate` 的 `operatorAttestation` 中背书：`transport` ∈ CELLULAR/VOWIFI/UNKNOWN，`route` ∈ EARPIECE/SPEAKER/HEADSET/BLUETOOTH/UNKNOWN；`frameworkVersion`/`simCarrier` 观测不到时也可背书，为 1..128 字符、前后无空白（带空白即整体拒绝，不 trim）、无控制字符且 ≠ UNKNOWN；`manualTestCompleted=true` 必填。桥接已观测到的已知值永远优先，背书不能覆盖；`UNKNOWN` 不能解锁完整环境。其余环境字段与时间戳仍由服务端采集/写入，APP/HOOK 不能背书。没有完整且一致的环境时自动接听保持关闭；这是 fail closed 的预期行为。观测/背书都只有宿主/JVM 证据，尚未在真机确认。
 
 五项人工测试（全部完成才允许 `calibratedAtMs` 非零并可能解锁）：
 
@@ -391,16 +393,18 @@ BUILD SUCCESSFUL
 - 自动接听仍被两道 fail-closed 闸门关闭：**校准记录** + `UnverifiedCallIdentityVerifier`
   不可用（`blocksAutoAnswer=true`）。因此真机上监督端当前不会拥有任何 AI 通话；D06/D09 需要
   先完成 D10 的身份核验与 D12 校准。校准写入通道已经存在：root CLI `calibrate` →
-  `calibration.record`（仅 CLI_ROOT）；环境可由桥接真实观测（frameworkVersion/simCarrier 有
-  真实观测源），只有观测为 UNKNOWN 的 transport/route/frameworkVersion/simCarrier 才采用
-  root 背书。**但这两道闸门是产品阻塞项，不是单纯的设备缺口**：即使校准记录齐全，没有设备
+  `calibration.record`（仅 CLI_ROOT）；环境只有 frameworkVersion/simCarrier 由桥接真实观测，
+  transport/route 没有任何观测路径、始终 UNKNOWN，只能由 root 背书（frameworkVersion/
+  simCarrier 观测不到时同样背书）。**但这两道闸门是产品阻塞项，不是单纯的设备缺口**：即使校准记录齐全，没有设备
   验证过的、按身份定位的特权 Telecom 终止路径，自动接听也不会开启。五项人工测试与背书都
   尚未在真机执行，D12 仍未验证，见 `docs/verification.md` 5.3。
 - **APK 只有 debug 签名**（`CN=Android Debug`），不可分发；必须用发布密钥重签并重生成
   `SHA256SUMS`。这也是交付阻塞项，不是验证项。
 - APP 就绪从桥接 `calibration.read` 派生：`available && supportedApiLevel==37 && verified &&
   environmentComplete && environmentMatchesEvidence`，再叠加本机 `CalibrationPolicy`；
-  读取失败/未知一律 `calibration_unavailable` 且为 false，绝不缓存上一轮的 true。
+  `supportedApiLevel` 是策略常量 `CalibrationPolicy.SUPPORTED_API_LEVEL`（37），不是设备
+  API 等级，API 36 因 `API_LEVEL_UNSUPPORTED` 保持阻断；读取失败/未知一律
+  `calibration_unavailable` 且为 false，绝不缓存上一轮的 true。
 - 监督端持久状态 `supervisor-state.json`（schema 3，含 boot_id/shutdownCode）、同一开机
   重启策略（有旧所有权时保持隔离并 BLOCKED）、重启预算与隔离读回均只有 JVM/宿主脚本证据；
   崩溃/重启时序、桥接退出后持久裁决的读回与 `SystemClock.elapsedRealtime` 行为未在真机验证。

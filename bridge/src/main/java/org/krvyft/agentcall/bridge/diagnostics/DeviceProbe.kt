@@ -12,9 +12,10 @@ import org.krvyft.agentcall.core.model.EnvironmentKey
 /**
  * 只读平台事实，便于在没有设备时隔离 Android API 与诊断逻辑。
  *
- * SIM/承载/路由三项默认是显式 [UNKNOWN]：平台只有在确实能读到事实时才返回字符串，
- * 绝不按“通常值”猜测。B2 允许真机通过 TelephonyManager 提供 SIM 运营商；通话承载与
- * 路由必须来自通话上下文，拿不到就保持 UNKNOWN（CalibrationPolicy 会因此 fail closed）。
+ * SIM 运营商默认是显式 [UNKNOWN]：平台只有在确实能读到事实时才返回字符串，绝不按
+ * “通常值”猜测。B2 允许真机通过 TelephonyManager 提供 SIM 运营商。承载/路由没有任何
+ * 观测路径（本接口的默认实现即 UNKNOWN，生产实现也不覆盖），因此始终为 UNKNOWN，
+ * 只能在 calibrate 时由 root 操作员背书；CalibrationPolicy 会因此 fail closed。
  */
 interface PlatformFacts {
     fun apiLevel(): Int
@@ -193,6 +194,9 @@ class AndroidPlatformFacts(
 /** 观测事实的长度上限：足够容纳版本/运营商名，又不会把任意 blob 写进证据。 */
 private const val MAX_OBSERVED_FACT_CHARS: Int = 128
 
+/** LSPosed/EdXposed/Vector 的 XposedBridge 类名；测试用替身类名覆盖反射路径。 */
+private const val XPOSED_BRIDGE_CLASS: String = "de.robv.android.xposed.XposedBridge"
+
 /**
  * 观测事实的有界校验（Task 11H1）：trim 后必须非空、≤ [MAX_OBSERVED_FACT_CHARS]、
  * 不含控制字符、且不是显式 UNKNOWN。任何不合格的值都返回 null（保持未知），
@@ -207,13 +211,25 @@ private fun boundedObservedFact(value: String?): String? {
 }
 
 /** 直接类检查（只是一个信号；bridge app_process 通常不加载 Xposed）。 */
-private fun reflectiveXposedBridgeVersion(): String? = try {
-    val xposedBridge = Class.forName("de.robv.android.xposed.XposedBridge")
+internal fun reflectiveXposedBridgeVersion(
+    className: String = XPOSED_BRIDGE_CLASS,
+): String? = try {
+    val xposedBridge = Class.forName(className)
     val method = xposedBridge.getMethod("getXposedVersion")
     method.isAccessible = true
-    method.invoke(null) as? String
+    boundedObservedFact(xposedVersionFact(method.invoke(null)))
 } catch (t: Throwable) {
     null
+}
+
+/**
+ * LSPosed/EdXposed 的 `getXposedVersion()` 返回 int，个别旧分支返回 String；统一成
+ * 十进制字符串再交给 [boundedObservedFact] 做有界校验。其他返回类型视为未知。
+ */
+private fun xposedVersionFact(value: Any?): String? = when (value) {
+    is String -> value
+    is Number -> value.toLong().toString()
+    else -> null
 }
 
 /** TelephonyManager 的 SIM 运营商名；系统服务不可达时返回 null（由属性来源兜底）。 */
@@ -263,7 +279,8 @@ class ReflectiveAudioApiProbe : AudioApiProbe {
  * - 音频（下行识别、上行注入、麦克风隔离）与权限未经真机测试，状态一律停在
  *   NOT_DETECTED，notes 标记 UNTESTED——本类没有任何路径会写 VERIFIED。
  * - SELinux 可达性、特权终止未在本任务验证，notes 标记 UNVERIFIED。
- * - SIM/承载/路由需要通话上下文，未取得时写 UNKNOWN，不猜默认值。
+ * - SIM 运营商由 TelephonyManager/telephony 属性观测；承载/路由没有观测路径，始终写
+ *   UNKNOWN，只能由 root 操作员背书，不猜默认值。
  */
 class DeviceProbe(
     private val packages: PackageIdentitySource,

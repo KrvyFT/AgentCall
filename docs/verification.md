@@ -177,16 +177,23 @@ flock /tmp/agentcall-gradle.lock ./gradlew \
   （`ro.lsposed.version`/`persist.sys.lsposed.version`/`ro.vector.version`/
   `persist.sys.vector.version`/`ro.edxposed.version`/`persist.sys.edxposed.version`），再读
   `/data/adb/modules/{lsposed,zygisk_lsposed,vector}/module.prop` 的 `version=`，最后做
-  XposedBridge 类检查；`simCarrier` 读 TelephonyManager SIM 运营商名，失败后回退
+  XposedBridge 类检查（`getXposedVersion()` 的 int/String 返回值）；`simCarrier` 读
+  TelephonyManager SIM 运营商名，失败后回退
   `gsm.sim.operator.alpha`/`gsm.sim.operator.default-name`/`ro.cdma.home.operator.alpha`。
 - 关闭语义：5 s 期限只约束 `awaitConfirmedDisconnect`（终止命令先下发，其等待另有预算），
   恢复只有单一 6 s 预算，CLI 仅 `shutdown` 放宽到 20 s；`clean=true` 只在隔离确认解除时成立。
   `service.sh` 在桥接退出后读 `supervisor-state.json`（schema ≥ 3）：`shutdownCode` 非 null
   或 `microphoneIsolated=true` 时打印 `! microphone_still_isolated`/`! shutdown_unresolved`
-  与 `bridge_stop_unclean`，绝不打印 `bridge_exit_clean`，非零退出并拒绝重启。
+  与 `bridge_stop_unclean`，绝不打印 `bridge_exit_clean`。非零退出只属于桥接退出容器路径
+  （`bridge_container_supervisor` 的返回值成为 `service.sh` 退出码）；信号触发的 `on_stop`
+  只记录同样的警告并 `exit 0`。持久裁决缺失/损坏/schema<3 时 `bridge_exit_clean_verdict`
+  回退到退出码证据；`agentcallctl restart` 更严格，关闭响应裁决缺失即拒绝并报
+  `verdict_missing`。
 - APP 就绪从 `calibration.read` 派生：`available && supportedApiLevel==37 && verified &&
-  environmentComplete && environmentMatchesEvidence` + 本机 `CalibrationPolicy`；读取失败/
-  未知一律 `calibration_unavailable` 并返回 false，绝不缓存上一轮的 true。
+  environmentComplete && environmentMatchesEvidence` + 本机 `CalibrationPolicy`；其中
+  `supportedApiLevel` 是策略常量 `CalibrationPolicy.SUPPORTED_API_LEVEL`，不是设备 API
+  等级（API 36 的 `environment.apiLevel` 不匹配 → `API_LEVEL_UNSUPPORTED`、`verified=false`）；
+  读取失败/未知一律 `calibration_unavailable` 并返回 false，绝不缓存上一轮的 true。
 
 ### 5.2 设备未验证（没有任何一行在真机上执行）
 
@@ -205,11 +212,12 @@ flock /tmp/agentcall-gradle.lock ./gradlew \
 
 ### 5.3 阻塞项（保持失败关闭，不伪造）
 
-1. **自动接听仍是产品阻塞项（两道闸门，缺一不可）**：校准写入通道与真实观测源都已实现，
-   环境现在能由桥接观测：`frameworkVersion` 读 root SystemProperties 与模块 `module.prop` 的
-   `version=`，`simCarrier` 读 TelephonyManager SIM 运营商名与 telephony 属性；只有观测为
-   UNKNOWN 的 `transport`/`route`/`frameworkVersion`/`simCarrier` 才由 root 操作员用固定
-   词表/有界自由文本背书（`manualTestCompleted=true`），观测到的已知值永远优先。
+1. **自动接听仍是产品阻塞项（两道闸门，缺一不可）**：校准写入通道与两项真实观测源都已实现，
+   环境只有 `frameworkVersion`（root SystemProperties 与模块 `module.prop` 的 `version=`）和
+   `simCarrier`（TelephonyManager SIM 运营商名与 telephony 属性）由桥接观测；
+   `transport`/`route` 没有任何观测路径、始终为 UNKNOWN，只能由 root 操作员在 `calibrate`
+   时用固定词表背书（`frameworkVersion`/`simCarrier` 观测不到时也用有界自由文本背书，
+   `manualTestCompleted=true`），观测到的已知值永远优先。
    **但即使校准记录齐全，默认 `UnverifiedCallIdentityVerifier` 仍无法按通话身份核验，保持
    `blocksAutoAnswer=true`；不存在设备验证过的、按身份定位的特权 Telecom 终止路径。**
    因此生产就绪**有意保持 NOT_READY（`calibration_not_verified`）**，必须继续 fail closed。

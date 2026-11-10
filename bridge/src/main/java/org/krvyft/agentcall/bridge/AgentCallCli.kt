@@ -267,9 +267,10 @@ class LocalSocketCliTransport(
 
     companion object {
         /**
-         * 优雅关闭专用读超时（Task 11E / I1）：监督端 5 s 终止 + 6 s 恢复 + 最多一次
-         * 不可中断的 5 s 角色通道往返（16 s）+ 余量。其他方法仍用
-         * [ControlServer.READ_TIMEOUT_MS]（10 s）。
+         * 优雅关闭专用 socket 读超时（Task 11E / I1）：20 s 覆盖 5 s 期限（只约束终止命令
+         * 下发后等待 `awaitConfirmedDisconnect` 的时间，不是“终止 + 确认”的总时长）、
+         * 6 s 恢复预算与最多一次不可中断的 5 s 角色通道往返（16 s）再加余量。其他方法
+         * 仍用 [ControlServer.READ_TIMEOUT_MS]（10 s）。
          */
         const val SHUTDOWN_TIMEOUT_MS: Int = 20_000
 

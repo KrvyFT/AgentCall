@@ -8,11 +8,11 @@ Xposed Hook 观察来电与通话状态，AgentCall APK 完成远程 ASR / LLM /
 > core 126 / bridge 354 / app 359（合计 **839**，0 failures / 0 errors / 0 skipped），
 > lint 0 errors / 15 warnings；release APK 与模块 ZIP 已在该 HEAD 上重新打包（大小与
 > SHA-256 见下）。但**没有真机证据**：交付时 `adb devices` 为空，设备侧一行都没跑；
-> 配对（WebUI/root CLI）、root CLI `calibrate` 与 APK 校准/诊断界面已实现。校准环境可由
-> 桥接真实观测（`frameworkVersion` 读 root SystemProperties 与模块 `module.prop` 的
-> `version=`，`simCarrier` 读 TelephonyManager 的 SIM 运营商名与 telephony 属性），只有
-> 观测为 UNKNOWN 的 `transport`/`route`/`frameworkVersion`/`simCarrier` 才由 root 操作员
-> 背书。**但仍有产品阻塞项（不是单纯的设备缺口）**：自动接听需要校准记录**且**需要设备
+> 配对（WebUI/root CLI）、root CLI `calibrate` 与 APK 校准/诊断界面已实现。校准环境有两项
+> 可由桥接真实观测（`frameworkVersion` 读 root SystemProperties 与模块 `module.prop` 的
+> `version=`，`simCarrier` 读 TelephonyManager 的 SIM 运营商名与 telephony 属性）；
+> `transport`/`route` 没有任何观测路径，始终为 UNKNOWN，只能在 `calibrate` 时由 root
+> 操作员背书（`frameworkVersion`/`simCarrier` 观测不到时同样由 root 背书）。**但仍有产品阻塞项（不是单纯的设备缺口）**：自动接听需要校准记录**且**需要设备
 > 验证过的、按通话身份定位的特权 Telecom 终止路径（`UnverifiedCallIdentityVerifier`
 > 保持 `blocksAutoAnswer=true`）；APK 只有 debug 签名、不可分发。生产就绪仍为
 > `NOT_READY`（`calibration_not_verified`），设备验收（spec §12）全部待做，见「状态与边界」与
@@ -144,9 +144,13 @@ manifest，打包与 `check_package.py` 都拿容器与 manifest 比对（名称
   CLI 25 s、桥接退出 10 s、最终探测 5 s）。桥接退出后 `service.sh` 读回
   `DATA_ROOT/supervisor-state.json`（schema ≥ 3）：`shutdownCode` 非 null 或
   `microphoneIsolated=true` 时打印 `! microphone_still_isolated ...` /
-  `! shutdown_unresolved ...` 与 `bridge_stop_unclean`，**绝不打印 `bridge_exit_clean`**，
-  以非零退出并拒绝重启。`agentcallctl restart` 也只在关闭裁决为 `clean=true` +
-  `shutdownCode=null` + `microphoneIsolated=false` 时继续，否则返回 `restart_refused`。
+  `! shutdown_unresolved ...` 与 `bridge_stop_unclean`，**绝不打印 `bridge_exit_clean`**。
+  这里的非零退出只属于桥接退出容器路径（`bridge_container_supervisor` 的返回值成为
+  `service.sh` 退出码）；信号触发的 `on_stop` 只记录同样的警告并 `exit 0`。持久裁决
+  缺失/损坏/schema<3 时回退到退出码证据（`bridge_exit_clean_verdict`）；`agentcallctl
+  restart` 更严格，必须读到关闭响应裁决，缺失即 `restart_refused`（`verdict_missing`）。
+  `agentcallctl restart` 也只在关闭裁决为 `clean=true` + `shutdownCode=null` +
+  `microphoneIsolated=false` 时继续，否则返回 `restart_refused`。
 
 ## 状态与边界
 
@@ -162,7 +166,7 @@ manifest，打包与 `check_package.py` 都拿容器与 manifest 比对（名称
 | 音频 downlink/uplink、麦克风隔离、真实 Google 电话 | **未验证**（无设备证据，不宣称可用） |
 | 人工接管、故障终止、锁屏/重启握手 | **未验证** |
 | KernelSU 真机安装、WebView WebUI、`ksu.io` 路径 | **未验证**（无真机） |
-| 配对（WebUI/root CLI）与 APK 校准/诊断界面 | 已实现；root CLI `calibrate` 经 `calibration.record` 写入五项人工证据。环境由桥接观测（frameworkVersion/simCarrier 有真实观测源），只有观测为 UNKNOWN 的 transport/route/frameworkVersion/simCarrier 才采用 root 背书。APP 就绪要求 `calibration.read` 的 available && supportedApiLevel==37 && verified && environmentComplete && environmentMatchesEvidence，再叠加本机 `CalibrationPolicy`；读取失败/未知一律 false（`calibration_unavailable`），不缓存旧 true。真机证据仍缺失，自动接听保持关闭（`calibration_not_verified`） |
+| 配对（WebUI/root CLI）与 APK 校准/诊断界面 | 已实现；root CLI `calibrate` 经 `calibration.record` 写入五项人工证据。环境只有 frameworkVersion/simCarrier 有真实观测源；transport/route 没有任何观测路径、始终为 UNKNOWN，只能由 root 操作员在 calibrate 时背书（frameworkVersion/simCarrier 观测不到时同样背书）。APP 就绪要求 `calibration.read` 的 available && supportedApiLevel==37 && verified && environmentComplete && environmentMatchesEvidence，再叠加本机 `CalibrationPolicy`；`supportedApiLevel` 是策略常量 `CalibrationPolicy.SUPPORTED_API_LEVEL`（37），不是设备 API 等级——API 36 会因 `verified=false` 且 blockers 含 `API_LEVEL_UNSUPPORTED` 保持阻断。读取失败/未知一律 false（`calibration_unavailable`），不缓存旧 true。真机证据仍缺失，自动接听保持关闭（`calibration_not_verified`） |
 | 双卡、VoWiFi、蓝牙 | **未验证**，未测组合不启用 |
 | **产品阻塞项**：按通话身份定位的特权 Telecom 终止 | **不存在**：`UnverifiedCallIdentityVerifier` 保持 `blocksAutoAnswer=true`；即使校准记录齐全，自动接听也不会开启 |
 | **产品阻塞项**：APK 签名 | 仅 debug 签名（`CN=Android Debug`），不可分发；必须用发布密钥重签并重生成 `SHA256SUMS` |
