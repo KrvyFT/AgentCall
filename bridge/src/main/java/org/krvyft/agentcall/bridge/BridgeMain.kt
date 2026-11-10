@@ -5,6 +5,12 @@ import com.google.gson.JsonParser
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.runBlocking
+import org.krvyft.agentcall.bridge.audio.AndroidAudioPlatform
+import org.krvyft.agentcall.bridge.audio.LocalSocketAudioRoleTransport
+import org.krvyft.agentcall.bridge.audio.RemoteSupervisedAudio
+import org.krvyft.agentcall.bridge.config.CalibrationStore
 import org.krvyft.agentcall.bridge.config.ConfigErrorCode
 import org.krvyft.agentcall.bridge.config.ConfigStore
 import org.krvyft.agentcall.bridge.config.ConfigStoreException
@@ -18,8 +24,29 @@ import org.krvyft.agentcall.bridge.ipc.PackageIdentitySource
 import org.krvyft.agentcall.bridge.ipc.PeerVerifier
 import org.krvyft.agentcall.bridge.ipc.RootFramework
 import org.krvyft.agentcall.bridge.ipc.RpcHandler
+import org.krvyft.agentcall.bridge.supervision.AutoAnswerAuthorization
+import org.krvyft.agentcall.bridge.supervision.EmergencyCallControl
+import org.krvyft.agentcall.bridge.supervision.HookCallInbox
+import org.krvyft.agentcall.bridge.supervision.HookCommandCallControl
+import org.krvyft.agentcall.bridge.supervision.HookCommandResultDecoder
+import org.krvyft.agentcall.bridge.supervision.HookSnapshotDecoder
+import org.krvyft.agentcall.bridge.supervision.ReflectiveTelecomTermination
+import org.krvyft.agentcall.bridge.supervision.SnapshotCallStateProbe
+import org.krvyft.agentcall.bridge.supervision.SupervisionGraph
+import org.krvyft.agentcall.bridge.supervision.SupervisionPlatform
+import org.krvyft.agentcall.bridge.supervision.SupervisionStateStore
+import org.krvyft.agentcall.bridge.supervision.Supervisor
+import org.krvyft.agentcall.bridge.supervision.SupervisorProductionGraph
+import org.krvyft.agentcall.bridge.supervision.SupervisionRpcPort
+import org.krvyft.agentcall.bridge.supervision.SupervisorRpcPort
+import org.krvyft.agentcall.bridge.supervision.TakeoverOutcome
+import org.krvyft.agentcall.bridge.supervision.TerminationPermission
+import org.krvyft.agentcall.bridge.supervision.UnverifiedCallIdentityVerifier
 import org.krvyft.agentcall.core.model.CallCommand
+import org.krvyft.agentcall.core.model.CallState
+import org.krvyft.agentcall.core.model.CommandResult
 import org.krvyft.agentcall.core.model.EndpointKind
+import org.krvyft.agentcall.core.model.EnvironmentKey
 import org.krvyft.agentcall.core.model.PROTOCOL_VERSION
 import org.krvyft.agentcall.core.model.PeerIdentity
 import org.krvyft.agentcall.core.model.RpcError
@@ -28,6 +55,7 @@ import org.krvyft.agentcall.core.model.RpcResponse
 import org.krvyft.agentcall.core.model.SessionId
 import org.krvyft.agentcall.core.protocol.RolePolicy
 import org.krvyft.agentcall.core.protocol.RpcCodec
+import org.krvyft.agentcall.core.port.MonotonicClock
 
 /**
  * 特权运行容器版本。容器由 app_process 加载，没有 AndroidManifest 版本可用；
@@ -40,8 +68,8 @@ internal object BridgeInfo {
 /**
  * 特权运行容器的进程入口（app_process 按类名加载）。
  *
- * 只做四件事：解析配置目录、取系统 PackageManager、启动 [ControlServer]、等待 shutdown。
- * 任何不可用条件都以机器可读错误码退出，绝不降级为“信任所有对端”。
+ * 只做四件事：解析配置目录、取系统 PackageManager、启动 [ControlServer] 与监督角色、
+ * 等待 shutdown。任何不可用条件都以机器可读错误码退出，绝不降级为“信任所有对端”。
  */
 object BridgeMain {
 
@@ -62,6 +90,10 @@ object BridgeMain {
 /**
  * 运行期装配。与 [BridgeMain] 分开，便于把可测试的配置/诊断/协议层和
  * 只能在真机/app_process 里成立的 Android 装配区分开。
+ *
+ * 本容器同时承载**监督角色**（spec §6.3：监督进程与音频工作进程分离）：监督状态机、
+ * 启动恢复与周期轮询都在这里构造并运行；音频工作角色由 AudioWorkerMain 以独立
+ * app_process 运行，两者只通过 root 私有的角色通道交互。
  */
 internal object BridgeRuntime {
 
@@ -90,6 +122,12 @@ internal object BridgeRuntime {
             System.err.println(machineErrorJson(error.code, error.message ?: error.code))
             return 1
         }
+        val calibration = try {
+            CalibrationStore(root)
+        } catch (error: org.krvyft.agentcall.bridge.config.CalibrationStoreException) {
+            System.err.println(machineErrorJson(error.code, error.message ?: error.code))
+            return 1
+        }
 
         val verifier = PeerVerifier(packages) { runCatching { store.readPairing() }.getOrNull() }
         val probe = DeviceProbe(
@@ -98,37 +136,75 @@ internal object BridgeRuntime {
             audioApiProbe = ReflectiveAudioApiProbe(),
             bridgeVersion = BridgeInfo.VERSION,
         )
+        // 环境在进程生命周期内固定（ROM/框架/桥接不变），只采集一次用于校准授权。
+        val environment = probe.inspect().environment
+
+        // 监督角色：生产图由唯一装配点构造（C1）；训练/测试不得另写一套逻辑。
+        val hookCommands = HookCommandRouter()
+        val inbox = HookCallInbox()
+        val supervision = buildSupervision(root, hookCommands, inbox, calibration, environment)
+        val bootOutcome = runBlocking { supervision.recovery.recover() }
+        supervision.supervisor.start()
+        val pollRunning = AtomicBoolean(true)
+        val pollThread = Thread(
+            { runBlocking { supervision.loop.run { !pollRunning.get() } } },
+            "agentcall-supervision-poll",
+        ).apply {
+            isDaemon = true
+            start()
+        }
+
         val shutdown = CountDownLatch(1)
         var server: ControlServer? = null
+        val supervisionRpc = SupervisorRpcPort(supervision.supervisor, inbox)
         val dispatcher = ControlDispatcher(
             store = store,
             packages = packages,
             probe = probe,
             shutdown = shutdown,
+            supervision = supervisionRpc,
+            hookCommands = hookCommands,
             connectionStats = {
                 val current = server
                 if (current == null) 0 to 0L else current.activeConnectionCount to current.rejectedConnectionCount
             },
         )
 
-        // PCM 通道由 ControlServer 独立 bind；本任务没有音频生产者，因此不注入 sink，
-        // 也就不会对外宣称一个只会丢帧的音频通道（任务 5 负责接入）。
+        // PCM 通道由 ControlServer 独立 bind；音频工作角色负责真实 PCM 生产/消费
+        // （AudioWorkerMain）。在 APP 音频代理接入前，本容器不注入 sink，也不对外宣称
+        // 一个只会丢帧的音频通道。
         val controlServer = ControlServer(verifier = verifier, handler = dispatcher)
         server = controlServer
         try {
             controlServer.start()
         } catch (io: IOException) {
             System.err.println(machineErrorJson("socket_bind_failed", io.javaClass.simpleName))
+            pollRunning.set(false)
+            pollThread.interrupt()
             return 1
         }
 
         Runtime.getRuntime().addShutdownHook(
-            Thread({ controlServer.close() }, "agentcall-bridge-shutdown"),
+            Thread(
+                {
+                    pollRunning.set(false)
+                    pollThread.interrupt()
+                    runBlocking {
+                        supervision.supervisor.shutdown()
+                        supervision.supervisor.close()
+                    }
+                    controlServer.close()
+                },
+                "agentcall-bridge-shutdown",
+            ),
         )
         val ready = JsonObject()
         ready.addProperty("state", "ready")
         ready.addProperty("socket", ControlServer.DEFAULT_CONTROL_SOCKET)
         ready.addProperty("version", BridgeInfo.VERSION)
+        ready.addProperty("supervisionBoot", bootOutcome.name)
+        ready.addProperty("supervisionPhase", supervision.supervisor.snapshot().phase.name)
+        ready.addProperty("supervisionBlocked", supervision.supervisor.snapshot().blockedReason)
         System.out.println(ready.toString())
 
         try {
@@ -136,9 +212,57 @@ internal object BridgeRuntime {
         } catch (interrupted: InterruptedException) {
             Thread.currentThread().interrupt()
         } finally {
+            pollRunning.set(false)
+            pollThread.interrupt()
+            runBlocking {
+                supervision.supervisor.shutdown()
+                supervision.supervisor.close()
+            }
             controlServer.close()
         }
         return 0
+    }
+
+    /**
+     * 监督角色的 Android 生产装配。
+     *
+     * 安全取舍（spec §8）：
+     * - 特权 Telecom 身份核验默认 [UnverifiedCallIdentityVerifier] 不可用，因此
+     *   [EmergencyCallControl.blocksAutoAnswer] 为 true，自动接听保持关闭，直到真机
+     *   验证了按身份终止的路径；
+     * - 校准授权来自 [CalibrationStore]，五项人工测试 + 环境绑定缺一不可；
+     * - 音频端口是独立音频工作进程的代理，监督进程不持有任何麦克风/音频句柄。
+     */
+    internal fun buildSupervision(
+        root: File,
+        hookCommands: HookCommandRouter,
+        inbox: HookCallInbox,
+        calibration: CalibrationStore,
+        environment: EnvironmentKey,
+    ): SupervisionGraph {
+        val clock: MonotonicClock = AndroidAudioPlatform.clock()
+        val stateStore = SupervisionStateStore(root)
+        val audio = RemoteSupervisedAudio(LocalSocketAudioRoleTransport(), clock)
+        val calls = HookCommandCallControl(
+            enqueue = { id, command -> hookCommands.enqueueCommand(id, command) },
+            inbox = inbox,
+        )
+        val emergency = EmergencyCallControl(
+            permissions = TerminationPermission { android.os.Process.myUid() == 0 },
+            identities = UnverifiedCallIdentityVerifier,
+            termination = ReflectiveTelecomTermination(),
+        )
+        val authorization = AutoAnswerAuthorization { calibration.isVerified(environment) }
+        return SupervisorProductionGraph.build(
+            object : SupervisionPlatform {
+                override fun clock(): MonotonicClock = clock
+                override fun supervisedAudio() = audio
+                override fun calls() = calls
+                override fun emergency() = emergency
+                override fun authorization() = authorization
+                override fun stateStore() = stateStore
+            },
+        )
     }
 }
 
@@ -180,19 +304,26 @@ internal fun resolveConfigRoot(args: Array<String>): File {
  *
  * 密钥只经 config.secret.read（仅 APP）返回；其余方法一律返回脱敏配置。
  * 任何错误消息都不拼接请求负载或密钥。
+ *
+ * 监督接入（C1）：
+ * - 任何已鉴权的 APP/HOOK 请求都按其 sessionId 记心跳（按会话归属，I1）；
+ * - session.request → 监督端准备接听；handover → 人工交还；
+ * - hook.snapshot → 更新真实通话状态并推动 ACTIVE/断开/交还；
+ * - call.command.result → 同时喂给监督端的命令结果收件箱。
  */
 internal class ControlDispatcher(
     private val store: ConfigStore,
     private val packages: PackageIdentitySource,
     private val probe: DeviceProbe,
     private val shutdown: CountDownLatch,
+    private val supervision: SupervisionRpcPort = SupervisionRpcPort(),
     private val startedAtMs: Long = System.currentTimeMillis(),
     private val connectionStats: () -> Pair<Int, Long> = { 0 to 0L },
     private val hookCommands: HookCommandRouter = HookCommandRouter(),
 ) : RpcHandler {
 
     /**
-     * 为某个 HOOK 会话排入一条受限通话命令；随该会话下一次 `hook.snapshot`/`hook.heartbeat`
+     * 为某个 HOOK 会话排入一条受限通话命令；随该会话下一次 hook.snapshot/hook.heartbeat
      * 的响应负载下发。Task 7 的 CallControl.send 经此进入 Hook，不在 bridge 内直接操作 Telecom。
      * @return false 表示会话字段非法或队列饱和（有界失败）
      */
@@ -204,6 +335,8 @@ internal class ControlDispatcher(
         hookCommands.takeResults()
 
     override fun handle(peer: PeerIdentity, request: RpcRequest): RpcResponse = try {
+        // 任何已鉴权请求都证明该角色此刻活着；存活按会话归属记录（I1）。
+        request.sessionId?.let { supervision.heartbeat(it, peer.role) }
         when (request.method) {
             RolePolicy.METHOD_STATUS -> ok(request, statusPayload())
             RolePolicy.METHOD_CONFIG_READ -> ok(request, RpcCodec.encodeRedacted(store.read()))
@@ -215,14 +348,14 @@ internal class ControlDispatcher(
                 shutdown.countDown()
                 ok(request, "{\"stopping\":true}")
             }
+            RolePolicy.METHOD_SESSION_REQUEST -> sessionRequest(request)
+            RolePolicy.METHOD_HANDOVER -> handover(request)
             RolePolicy.METHOD_HOOK_SNAPSHOT,
             RolePolicy.METHOD_HOOK_HEARTBEAT,
             -> hookCommandLines(request)
             RolePolicy.METHOD_CALL_COMMAND_RESULT -> hookCommandResult(request)
-            RolePolicy.METHOD_SESSION_REQUEST,
-            RolePolicy.METHOD_AUDIO_CHANNEL,
-            RolePolicy.METHOD_HANDOVER,
-            -> failure(request, "method_not_implemented", "session and audio routing are owned by a later task")
+            RolePolicy.METHOD_AUDIO_CHANNEL ->
+                failure(request, "method_not_implemented", "APP audio lane is wired by Task 7")
             else -> failure(request, "method_not_implemented", "method is not in the fixed command table")
         }
     } catch (error: ConfigStoreException) {
@@ -234,22 +367,96 @@ internal class ControlDispatcher(
     }
 
     /**
-     * `hook.snapshot`/`hook.heartbeat` 的响应：带回该会话的待执行命令行（可能为空）。
+     * session.request：APP 请求为一通已通过自身预检的电话建立 AI 会话。
+     * 监督端仍会重新检查心跳/校准/独立终止能力；拒绝时明确返回原因。
+     */
+    private fun sessionRequest(request: RpcRequest): RpcResponse {
+        val session = request.sessionId
+            ?: return failure(request, "payload_invalid", "session.request must carry a session id")
+        if (request.payload.isNotEmpty() && request.payload.length > MAX_SESSION_REQUEST_CHARS) {
+            return failure(request, "payload_invalid", "session.request payload is too large")
+        }
+        val result = runBlocking { supervision.prepareAnswer(session) }
+        return ok(request, encodeCommandResult(result))
+    }
+
+    /** handover：APP 报告人工接管；监督端先撤销所有权再恢复麦克风。 */
+    private fun handover(request: RpcRequest): RpcResponse {
+        val session = request.sessionId
+            ?: return failure(request, "payload_invalid", "handover must carry a session id")
+        val outcome = runBlocking { supervision.onManualTakeover(session) }
+        val json = JsonObject()
+        json.addProperty("sessionMatched", outcome != TakeoverOutcome.NotOwned)
+        when (outcome) {
+            TakeoverOutcome.Confirmed -> json.addProperty("outcome", "confirmed")
+            TakeoverOutcome.NotOwned -> json.addProperty("outcome", "not_owned")
+            is TakeoverOutcome.RevokeFailed -> {
+                json.addProperty("outcome", "revoke_failed")
+                json.addProperty("reason", outcome.reason)
+            }
+            is TakeoverOutcome.RestoreFailed -> {
+                json.addProperty("outcome", "restore_failed")
+                json.addProperty("reason", outcome.reason)
+            }
+        }
+        return ok(request, json.toString())
+    }
+
+    private fun encodeCommandResult(result: CommandResult): String {
+        val json = JsonObject()
+        when (result) {
+            is CommandResult.Accepted -> json.addProperty("outcome", "accepted")
+            is CommandResult.Rejected -> {
+                json.addProperty("outcome", "rejected")
+                json.addProperty("reason", result.reason.name)
+            }
+            is CommandResult.Failed -> {
+                json.addProperty("outcome", "failed")
+                json.addProperty("code", result.code)
+                json.addProperty("message", result.message.take(MAX_ERROR_TEXT_CHARS))
+            }
+        }
+        return json.toString()
+    }
+
+    /**
+     * hook.snapshot/hook.heartbeat 的响应：带回该会话的待执行命令行（可能为空）。
      * 命令不在响应里执行，Hook 收到后仍要按自己的会话/代次/状态裁决。
      */
     private fun hookCommandLines(request: RpcRequest): RpcResponse {
         val session = request.sessionId
             ?: return failure(request, "payload_invalid", "hook calls must carry a session id")
+        if (request.method == RolePolicy.METHOD_HOOK_SNAPSHOT) {
+            feedSnapshot(session, request.payload)
+        }
         return ok(request, hookCommands.drainCommandLines(session))
     }
 
-    /** `call.command.result`：解析并暂存真实结果，供 APP 侧 CallControl.send 取走。 */
+    private fun feedSnapshot(session: SessionId, payload: String) {
+        val decoded = HookSnapshotDecoder.decode(session, payload) ?: return
+        supervision.recordSnapshotState(session, decoded.state)
+        if (decoded.handbackReason != null) {
+            runBlocking { supervision.onManualTakeover(session) }
+            return
+        }
+        when (decoded.state) {
+            CallState.ACTIVE -> runBlocking { supervision.onCallActive(session) }
+            CallState.DISCONNECTED -> runBlocking { supervision.onCallDisconnected(session) }
+            else -> Unit
+        }
+    }
+
+    /** call.command.result：解析并暂存真实结果，供监督端与 APP 侧 CallControl 取走。 */
     private fun hookCommandResult(request: RpcRequest): RpcResponse {
         val session = request.sessionId
             ?: return failure(request, "payload_invalid", "hook calls must carry a session id")
+        val decoded = HookCommandResultDecoder.decode(session, request.payload)
+            ?: return failure(request, "payload_invalid", "command result payload is invalid")
         if (!hookCommands.recordResult(session, request.payload)) {
             return failure(request, "payload_invalid", "command result payload is invalid")
         }
+        // 监督端只取自己等待的那一条；路由器仍把结果留给 APP 侧。
+        supervision.recordCommandResult(session, decoded.command, decoded.result)
         return ok(request, "")
     }
 
@@ -257,6 +464,7 @@ internal class ControlDispatcher(
         val redacted = store.read()
         val pairing = runCatching { store.readPairing() }.getOrNull()
         val (active, rejected) = connectionStats()
+        val state = supervision.status()
         val json = JsonObject()
         json.addProperty("bridgeVersion", BridgeInfo.VERSION)
         json.addProperty("protocolVersion", PROTOCOL_VERSION)
@@ -266,6 +474,11 @@ internal class ControlDispatcher(
         json.addProperty("uptimeMs", System.currentTimeMillis() - startedAtMs)
         json.addProperty("activeConnections", active)
         json.addProperty("rejectedConnections", rejected)
+        json.addProperty("supervisionPhase", state?.phase)
+        json.addProperty("supervisionOwned", state?.owned ?: false)
+        json.addProperty("microphoneIsolated", state?.microphoneIsolated ?: false)
+        json.addProperty("supervisionBlocked", state?.blockedReason)
+        json.addProperty("supervisionLastFault", state?.lastFault)
         return json.toString()
     }
 
@@ -362,6 +575,8 @@ internal class ControlDispatcher(
 
     private companion object {
         val PACKAGE_PATTERN = Regex("[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)+")
+        const val MAX_SESSION_REQUEST_CHARS: Int = 1024
+        const val MAX_ERROR_TEXT_CHARS: Int = 200
     }
 }
 
