@@ -28,12 +28,16 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import org.krvyft.agentcall.core.model.AudioFormatSpec
 import org.krvyft.agentcall.core.model.CallCommand
+import org.krvyft.agentcall.core.model.CallDirection
+import org.krvyft.agentcall.core.model.CallState
 import org.krvyft.agentcall.core.model.CommandResult
 import org.krvyft.agentcall.core.model.EndpointKind
+import org.krvyft.agentcall.core.model.EnvironmentKey
 import org.krvyft.agentcall.core.model.PROTOCOL_VERSION
 import org.krvyft.agentcall.core.model.PcmAudio
 import org.krvyft.agentcall.core.model.PcmChunk
 import org.krvyft.agentcall.core.model.PcmEncoding
+import org.krvyft.agentcall.core.model.Presentation
 import org.krvyft.agentcall.core.model.RejectReason
 import org.krvyft.agentcall.core.model.RpcRequest
 import org.krvyft.agentcall.core.model.RpcResponse
@@ -149,12 +153,87 @@ object ControlTimeouts {
 }
 
 /**
+ * 只读控制方法的机器码结果（Task 7B3）。
+ *
+ * 失败**绝不兜底**成“可用/在线/空批次”：要么是读到的真实负载，要么是固定机器码
+ * （[RpcError.code] 或客户端自己的负载校验码）。调用方据此保持 fail closed。
+ */
+sealed interface BridgeRead<out T> {
+    data class Available<T>(val value: T) : BridgeRead<T>
+
+    data class Unavailable(val code: String) : BridgeRead<Nothing>
+}
+
+/**
+ * 桥接 `status` 的只读投影（Task 7C 线格式）。
+ *
+ * 只有机器码/布尔/字符串；不含号码、密钥或连接凭据。null 表示桥接明确写 "unknown" 或
+ * 字段缺失——**绝不**被调用方解释成“在线/是默认拨号器”。
+ */
+data class BridgeStatusFacts(
+    /** true/false 是桥接的确定结论；null = "unknown"/缺失。 */
+    val hookConnected: Boolean? = null,
+    /** Google 电话默认角色；null = 桥接无法确定。 */
+    val dialerDefaultRole: Boolean? = null,
+    /** 监督阶段机器码（IDLE/ARMED/ANSWER_PENDING/ACTIVE/HANDOFF_PENDING/TERMINATING/ENDED/BLOCKED）。 */
+    val supervisionPhase: String? = null,
+    /** 监督端 blocked 原因机器码；null 表示没有阻塞。 */
+    val supervisionBlocked: String? = null,
+    /** 监督端最近一次故障机器码。 */
+    val supervisionLastFault: String? = null,
+    val supervisionOwned: Boolean? = null,
+    val microphoneIsolated: Boolean? = null,
+    val paired: Boolean? = null,
+    val enabled: Boolean? = null,
+    val bridgeVersion: String? = null,
+)
+
+/**
+ * 事件流里的一条事实（Task 7C 的 14 键固定格式）。
+ *
+ * 观测字段为 null 表示“这条事实没有该观测值”，绝不补 false/0/1；会话身份是
+ * [sessionId]（`{processEpoch, callId}`），[epoch] 只是便利副本。
+ */
+data class SessionWireEvent(
+    val seq: Long,
+    val sessionId: SessionId,
+    val epoch: String? = null,
+    val state: CallState? = null,
+    val presentation: Presentation? = null,
+    val direction: CallDirection? = null,
+    val phoneAccount: String? = null,
+    val isEmergency: Boolean? = null,
+    val isConference: Boolean? = null,
+    val activeCallCount: Int? = null,
+    val number: String? = null,
+    val source: String? = null,
+    val handbackReason: String? = null,
+    val outcome: String? = null,
+)
+
+/** 一次 `session.events` 轮询的结果：[nextSeq] 是下一次请求的游标，[dropped] 是桥接丢弃总数。 */
+data class EventsBatch(
+    val events: List<SessionWireEvent>,
+    val nextSeq: Long,
+    val dropped: Long,
+)
+
+/** 只读事件源（生产是 [BridgeClient]；测试注入假实现）。 */
+fun interface SessionEventSource {
+    suspend fun pollEvents(sinceSeq: Long): BridgeRead<EventsBatch>
+}
+
+/**
  * APP 角色的本地桥接客户端（spec §6.4 / Task 7B1）。
  *
  * 职责与边界：
  * - **身份**：只调用 APP 固定方法表（session.request / session.heartbeat / session.command /
- *   config.read / config.secret.read / audio.channel / handover）。从不声称 uid/包名/角色；
- *   控制传输还要求服务端内核凭据是 root（见 [LocalSocketControlTransport]）。
+ *   config.read / config.secret.read / audio.channel / handover / status / diagnose /
+ *   session.events）。从不声称 uid/包名/角色；控制传输还要求服务端内核凭据是 root
+ *   （见 [LocalSocketControlTransport]）。
+ * - **只读通道**：[status] 提供 HOOK 存在性/默认拨号角色/监督阶段；[diagnose] 提供
+ *   EnvironmentKey；[pollEvents] 轮询 HOOK → APP 事件流（Task 7C）。失败一律是固定机器码
+ *   （[BridgeRead.Unavailable]），绝不兜底成“在线/就绪/空批次”。
  * - **接听裁决**：[send] 的 Answer 只走 **session.request**（监督端授权、取租约、隔离麦克风并
  *   下发接听），Hangup 只走 **session.command**。因此“session.request 在途中又发
  *   session.command(answer)”在结构上不可能发生——answer 从不作为命令发送。
@@ -180,7 +259,7 @@ class BridgeClient(
     private val attachRetryAttempts: Int = ATTACH_RETRY_ATTEMPTS,
     private val attachRetryDelayMs: Long = ATTACH_RETRY_DELAY_MS,
     private val logger: (String) -> Unit = {},
-) : CallControl, AudioBridge {
+) : CallControl, AudioBridge, SessionEventSource {
 
     init {
         // 监督端把 >=5000 ms 的静默判为失联（core 的 SessionLimits.HEARTBEAT_TIMEOUT_MS）：
@@ -255,6 +334,167 @@ class BridgeClient(
             val remaining = heartbeatIntervalMs - (clock.nowMs() - startedAt)
             if (remaining > 0) delay(remaining)
         }
+    }
+
+    // ------------------------------------------------------------------ 只读通道（Task 7C 线格式）
+
+    /**
+     * 读取桥接 `status`（与 CLI_ROOT 同一份负载）。
+     *
+     * 只暴露机器码/布尔；`hookConnected` 是监督端 5000 ms 心跳窗口内的真实结论，
+     * "unknown" 与字段缺失都解析为 null（调用方保持 UNKNOWN，fail closed）。
+     * RPC 错误原样返回机器码（forbidden/internal_error/...），绝不变成本地推测。
+     */
+    suspend fun status(): BridgeRead<BridgeStatusFacts> {
+        val response = controlRequest(RolePolicy.METHOD_STATUS, null, "")
+            ?: return BridgeRead.Unavailable(ERROR_BRIDGE_UNAVAILABLE)
+        val error = response.error
+        if (error != null) {
+            logger("bridge.status_failed code=" + error.code)
+            return BridgeRead.Unavailable(error.code)
+        }
+        val json = parseObject(response.payload.toByteArray(Charsets.UTF_8))
+            ?: return BridgeRead.Unavailable(ERROR_STATUS_PAYLOAD)
+        return BridgeRead.Available(
+            BridgeStatusFacts(
+                hookConnected = booleanOrUnknownString(json, "hookConnected"),
+                dialerDefaultRole = booleanOrUnknownString(json, "dialerDefaultRole"),
+                supervisionPhase = json.string("supervisionPhase"),
+                supervisionBlocked = json.string("supervisionBlocked"),
+                supervisionLastFault = json.string("supervisionLastFault"),
+                supervisionOwned = json.boolean("supervisionOwned"),
+                microphoneIsolated = json.boolean("microphoneIsolated"),
+                paired = json.boolean("paired"),
+                enabled = json.boolean("enabled"),
+                bridgeVersion = json.string("bridgeVersion"),
+            ),
+        )
+    }
+
+    /**
+     * 读取桥接 `diagnose` 的环境事实（与 CLI_ROOT 逐字节相同）。
+     *
+     * 环境用于把校准证据绑定到“这一台/这一版”；字段缺失或空串一律不可用——
+     * 不完整的环境绝不能被当成可复现的校准绑定（spec §9）。
+     */
+    suspend fun diagnose(): BridgeRead<EnvironmentKey> {
+        val response = controlRequest(RolePolicy.METHOD_DIAGNOSE, null, "")
+            ?: return BridgeRead.Unavailable(ERROR_BRIDGE_UNAVAILABLE)
+        val error = response.error
+        if (error != null) {
+            logger("bridge.diagnose_failed code=" + error.code)
+            return BridgeRead.Unavailable(error.code)
+        }
+        val json = parseObject(response.payload.toByteArray(Charsets.UTF_8))
+            ?: return BridgeRead.Unavailable(ERROR_DIAGNOSE_PAYLOAD)
+        val environment = json.get("environment")
+        if (environment == null || !environment.isJsonObject) {
+            return BridgeRead.Unavailable(ERROR_DIAGNOSE_PAYLOAD)
+        }
+        val facts = environment.asJsonObject
+        val apiLevel = facts.int("apiLevel") ?: return BridgeRead.Unavailable(ERROR_DIAGNOSE_PAYLOAD)
+        val fields = listOf(
+            "romFingerprint", "kernelVersion", "dialerPackageVersion", "frameworkVersion",
+            "bridgeVersion", "audioPolicyDigest", "simCarrier", "transport", "route",
+        )
+        val values = fields.map { name ->
+            facts.string(name)?.takeIf { it.isNotBlank() }
+                ?: return BridgeRead.Unavailable(ERROR_DIAGNOSE_PAYLOAD)
+        }
+        return BridgeRead.Available(
+            EnvironmentKey(
+                apiLevel = apiLevel,
+                romFingerprint = values[0],
+                kernelVersion = values[1],
+                dialerPackageVersion = values[2],
+                frameworkVersion = values[3],
+                bridgeVersion = values[4],
+                audioPolicyDigest = values[5],
+                simCarrier = values[6],
+                transport = values[7],
+                route = values[8],
+            ),
+        )
+    }
+
+    /**
+     * 轮询 HOOK → APP 的会话事件流（`session.events`，Task 7C）。
+     *
+     * 游标语义与桥接一致：0 从最旧可用事件开始；中间游标只返回更新的；陈旧游标返回仍可用
+     * 的部分。**`cursor_ahead` 表示桥接进程重启/事件环已清空，不是“没有新事件”**：
+     * 这里重置为 0 再读一次（只重试一次，绝不无限循环）。
+     */
+    override suspend fun pollEvents(sinceSeq: Long): BridgeRead<EventsBatch> {
+        if (sinceSeq < 0L) return BridgeRead.Unavailable(ERROR_EVENTS_PAYLOAD)
+        val first = pollEventsOnce(sinceSeq)
+        if (first is BridgeRead.Unavailable &&
+            first.code == ERROR_CURSOR_AHEAD &&
+            sinceSeq != 0L
+        ) {
+            logger("bridge.session_events_cursor_ahead")
+            return pollEventsOnce(0L)
+        }
+        return first
+    }
+
+    private suspend fun pollEventsOnce(sinceSeq: Long): BridgeRead<EventsBatch> {
+        val payload = "{\"sinceSeq\":" + sinceSeq + "}"
+        val response = controlRequest(RolePolicy.METHOD_SESSION_EVENTS, null, payload)
+            ?: return BridgeRead.Unavailable(ERROR_BRIDGE_UNAVAILABLE)
+        val error = response.error
+        if (error != null) {
+            if (error.code != ERROR_CURSOR_AHEAD) {
+                logger("bridge.session_events_failed code=" + error.code)
+            }
+            return BridgeRead.Unavailable(error.code)
+        }
+        val json = parseObject(response.payload.toByteArray(Charsets.UTF_8))
+            ?: return BridgeRead.Unavailable(ERROR_EVENTS_PAYLOAD)
+        val array = json.get("events") ?: return BridgeRead.Unavailable(ERROR_EVENTS_PAYLOAD)
+        if (!array.isJsonArray) return BridgeRead.Unavailable(ERROR_EVENTS_PAYLOAD)
+        val nextSeq = json.long("nextSeq") ?: return BridgeRead.Unavailable(ERROR_EVENTS_PAYLOAD)
+        val dropped = json.long("dropped") ?: return BridgeRead.Unavailable(ERROR_EVENTS_PAYLOAD)
+        if (nextSeq < 0L || dropped < 0L) return BridgeRead.Unavailable(ERROR_EVENTS_PAYLOAD)
+        val parsed = ArrayList<SessionWireEvent>(array.asJsonArray.size())
+        for (element in array.asJsonArray) {
+            if (!element.isJsonObject) return BridgeRead.Unavailable(ERROR_EVENTS_PAYLOAD)
+            val event = decodeWireEvent(element.asJsonObject)
+                ?: return BridgeRead.Unavailable(ERROR_EVENTS_PAYLOAD)
+            parsed += event
+        }
+        // 桥接保证 seq 升序；这里仍显式排序，避免乱序负载让去重游标倒退。
+        parsed.sortBy { it.seq }
+        return BridgeRead.Available(EventsBatch(parsed, nextSeq, dropped))
+    }
+
+    /**
+     * 解析一条事件。[seq]/[sessionId] 是结构身份（缺失或不合法 → 整批拒绝）；
+     * 其余观测字段缺失/类型不符一律 null，绝不补 false/0/1（7C 线格式）。
+     */
+    private fun decodeWireEvent(json: JsonObject): SessionWireEvent? {
+        val seq = json.long("seq") ?: return null
+        if (seq <= 0L) return null
+        val sessionJson = json.get("sessionId") ?: return null
+        if (!sessionJson.isJsonObject) return null
+        val id = sessionJson.asJsonObject
+        val processEpoch = id.string("processEpoch")?.takeIf { it.isWireToken() } ?: return null
+        val callId = id.string("callId")?.takeIf { it.isWireToken() } ?: return null
+        return SessionWireEvent(
+            seq = seq,
+            sessionId = SessionId(processEpoch, callId),
+            epoch = json.string("epoch"),
+            state = json.enumOf<CallState>("state"),
+            presentation = json.enumOf<Presentation>("presentation"),
+            direction = json.enumOf<CallDirection>("direction"),
+            phoneAccount = json.string("phoneAccount"),
+            isEmergency = json.boolean("isEmergency"),
+            isConference = json.boolean("isConference"),
+            activeCallCount = json.int("activeCallCount")?.takeIf { it >= 1 },
+            number = json.string("number"),
+            source = json.string("source"),
+            handbackReason = json.string("handbackReason"),
+            outcome = json.string("outcome"),
+        )
     }
 
     // ------------------------------------------------------------------ CallControl
@@ -934,6 +1174,17 @@ class BridgeClient(
         const val ERROR_UPLINK_FAILED: String = "audio_pcm_uplink_failed"
         const val ERROR_WRITE_FAILED: String = "audio_pcm_write_failed"
 
+        // ---- 只读通道（Task 7C 线格式）的客户端负载校验码。RPC 错误码原样透传，不在此表内。
+        const val ERROR_STATUS_PAYLOAD: String = "status_payload_invalid"
+        const val ERROR_DIAGNOSE_PAYLOAD: String = "diagnose_payload_invalid"
+        const val ERROR_EVENTS_PAYLOAD: String = "events_payload_invalid"
+
+        /** 桥接事件游标超前（进程重启/环已清空）：客户端重置为 0 再读一次。 */
+        const val ERROR_CURSOR_AHEAD: String = "cursor_ahead"
+
+        /** 会话 token 的线格式上界：桥接只接受短机器码（7A1/7C 的会话字段约束）。 */
+        const val MAX_SESSION_TOKEN_CHARS: Int = 256
+
         private val ENCODE_STOP: ByteArray = "{\"type\":\"stop\"}".toByteArray(Charsets.UTF_8)
 
         private val ACK_KEYS = setOf("type", "seq", "ok")
@@ -1053,6 +1304,46 @@ private class LocalSocketPcmLaneConnection(
 // --------------------------------------------------------------------------
 
 private fun JsonObject.string(name: String): String? = get(name)?.asStringOrNull()
+
+private fun JsonObject.long(name: String): Long? {
+    val element = get(name) ?: return null
+    if (!element.isJsonPrimitive || !element.asJsonPrimitive.isNumber) return null
+    val value = element.asDouble
+    if (!value.isFinite() || value != Math.floor(value)) return null
+    if (value < Long.MIN_VALUE.toDouble() || value > Long.MAX_VALUE.toDouble()) return null
+    return element.asLong
+}
+
+/**
+ * status 的三态实时字段：布尔原样；字符串 "true"/"false" 兼容旧桥接；
+ * "unknown"/缺失/null 一律 null（调用方按 UNKNOWN 处理，绝不当成在线）。
+ */
+private fun booleanOrUnknownString(json: JsonObject, name: String): Boolean? {
+    val element = json.get(name) ?: return null
+    if (element.isJsonNull || !element.isJsonPrimitive) return null
+    val primitive = element.asJsonPrimitive
+    return when {
+        primitive.isBoolean -> primitive.asBoolean
+        primitive.isString -> when (primitive.asString) {
+            "true" -> true
+            "false" -> false
+            else -> null
+        }
+        else -> null
+    }
+}
+
+/** 枚举字段：缺失/JSON null 返回 null；字符串必须是已知名字，否则同样视为“没有观测值”。 */
+private inline fun <reified T : Enum<T>> JsonObject.enumOf(name: String): T? {
+    val value = string(name) ?: return null
+    return enumValues<T>().firstOrNull { it.name == value }
+}
+
+/** 会话 token 只接受短机器码（无控制字符/空白/引号）；不合法的身份让整批负载被拒绝。 */
+private fun String.isWireToken(): Boolean =
+    isNotEmpty() && length <= BridgeClient.MAX_SESSION_TOKEN_CHARS &&
+        none { it.isISOControl() || it.isWhitespace() || it == '"' }
+
 
 private fun JsonObject.int(name: String): Int? {
     val element = get(name) ?: return null
