@@ -23,6 +23,12 @@ class SpeechClient(
     private val speed: Double = 1.0,
 ) : SpeechSynthesizer {
 
+    init {
+        // coerceIn 对 NaN 是恒等映射（NaN 比较恒为 false），会原样拼进 JSON；
+        // 非有限语速直接拒绝，不把 "NaN"/"Infinity" 发给供应商。
+        require(speed.isFinite()) { "TTS speed must be a finite number, got " + speed }
+    }
+
     override suspend fun synthesize(text: String): PcmAudio {
         if (endpoint.model.isBlank()) throw IllegalArgumentException("TTS model must not be blank")
         if (text.isBlank()) throw IllegalArgumentException("TTS text must not be blank")

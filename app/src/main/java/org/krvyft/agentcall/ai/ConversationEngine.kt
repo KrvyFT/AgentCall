@@ -3,7 +3,6 @@ package org.krvyft.agentcall.ai
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
@@ -11,7 +10,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import org.krvyft.agentcall.core.model.AgentConfig
 import org.krvyft.agentcall.core.model.ApiEndpoint
 import org.krvyft.agentcall.core.model.EndpointKind
@@ -97,6 +97,13 @@ class ConversationEngine(
                             accepting.set(true)
                         }
                     }
+                    // 下行正常结束（通话结束）时，把还差最后 800 ms 静音的那一段也交给
+                    // ASR/LLM/TTS，避免丢掉用户最后一句话。取消/异常路径不会执行到这里，
+                    // 因此不会在取消后发起新回合。
+                    accepting.set(false)
+                    vad.flush()?.let { segment ->
+                        handleTurn(segment, audio, config, context)
+                    }
                 } finally {
                     accepting.set(false)
                     collector.cancel()
@@ -111,13 +118,11 @@ class ConversationEngine(
 
     private suspend fun playGreeting(audio: AudioSession, openingLine: String) {
         val deadline = Deadline(clock.nowMs() + turnTimeoutMs)
-        val pcm = try {
-            withTimeout(turnTimeoutMs) {
-                callWithRetry("tts-greeting", deadline) { speech.synthesize(openingLine) }
-            }
-        } catch (error: TimeoutCancellationException) {
-            throw VoiceTurnTimeoutException("greeting timed out after " + turnTimeoutMs + " ms", error)
-        }
+        // withTimeoutOrNull 内部只吞掉“自己创建的 TimeoutCoroutine”的超时；调用方取消
+        // （包括外层 withTimeout）会原样抛出，不会被改写成 VoiceTurnTimeoutException。
+        val pcm = withTimeoutOrNull(turnTimeoutMs) {
+            callWithRetry("tts-greeting", deadline) { speech.synthesize(openingLine) }
+        } ?: throw VoiceTurnTimeoutException("greeting timed out after " + turnTimeoutMs + " ms")
         currentCoroutineContext().ensureActive()
         audio.writeUplink(pcm)
     }
@@ -129,38 +134,38 @@ class ConversationEngine(
         context: MutableList<ChatMessage>,
     ) {
         val deadline = Deadline(clock.nowMs() + turnTimeoutMs)
-        try {
-            withTimeout(turnTimeoutMs) {
-                val wav = WavCodec.encode(segment)
-                val transcript = callWithRetry("asr", deadline) {
-                    transcriber.transcribe(wav)
-                }.trim()
-                // 迟到的结果不得推进到下一阶段：取消后既不请求 TTS，也不写上行。
-                currentCoroutineContext().ensureActive()
-                if (transcript.isEmpty()) return@withTimeout
-                context += ChatMessage(ChatMessage.ROLE_USER, transcript)
-                trimContext(context)
+        // withTimeoutOrNull 只吞掉自己的回合超时；调用方取消原样传播（spec §10）。
+        val completed = withTimeoutOrNull(turnTimeoutMs) {
+            val wav = WavCodec.encode(segment)
+            val transcript = callWithRetry("asr", deadline) {
+                transcriber.transcribe(wav)
+            }.trim()
+            // 迟到的结果不得推进到下一阶段：取消后既不请求 TTS，也不写上行。
+            currentCoroutineContext().ensureActive()
+            if (transcript.isEmpty()) return@withTimeoutOrNull
+            context += ChatMessage(ChatMessage.ROLE_USER, transcript)
+            trimContext(context)
 
-                val reply = callWithRetry("llm", deadline) {
-                    chat.reply(buildMessages(config, context))
-                }
-                currentCoroutineContext().ensureActive()
-                val trimmed = trimReply(reply)
-                if (trimmed.isEmpty()) return@withTimeout
-                context += ChatMessage(ChatMessage.ROLE_ASSISTANT, trimmed)
-                trimContext(context)
-
-                val pcm = callWithRetry("tts", deadline) { speech.synthesize(trimmed) }
-                // 取消后到达的结果绝不写上行：写之前再检查一次协程仍存活。
-                currentCoroutineContext().ensureActive()
-                if (clock.nowMs() >= deadline.atMs) {
-                    throw VoiceTurnTimeoutException("turn deadline reached before playback")
-                }
-                audio.writeUplink(pcm)
-                delay(ECHO_GUARD_MS)
+            val reply = callWithRetry("llm", deadline) {
+                chat.reply(buildMessages(config, context))
             }
-        } catch (error: TimeoutCancellationException) {
-            throw VoiceTurnTimeoutException("turn timed out after " + turnTimeoutMs + " ms", error)
+            currentCoroutineContext().ensureActive()
+            val trimmed = trimReply(reply)
+            if (trimmed.isEmpty()) return@withTimeoutOrNull
+            context += ChatMessage(ChatMessage.ROLE_ASSISTANT, trimmed)
+            trimContext(context)
+
+            val pcm = callWithRetry("tts", deadline) { speech.synthesize(trimmed) }
+            // 取消后到达的结果绝不写上行：写之前再检查一次协程仍存活。
+            currentCoroutineContext().ensureActive()
+            if (clock.nowMs() >= deadline.atMs) {
+                throw VoiceTurnTimeoutException("turn deadline reached before playback")
+            }
+            audio.writeUplink(pcm)
+            delay(ECHO_GUARD_MS)
+        }
+        if (completed == null) {
+            throw VoiceTurnTimeoutException("turn timed out after " + turnTimeoutMs + " ms")
         }
     }
 
@@ -201,8 +206,10 @@ class ConversationEngine(
 
     private fun trimReply(reply: String): String {
         val trimmed = reply.trim()
-        if (trimmed.length <= maxReplyChars) return trimmed
-        return trimmed.take(maxReplyChars).trimEnd()
+        if (trimmed.codePointCount(0, trimmed.length) <= maxReplyChars) return trimmed
+        // 按码点截断：take(300) 会把 emoji 等代理对切成两半，产出非法 UTF-16。
+        val end = trimmed.offsetByCodePoints(0, maxReplyChars)
+        return trimmed.substring(0, end).trimEnd()
     }
 
     companion object {
@@ -230,10 +237,18 @@ class ConversationEngine(
                 isConfiguredEndpoint(config.llm) &&
                 isConfiguredEndpoint(config.tts)
 
-        private fun isConfiguredEndpoint(endpoint: ApiEndpoint?): Boolean =
-            endpoint != null &&
-                endpoint.baseUrl.trim().startsWith("https://") &&
-                endpoint.model.isNotBlank()
+        private fun isConfiguredEndpoint(endpoint: ApiEndpoint?): Boolean {
+            if (endpoint == null || endpoint.model.isBlank()) return false
+            // 真正解析一次 URL；startsWith("https://") 会接受 user-info、query、fragment
+            // 甚至空主机，这些都必须在使用前拒绝（与 ApiTransport 的校验一致）。
+            val url = endpoint.baseUrl.trim().toHttpUrlOrNull() ?: return false
+            return url.scheme == "https" &&
+                url.host.isNotBlank() &&
+                url.username.isEmpty() &&
+                url.password.isEmpty() &&
+                url.query == null &&
+                url.fragment == null
+        }
 
         /**
          * 从公开配置与密钥端口装配真实引擎；任一语音端点缺失或非 HTTPS 时返回 null，

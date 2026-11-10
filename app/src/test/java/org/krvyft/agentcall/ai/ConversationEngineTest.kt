@@ -2,6 +2,7 @@ package org.krvyft.agentcall.ai
 
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
@@ -10,6 +11,7 @@ import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -49,6 +51,25 @@ class ConversationEngineTest {
         assertFalse(ConversationEngine.isVoiceCapable(config(tts = null)))
         assertFalse(ConversationEngine.isVoiceCapable(config(asr = ApiEndpoint("http://asr.test/v1/", "m"))))
         assertFalse(ConversationEngine.isVoiceCapable(config(llm = ApiEndpoint("https://llm.test/v1/", " "))))
+        assertFalse(
+            "user-info in the URL must be rejected",
+            ConversationEngine.isVoiceCapable(config(asr = ApiEndpoint("https://user:pass@asr.test/v1/", "m"))),
+        )
+        assertFalse(
+            "query string in the URL must be rejected",
+            ConversationEngine.isVoiceCapable(config(asr = ApiEndpoint("https://asr.test/v1/?key=1", "m"))),
+        )
+        assertFalse(
+            "fragment in the URL must be rejected",
+            ConversationEngine.isVoiceCapable(config(asr = ApiEndpoint("https://asr.test/v1/#frag", "m"))),
+        )
+        assertFalse(
+            "missing host must be rejected",
+            ConversationEngine.isVoiceCapable(config(asr = ApiEndpoint("https://", "m"))),
+        )
+        assertTrue(
+            ConversationEngine.isVoiceCapable(config(asr = ApiEndpoint("https://asr.test:8443/v1/", "m"))),
+        )
         assertTrue(ConversationEngine.isVoiceCapable(config()))
     }
 
@@ -139,6 +160,30 @@ class ConversationEngineTest {
     }
 
     @Test
+    fun replyTruncationKeepsSurrogatePairsWhole() = runTest {
+        val emoji = "\uD83D\uDE00" // U+1F600，一个 UTF-16 代理对
+        val audio = FakeAudioSession()
+        val chat = FakeChat().apply { result = "字".repeat(299) + emoji }
+        val speech = FakeSpeech()
+        val job = launch { engine(chat = chat, speech = speech).run(session, audio, config()) }
+        audio.feedSegment()
+        testScheduler.advanceUntilIdle()
+
+        // 299 个汉字 + 1 个 emoji 恰好 300 个码点：必须整体保留，不能把代理对切成两半。
+        val spoken = speech.texts.single()
+        assertEquals(300, spoken.codePointCount(0, spoken.length))
+        assertEquals("字".repeat(299) + emoji, spoken)
+
+        chat.result = emoji.repeat(400)
+        audio.feedSegment()
+        testScheduler.advanceUntilIdle()
+        val truncated = speech.texts.last()
+        assertEquals(300, truncated.codePointCount(0, truncated.length))
+        assertEquals(emoji.repeat(300), truncated)
+        job.cancel()
+    }
+
+    @Test
     fun contextIsLimitedToEightRounds() = runTest {
         val audio = FakeAudioSession()
         val transcriber = FakeTranscriber().apply { resultFactory = { n -> "第" + n + "轮" } }
@@ -180,6 +225,23 @@ class ConversationEngineTest {
         assertEquals("previous call context must be cleared", 2, secondRequest.size)
         assertEquals("第二通", secondRequest[1].content)
         second.cancel()
+    }
+
+    @Test
+    fun pendingSpeechIsFlushedWhenTheDownlinkEnds() = runTest {
+        val audio = FakeAudioSession()
+        val transcriber = FakeTranscriber()
+        val speech = FakeSpeech()
+        val job = launch { engine(transcriber, chat = FakeChat(), speech = speech).run(session, audio, config()) }
+        // 通话在用户说话中途结束：没有 800 ms 静音，只有不足一个完整分句的语音。
+        chunked(tone(1_000)).forEach { audio.chunks.trySend(it) }
+        audio.chunks.close()
+        testScheduler.advanceUntilIdle()
+        job.join()
+
+        assertEquals("the final segment must still be considered", 1, transcriber.calls)
+        assertEquals(1, audio.writeCount)
+        assertEquals(1, audio.stopCount)
     }
 
     // ------------------------------------------------------------------ 错误、重试与超时
@@ -228,6 +290,42 @@ class ConversationEngineTest {
         }
 
         assertTrue(failure.message!!.contains("45"))
+        assertEquals(0, audio.writeCount)
+        assertEquals(1, audio.stopCount)
+    }
+
+    @Test
+    fun callerTimeoutIsPropagatedUnchanged() = runTest {
+        val audio = FakeAudioSession()
+        val chat = FakeChat().apply { delayMs = 10_000L }
+        audio.feedSegment()
+
+        val failure: Throwable = expectFailure(TimeoutCancellationException::class.java) {
+            withTimeout(1_000L) {
+                engine(chat = chat).run(session, audio, config())
+            }
+        }
+
+        assertFalse(
+            "a caller timeout is not the engine's 45 s turn timeout",
+            failure is VoiceTurnTimeoutException,
+        )
+        assertEquals(0, audio.writeCount)
+        assertEquals(1, audio.stopCount)
+    }
+
+    @Test
+    fun callerTimeoutDuringGreetingIsPropagatedUnchanged() = runTest {
+        val audio = FakeAudioSession()
+        val speech = FakeSpeech().apply { delayMs = 10_000L }
+
+        val failure: Throwable = expectFailure(TimeoutCancellationException::class.java) {
+            withTimeout(1_000L) {
+                engine(speech = speech).run(session, audio, config(openingLine = "您好，我是助理。"))
+            }
+        }
+
+        assertFalse(failure is VoiceTurnTimeoutException)
         assertEquals(0, audio.writeCount)
         assertEquals(1, audio.stopCount)
     }
@@ -302,6 +400,42 @@ class ConversationEngineTest {
         job.cancel()
     }
 
+    @Test
+    fun echoedDownlinkDuringPlaybackNeverStartsATurn() = runTest {
+        val audio = FakeAudioSession().apply { playbackMs = 2_000L }
+        val transcriber = FakeTranscriber()
+        val speech = FakeSpeech()
+        audio.feedSegment()
+        val job = launch { engine(transcriber, chat = FakeChat(), speech = speech).run(session, audio, config()) }
+
+        // 到达上行播放：writeUplink 在“播放”期间挂起 2 秒（模拟真实播放阻塞语义）。
+        testScheduler.advanceTimeBy(1_000L)
+        assertEquals(1, audio.writeCount)
+        assertTrue("playback must still be in progress", audio.playing)
+
+        // 播放期间的下行是本机 TTS 回声：既不能开启新回合，也不能在播放结束后补开。
+        audio.feedSegment()
+        testScheduler.advanceTimeBy(1_001L)
+        assertEquals(1, transcriber.calls)
+        assertFalse("playback has finished", audio.playing)
+
+        // 播放结束后 300 ms 回声残留窗口内到达的下行同样丢弃。
+        audio.feedSegment()
+        testScheduler.advanceTimeBy(200L)
+        assertEquals(1, transcriber.calls)
+        testScheduler.advanceTimeBy(200L)
+        testScheduler.advanceUntilIdle()
+        assertEquals("echo residue must never start a turn after playback", 1, transcriber.calls)
+        assertEquals(1, audio.writeCount)
+
+        // 真实用户语音仍然能在播放结束后开启下一回合。
+        audio.feedSegment()
+        testScheduler.advanceUntilIdle()
+        assertEquals(2, transcriber.calls)
+        assertEquals(2, audio.writeCount)
+        job.cancel()
+    }
+
     // ------------------------------------------------------------------ 基础设施
 
     private fun engine(
@@ -343,7 +477,6 @@ class ConversationEngineTest {
         var calls = 0
         var resultFactory: (Int) -> String = { "你好" }
         var delayMs = 0L
-        var lateNonCancellable = false
         var onCall: (Int) -> Unit = {}
         val wavs = mutableListOf<ByteArray>()
         val failures = ArrayDeque<Throwable>()
@@ -353,13 +486,7 @@ class ConversationEngineTest {
             wavs += wav
             onCall(calls)
             failures.removeFirstOrNull()?.let { throw it }
-            if (delayMs > 0L) {
-                if (lateNonCancellable) {
-                    withContext(NonCancellable) { delay(delayMs) }
-                } else {
-                    delay(delayMs)
-                }
-            }
+            if (delayMs > 0L) delay(delayMs)
             return resultFactory(calls)
         }
     }
@@ -412,9 +539,21 @@ class ConversationEngineTest {
         var writeCount = 0
         var stopCount = 0
 
+        /** 非 0 时 writeUplink 模拟“播放期间挂起”，即 AudioBridge 约定的播放完成语义。 */
+        var playbackMs = 0L
+        var playing = false
+
         override suspend fun writeUplink(audio: PcmAudio) {
             writeCount += 1
             written += audio
+            if (playbackMs > 0L) {
+                playing = true
+                try {
+                    delay(playbackMs)
+                } finally {
+                    playing = false
+                }
+            }
         }
 
         override suspend fun stop() {

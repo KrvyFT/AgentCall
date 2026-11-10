@@ -14,7 +14,15 @@ import javax.net.ssl.KeyManagerFactory
 import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManagerFactory
 import javax.net.ssl.X509TrustManager
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -27,12 +35,15 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
-import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
+import org.krvyft.agentcall.core.model.AgentConfig
 import org.krvyft.agentcall.core.model.ApiEndpoint
 import org.krvyft.agentcall.core.model.AudioFormatSpec
 import org.krvyft.agentcall.core.model.PcmAudio
+import org.krvyft.agentcall.core.model.PcmChunk
+import org.krvyft.agentcall.core.model.SessionId
+import org.krvyft.agentcall.core.port.AudioSession
 
 /**
  * 真实 TLS + MockWebServer 的 HTTP 失败路径测试：路径前缀、内容类型、8 MiB 上限、
@@ -282,7 +293,6 @@ class ApiTransportTest {
     @Test
     fun insecureOrAmbiguousBaseUrlsAreRejectedBeforeNetwork() = runBlocking {
         val transport = transport()
-        val bodies = mutableListOf<String>()
         for (base in listOf(
             "http://127.0.0.1:1/v1/",
             "https://user:pass@example.test/v1/",
@@ -300,7 +310,6 @@ class ApiTransportTest {
                     transport.deadlineAfter(1_000),
                 )
             }
-            bodies += base
         }
         assertEquals(0, server.requestCount)
     }
@@ -421,6 +430,127 @@ class ApiTransportTest {
         assertTrue("slow response must fail promptly, elapsed=" + elapsedMs, elapsedMs < 4_000L)
     }
 
+    @Test
+    fun slowBodyIsAbortedAtTheRequestDeadline() = runBlocking {
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "application/json")
+                .setBody("{}")
+                .setBodyDelay(5, TimeUnit.SECONDS),
+        )
+        // 网络超时远大于截止时间：能在 5 秒之前结束，只能是回合截止时间在正文读取阶段生效。
+        val transport = transport(timeoutMs = 10_000)
+        val startedAt = System.nanoTime()
+        expectFailure(ApiTimeoutException::class.java) {
+            transport.post(
+                ApiEndpoint(server.url("/v1/").toString(), "m"),
+                "chat/completions",
+                "sk",
+                "{}".toRequestBody("application/json".toMediaType()),
+                "application/json",
+                transport.deadlineAfter(400),
+            )
+        }
+        val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L
+        assertTrue("body read must not outlive the deadline, elapsed=" + elapsedMs, elapsedMs < 3_000L)
+    }
+
+    @Test
+    fun cancellationInterruptsAPendingBodyRead() = runBlocking {
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "application/json")
+                .setBody("{}")
+                .setBodyDelay(3, TimeUnit.SECONDS),
+        )
+        val transport = transport(timeoutMs = 30_000)
+        val job = launch(Dispatchers.Default) {
+            transport.post(
+                ApiEndpoint(server.url("/v1/").toString(), "m"),
+                "chat/completions",
+                "sk",
+                "{}".toRequestBody("application/json".toMediaType()),
+                "application/json",
+                transport.deadlineAfter(60_000),
+            )
+        }
+        assertTrue("server must receive the request", server.takeRequest(2, TimeUnit.SECONDS) != null)
+        // 客户端已经收到响应头并阻塞在正文读取上。
+        delay(500)
+        val startedAt = System.nanoTime()
+        withTimeout(2_000) { job.cancelAndJoin() }
+        val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L
+        assertTrue("cancellation must interrupt the body read, elapsed=" + elapsedMs, elapsedMs < 2_000L)
+    }
+
+    @Test
+    fun slowChatBodyCannotOutliveTheTurnBudget() = runBlocking {
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "application/json")
+                .setBody(TestResources.text("ai/json/chat_completion.json"))
+                .setBodyDelay(2, TimeUnit.SECONDS),
+        )
+        val transport = transport(timeoutMs = 10_000)
+        val engine = ConversationEngine(
+            transcriber = Transcriber { "你好" },
+            chat = ChatClient(transport, ApiEndpoint(server.url("/v1/").toString(), "gpt-fixture"), "sk"),
+            speech = SpeechSynthesizer { PcmAudio(tone(200), AudioFormatSpec(16_000)) },
+            turnTimeoutMs = 500L,
+        )
+        val audio = SingleSegmentAudio()
+        val startedAt = System.nanoTime()
+
+        expectFailure(VoiceTurnTimeoutException::class.java) {
+            engine.run(
+                SessionId(processEpoch = "epoch-fixture", callId = "call-fixture"),
+                audio,
+                AgentConfig(
+                    asr = ApiEndpoint("https://asr.example/v1/", "asr"),
+                    llm = ApiEndpoint("https://llm.example/v1/", "llm"),
+                    tts = ApiEndpoint("https://tts.example/v1/", "tts"),
+                    // 开场白会在 VAD 开始接收下行前播放；这里只要回合链路本身。
+                    openingLine = "",
+                ),
+            )
+        }
+
+        val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L
+        assertTrue(
+            "a slow LLM body must not outlive the turn budget, elapsed=" + elapsedMs,
+            elapsedMs < 1_500L,
+        )
+        assertEquals("timed-out turns must not write uplink audio", 0, audio.writeCount)
+        assertEquals(1, audio.stopCount)
+    }
+
+    @Test
+    fun callerTimeoutIsPropagatedUnchanged() = runBlocking {
+        server.enqueue(
+            MockResponse()
+                .setHeader("Content-Type", "application/json")
+                .setBody("{}")
+                .setHeadersDelay(5, TimeUnit.SECONDS),
+        )
+        val transport = transport(timeoutMs = 10_000)
+        val startedAt = System.nanoTime()
+        val failure: Throwable = expectFailure(TimeoutCancellationException::class.java) {
+            withTimeout(300) {
+                transport.post(
+                    ApiEndpoint(server.url("/v1/").toString(), "m"),
+                    "chat/completions",
+                    "sk",
+                    "{}".toRequestBody("application/json".toMediaType()),
+                    "application/json",
+                    transport.deadlineAfter(30_000),
+                )
+            }
+        }
+        assertFalse("a caller timeout must not become an API timeout", failure is ApiTimeoutException)
+        val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L
+        assertTrue("caller cancellation must interrupt the request promptly, elapsed=" + elapsedMs, elapsedMs < 3_000L)
+    }
+
     // ------------------------------------------------------------------ 日志
 
     @Test
@@ -445,6 +575,36 @@ class ApiTransportTest {
         assertFalse(all, all.contains("Bearer", ignoreCase = true))
         assertFalse("logs must not contain audio bytes", all.contains("RIFF"))
         assertTrue("expected some diagnostics, got none", logs.isNotEmpty())
+    }
+
+    // ------------------------------------------------------------------ 默认客户端
+
+    @Test
+    fun defaultClientMatchesTheSpecifiedBudgetsAndDoesNotRetryPosts() {
+        val client = ApiTransport.defaultClient()
+        assertEquals("connect timeout must be 10 s", 10_000L, ApiTransport.CONNECT_TIMEOUT_MS)
+        assertEquals("turn budget must be 45 s", 45_000L, ApiTransport.TURN_TIMEOUT_MS)
+        assertEquals(10_000, client.connectTimeoutMillis)
+        assertEquals(45_000, client.readTimeoutMillis)
+        assertEquals(45_000, client.writeTimeoutMillis)
+        assertEquals(45_000, client.callTimeoutMillis)
+        assertFalse("OkHttp must never silently retry a POST", client.retryOnConnectionFailure)
+        assertFalse("redirects are handled explicitly by ApiTransport", client.followRedirects)
+        assertFalse(client.followSslRedirects)
+    }
+
+    @Test
+    fun synthesizeRejectsNonFiniteSpeed() {
+        for (speed in listOf(Double.NaN, Double.POSITIVE_INFINITY, Double.NEGATIVE_INFINITY)) {
+            expectFailure(IllegalArgumentException::class.java) {
+                SpeechClient(
+                    transport(),
+                    ApiEndpoint("https://tts.example/v1/", "m"),
+                    "sk",
+                    speed = speed,
+                )
+            }
+        }
     }
 
     // ------------------------------------------------------------------ 工具
@@ -487,6 +647,23 @@ internal object TestResources {
         }.use { it.readBytes() }
 
     fun text(name: String): String = String(bytes(name), Charsets.UTF_8)
+}
+
+/** 只提供“一句用户语音”的下行会话：用于把真实 HTTP 客户端接进完整回合。 */
+private class SingleSegmentAudio : AudioSession {
+    override val downlink: Flow<PcmChunk> = flowOf(
+        PcmChunk(tone(1_000) + silence(800), AudioFormatSpec(16_000)),
+    )
+    var writeCount = 0
+    var stopCount = 0
+
+    override suspend fun writeUplink(audio: PcmAudio) {
+        writeCount += 1
+    }
+
+    override suspend fun stop() {
+        stopCount += 1
+    }
 }
 
 /** 测试专用自签名 TLS 材料（PEM 位于 test/resources/ai/tls）。 */

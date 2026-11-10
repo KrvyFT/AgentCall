@@ -7,13 +7,11 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.TimeoutCancellationException
-import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.asExecutor
 import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.HttpUrl
@@ -76,8 +74,10 @@ class ApiStatusException(
  * - 响应正文最多 8 MiB，先看 Content-Length 再对字节流设上限；
  * - 只记录方法、主机、路径与状态/字节数，绝不记录 header、请求体或响应体。
  *
- * 所有等待都可被协程取消：取消会 cancel OkHttp Call；OkHttp 的中断异常映射为
- * [ApiTimeoutException]，其余取消原样传播。
+ * 响应头与正文读取都受 [Deadline] 约束：整个 HTTP 调用在同一个 withTimeout 内完成，
+ * 静默服务器或慢正文不能把一次请求拖过截止时间。取消会 cancel OkHttp Call（正文读取阶段
+ * 同样如此），阻塞的 socket 读取被立即打断；只有本类自己的截止时间超时才映射为
+ * [ApiTimeoutException]，调用方取消原样传播。
  */
 class ApiTransport(
     private val clock: MonotonicClock = MonotonicClock { System.nanoTime() / 1_000_000L },
@@ -126,74 +126,78 @@ class ApiTransport(
         val remaining = deadline.remainingMs(clock)
         if (remaining <= 0L) throw ApiTimeoutException("deadline exceeded before the request was sent")
         val call = client.newCall(request)
-        // 取消与 resume 之间到达的响应必须由本类关闭，否则连接不会被回收。
-        val pending = AtomicReference<Response?>(null)
-        val response = try {
-            withTimeout(remaining) {
-                suspendCancellableCoroutine<Response> { continuation ->
-                    // 只使用公开 API（Continuation.resume/resumeWithException）；tryResume/completeResume
-                    // 是 kotlinx.coroutines 内部 API，不属于稳定契约。
-                    continuation.invokeOnCancellation {
-                        call.cancel()
-                        pending.getAndSet(null)?.close()
+        // 响应头与正文读取都必须在同一个回合截止时间内：静默服务器或慢正文不得把
+        // 一个回合拖过 45 s。取消由 awaitResponse/readCapped 的 invokeOnCancellation
+        // 关闭 OkHttp Call，阻塞的正文读取会被立即打断。
+        //
+        // 用 withTimeoutOrNull 而不是 withTimeout：它内部只吞掉“自己创建的
+        // TimeoutCoroutine”抛出的超时（private 的 coroutine 归属检查），调用方取消——
+        // 包括外层 withTimeout——会原样抛出，不会被改写成 ApiTimeoutException（spec §10）。
+        val outcome = withTimeoutOrNull(remaining) {
+            val received = awaitResponse(call)
+            if (received.code in 300..399) {
+                val next = received.use { followRedirectTarget(request, it, redirectsLeft) }
+                execute(next, deadline, redirectsLeft - 1)
+            } else {
+                received.use { response ->
+                    if (!response.isSuccessful) {
+                        logger("ai http status " + response.code)
+                        throw ApiStatusException(response.code, "HTTP " + response.code)
                     }
-                    call.enqueue(object : Callback {
-                        override fun onFailure(call: Call, e: java.io.IOException) {
-                            val mapped = if (e is InterruptedIOException) {
-                                ApiTimeoutException("network timeout", e)
-                            } else {
-                                e
-                            }
-                            if (continuation.isActive) continuation.resumeWithException(mapped)
-                        }
-
-                        override fun onResponse(call: Call, response: Response) {
-                            pending.set(response)
-                            if (!continuation.isActive) {
-                                pending.getAndSet(null)?.close()
-                                return
-                            }
-                            continuation.resume(response)
-                            // 对已取消的 continuation，resume 会被忽略且不触发 invokeOnCancellation，
-                            // 因此这里必须自己关闭响应。
-                            if (continuation.isCancelled) {
-                                pending.getAndSet(null)?.close()
-                            } else {
-                                pending.set(null)
-                            }
-                        }
-                    })
+                    val contentType = response.header("Content-Type")
+                        ?.substringBefore(';')
+                        ?.trim()
+                        ?.lowercase()
+                        .orEmpty()
+                    val bytes = readCapped(call, response.body)
+                    logger("ai http status " + response.code + " bytes=" + bytes.size)
+                    HttpResponse(response.code, contentType, bytes)
                 }
             }
-        } catch (error: TimeoutCancellationException) {
-            throw ApiTimeoutException("request deadline exceeded", error)
         }
-
-        response.use { received ->
-            if (received.code in 300..399) {
-                return followRedirect(request, received, deadline, redirectsLeft)
-            }
-            if (!received.isSuccessful) {
-                logger("ai http status " + received.code)
-                throw ApiStatusException(received.code, "HTTP " + received.code)
-            }
-            val contentType = received.header("Content-Type")
-                ?.substringBefore(';')
-                ?.trim()
-                ?.lowercase()
-                .orEmpty()
-            val bytes = readCapped(received.body)
-            logger("ai http status " + received.code + " bytes=" + bytes.size)
-            return HttpResponse(received.code, contentType, bytes)
-        }
+        return outcome ?: throw ApiTimeoutException("request deadline exceeded")
     }
 
-    private suspend fun followRedirect(
-        request: Request,
-        response: Response,
-        deadline: Deadline,
-        redirectsLeft: Int,
-    ): HttpResponse {
+    private suspend fun awaitResponse(call: Call): Response =
+        suspendCancellableCoroutine { continuation ->
+            // 取消与 resume 之间到达的响应必须由本类关闭，否则连接不会被回收。
+            val pending = AtomicReference<Response?>(null)
+            // 只使用公开 API（Continuation.resume/resumeWithException）；tryResume/completeResume
+            // 是 kotlinx.coroutines 内部 API，不属于稳定契约。
+            continuation.invokeOnCancellation {
+                call.cancel()
+                pending.getAndSet(null)?.close()
+            }
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: java.io.IOException) {
+                    if (!continuation.isActive) return
+                    val mapped = if (e is InterruptedIOException) {
+                        ApiTimeoutException("network timeout", e)
+                    } else {
+                        e
+                    }
+                    continuation.resumeWithException(mapped)
+                }
+
+                override fun onResponse(call: Call, response: Response) {
+                    pending.set(response)
+                    if (!continuation.isActive) {
+                        pending.getAndSet(null)?.close()
+                        return
+                    }
+                    continuation.resume(response)
+                    // 对已取消的 continuation，resume 会被忽略且不触发 invokeOnCancellation，
+                    // 因此这里必须自己关闭响应。
+                    if (continuation.isCancelled) {
+                        pending.getAndSet(null)?.close()
+                    } else {
+                        pending.set(null)
+                    }
+                }
+            })
+        }
+
+    private fun followRedirectTarget(request: Request, response: Response, redirectsLeft: Int): Request {
         if (redirectsLeft <= 0) throw RedirectRefusedException("too many redirects")
         val location = response.header("Location")
             ?: throw RedirectRefusedException("redirect without Location")
@@ -208,41 +212,66 @@ class ApiTransport(
         if (body == null || body.isOneShot()) {
             throw RedirectRefusedException("request body cannot be replayed after a redirect")
         }
-        val next = request.newBuilder().url(target).build()
-        return execute(next, deadline, redirectsLeft - 1)
+        return request.newBuilder().url(target).build()
     }
 
-    private suspend fun readCapped(body: ResponseBody?): ByteArray {
+    /**
+     * 读取正文并返回原始字节。
+     *
+     * 阻塞读取放在可取消的 continuation 上：协程取消（回合截止时间或调用方取消）会立刻
+     * 关闭 OkHttp Call，从而打断阻塞的 stream.read，不依赖读取完成后才发现已取消。
+     */
+    private suspend fun readCapped(call: Call, body: ResponseBody?): ByteArray {
         if (body == null) return ByteArray(0)
         val declared = body.contentLength()
         if (declared > maxResponseBytes.toLong()) {
             throw ResponseTooLargeException("response exceeds " + maxResponseBytes + " bytes")
         }
-        return withContext(Dispatchers.IO) {
-            try {
-                val stream = body.byteStream()
-                val out = ByteArrayOutputStream(
-                    if (declared in 0..64L * 1024L) declared.toInt() else 16 * 1024,
-                )
-                val buffer = ByteArray(16 * 1024)
-                var total = 0
-                while (true) {
-                    currentCoroutineContext().ensureActive()
-                    val read = stream.read(buffer)
-                    if (read < 0) break
-                    total += read
-                    if (total > maxResponseBytes) {
-                        throw ResponseTooLargeException("response exceeds " + maxResponseBytes + " bytes")
+        return suspendCancellableCoroutine { continuation ->
+            continuation.invokeOnCancellation { call.cancel() }
+            if (continuation.isActive) {
+                READ_EXECUTOR.execute {
+                    try {
+                        continuation.resume(readBody(body, declared, continuation))
+                    } catch (error: Throwable) {
+                        // 已取消/已完成的 continuation 会忽略 resumeWithException；这里只负责退出。
+                        continuation.resumeWithException(mapBodyFailure(error))
                     }
-                    out.write(buffer, 0, read)
                 }
-                out.toByteArray()
-            } catch (e: InterruptedIOException) {
-                // OkHttp 的 readTimeout 在正文读取阶段也表现为 InterruptedIOException。
-                throw ApiTimeoutException("network timeout while reading the response", e)
             }
         }
     }
+
+    private fun readBody(
+        body: ResponseBody,
+        declared: Long,
+        continuation: CancellableContinuation<ByteArray>,
+    ): ByteArray {
+        val stream = body.byteStream()
+        val out = ByteArrayOutputStream(if (declared in 0..64L * 1024L) declared.toInt() else 16 * 1024)
+        val buffer = ByteArray(16 * 1024)
+        var total = 0
+        while (true) {
+            // 取消后即使连接还没完全关闭也不再继续读；关闭连接由 invokeOnCancellation 负责。
+            if (!continuation.isActive) throw IOException("response body read was cancelled")
+            val read = stream.read(buffer)
+            if (read < 0) break
+            total += read
+            if (total > maxResponseBytes) {
+                throw ResponseTooLargeException("response exceeds " + maxResponseBytes + " bytes")
+            }
+            out.write(buffer, 0, read)
+        }
+        return out.toByteArray()
+    }
+
+    private fun mapBodyFailure(error: Throwable): Throwable =
+        if (error is InterruptedIOException) {
+            // OkHttp 的 readTimeout/连接中断在正文读取阶段也表现为 InterruptedIOException。
+            ApiTimeoutException("network timeout while reading the response", error)
+        } else {
+            error
+        }
 
     private fun validateBaseUrl(raw: String): HttpUrl {
         val url = raw.trim().toHttpUrlOrNull()
@@ -296,11 +325,20 @@ class ApiTransport(
 
         internal val WAV_MEDIA_TYPE = "audio/wav".toMediaType()
 
+        /**
+         * 正文读取的工作线程：阻塞 read 必须放在独立线程上，取消时由 [Call.cancel] 打断。
+         * Dispatchers.IO 的线程池由 kotlinx.coroutines 管理，无需感知生命周期。
+         */
+        private val READ_EXECUTOR = Dispatchers.IO.asExecutor()
+
         internal fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
             .connectTimeout(CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
             .readTimeout(TURN_TIMEOUT_MS, TimeUnit.MILLISECONDS)
             .writeTimeout(TURN_TIMEOUT_MS, TimeUnit.MILLISECONDS)
             .callTimeout(TURN_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            // spec §10 只允许“最多一次重试”，由引擎的 callWithRetry 决定；OkHttp 的
+            // 自动重连重试会让一次 POST 变成多次，必须关闭。
+            .retryOnConnectionFailure(false)
             .followRedirects(false)
             .followSslRedirects(false)
             .build()
