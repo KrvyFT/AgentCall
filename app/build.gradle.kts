@@ -49,6 +49,10 @@ dependencies {
     // Xposed framework 由用户安装；compileOnly 保证 API 只参与编译，不进入 APK。
     compileOnly(libs.xposed.api)
 
+    // APP 侧控制协议负载（audio.channel/handover/脱敏配置）与 :core 使用同一 Gson 版本；
+    // :core 把 Gson 声明为 implementation，不会传递到 app 的编译类路径，因此这里显式声明。
+    implementation(libs.gson)
+
     // 远程语音回合：OkHttp 负责 HTTPS/超时/响应上限；MockWebServer 只在 JVM 单测中使用。
     implementation(libs.okhttp)
     testImplementation(libs.okhttp.mockwebserver)
