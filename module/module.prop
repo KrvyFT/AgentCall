@@ -1,0 +1,6 @@
+id=agentcall
+name=AgentCall
+version=1.0
+versionCode=1
+author=krvyft
+description=Google 电话 AI 接听助理：Xposed Hook、KernelSU 特权桥接与中文 WebUI。总开关默认关闭，未校准不自动接管。

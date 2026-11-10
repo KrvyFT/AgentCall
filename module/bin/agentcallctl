@@ -1,0 +1,101 @@
+#!/system/bin/sh
+# AgentCall 固定命令包装器（spec §6.4 / 任务 8）。
+#
+# 设计边界：
+# - 只转发固定六条命令给 org.krvyft.agentcall.bridge.AgentCallCli，没有任意 RPC、没有任意 shell。
+# - 配置写入只从 stdin 进入。本脚本从不接收、拼接或回显配置内容：密钥不可能出现在
+#   进程 argv、URL 或日志中。调用方（WebUI）把补丁 JSON 写入 root 私有文件后重定向 stdin：
+#     agentcallctl config-set < /data/adb/agentcall/inbox/config-set.json
+# - 本脚本不提供 base64/echo 之类的“保密”伪装，也从不读取或回显 stdin 内容。
+# - 错误一律输出单行机器可读 JSON；成功输出 CLI 的 JSON，调用方据此判定。
+#
+# 退出码与 CLI 对齐：0 成功；1 服务端错误；2 用法/负载错误；3 传输失败。
+
+set -u
+umask 077
+
+MODDIR=${0%/*}/..
+DATA_ROOT=/data/adb/agentcall
+INBOX_DIR=$DATA_ROOT/inbox
+LOG_DIR=$DATA_ROOT/logs
+BRIDGE_JAR=$MODDIR/bridge/agentcall-bridge.jar
+APP_PROCESS=/system/bin/app_process
+MAIN_CLASS=org.krvyft.agentcall.bridge.AgentCallCli
+
+emit_error() {
+    code=$1
+    message=$2
+    status=${3:-1}
+    printf '{"error":{"code":"%s","message":"%s"}}\n' "$code" "$message"
+    exit "$status"
+}
+
+if [ "$#" -lt 1 ]; then
+    emit_error "usage_invalid" "usage: status | config-get | config-set (JSON on stdin) | pair [packageName] | diagnose | shutdown" 2
+fi
+
+COMMAND=$1
+case "$COMMAND" in
+    status|config-get|config-set|diagnose|shutdown)
+        if [ "$#" -ne 1 ]; then
+            emit_error "usage_invalid" "$COMMAND takes no arguments; config-set reads JSON from stdin" 2
+        fi
+        ;;
+    pair)
+        if [ "$#" -gt 2 ]; then
+            emit_error "usage_invalid" "pair takes at most one package name" 2
+        fi
+        if [ "$#" -eq 2 ]; then
+            case "$2" in
+                ""|.*|*.|*..*) emit_error "payload_invalid" "package name is invalid" 2 ;;
+                *[!A-Za-z0-9._]*) emit_error "payload_invalid" "package name is invalid" 2 ;;
+            esac
+        fi
+        ;;
+    *)
+        emit_error "usage_invalid" "unknown command; allowed: status config-get config-set pair diagnose shutdown" 2
+        ;;
+esac
+
+# 配对、写入与关闭都要求 root；非 root 时 CLI 也会拒绝，这里先给出机器可读原因。
+if [ "$(id -u 2>/dev/null)" != "0" ]; then
+    emit_error "cli_requires_root" "agentcallctl must run as root" 2
+fi
+
+if [ ! -f "$BRIDGE_JAR" ]; then
+    emit_error "bridge_container_missing" "module bridge runtime container is missing" 3
+fi
+if [ ! -x "$APP_PROCESS" ]; then
+    emit_error "app_process_missing" "app_process is unavailable on this system" 3
+fi
+
+# root 私有目录 0700。WebUI 只往 inbox 写受控临时文件；agentcallctl 也在这里确保目录存在。
+mkdir -p "$DATA_ROOT" "$INBOX_DIR" "$LOG_DIR" 2>/dev/null
+chmod 0700 "$DATA_ROOT" "$INBOX_DIR" "$LOG_DIR" 2>/dev/null
+
+run_cli() {
+    "$APP_PROCESS" -Djava.class.path="$BRIDGE_JAR" /system/bin --nice-name=agentcall-cli "$MAIN_CLASS" "$@"
+}
+
+case "$COMMAND" in
+    config-set)
+        # stdin 只来自调用方的重定向；内容不经过任何 shell 拼接或回显。
+        run_cli config-set
+        result=$?
+        # 只清理本模块固定的 inbox 文件，不接触其它路径。
+        rm -f "$INBOX_DIR/config-set.json" 2>/dev/null
+        exit "$result"
+        ;;
+    pair)
+        if [ "$#" -eq 2 ]; then
+            run_cli pair "$2"
+        else
+            run_cli pair
+        fi
+        exit $?
+        ;;
+    *)
+        run_cli "$COMMAND"
+        exit $?
+        ;;
+esac

@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<meta name="referrer" content="no-referrer">
+<title>AgentCall 控制台</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<noscript><p class="noscript">此页面需要启用 JavaScript 才能读取 AgentCall 配置。</p></noscript>
+
+<header class="app-header">
+  <div class="app-title">
+    <h1>AgentCall</h1>
+    <span id="mode-badge" class="badge badge-neutral">正在检测…</span>
+  </div>
+  <p id="mode-note" class="mode-note"></p>
+</header>
+
+<div id="banner" class="banner" hidden>
+  <p id="banner-text" class="banner-text"></p>
+  <div id="banner-actions" class="banner-actions"></div>
+</div>
+
+<nav class="tabs" id="tabs" aria-label="页面切换">
+  <button type="button" class="tab is-active" data-page="overview" aria-current="page">概览</button>
+  <button type="button" class="tab" data-page="rules">规则</button>
+  <button type="button" class="tab" data-page="ai">AI</button>
+  <button type="button" class="tab" data-page="dialog">对话</button>
+  <button type="button" class="tab" data-page="diag">诊断</button>
+</nav>
+
+<main class="content">
+
+  <section id="page-overview" class="page is-active" aria-labelledby="h-overview">
+    <h2 id="h-overview">概览</h2>
+
+    <div class="card">
+      <div class="card-row">
+        <div>
+          <div class="card-label">总开关</div>
+          <div class="card-hint">默认关闭；关闭时不会自动接听任何来电。</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="ov-enabled" aria-label="总开关">
+          <span class="switch-track" aria-hidden="true"></span>
+        </label>
+      </div>
+      <div class="card-row card-row-end">
+        <span id="ov-enabled-state" class="value">—</span>
+        <button type="button" class="btn btn-primary btn-small" id="ov-save-switch" disabled>保存开关</button>
+      </div>
+      <ul class="issues" id="ov-issues"></ul>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Google 电话默认角色</div>
+      <div class="card-row">
+        <span id="ov-dialer-role" class="value">未检测</span>
+        <span class="badge badge-warn">未验证</span>
+      </div>
+      <p class="card-hint" id="ov-dialer-note">当前固定 CLI 不读取默认拨号角色；该检查属于 APK 启动向导，未获得设备证据前不会显示“已就绪”。</p>
+    </div>
+
+    <div class="card">
+      <div class="card-label">桥接服务</div>
+      <dl class="kv">
+        <dt>服务状态</dt><dd id="ov-bridge-state">—</dd>
+        <dt>配对状态</dt><dd id="ov-paired">—</dd>
+        <dt>桥接版本</dt><dd id="ov-bridge-version">—</dd>
+        <dt>协议版本</dt><dd id="ov-protocol-version">—</dd>
+        <dt>运行时长</dt><dd id="ov-uptime">—</dd>
+        <dt>活动/拒绝连接</dt><dd id="ov-connections">—</dd>
+      </dl>
+      <div class="card-row card-row-end">
+        <button type="button" class="btn btn-secondary btn-small" id="ov-refresh">刷新状态</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Hook 连通性</div>
+      <div class="card-row">
+        <span id="ov-hook-state" class="value">无法确认</span>
+        <span class="badge badge-warn">未验证</span>
+      </div>
+      <p class="card-hint" id="ov-hook-note">固定 CLI 的 status 只报告桥接自身的连接统计，不提供 Hook 心跳；Hook 侧状态由 APK 会话与诊断上报。</p>
+    </div>
+
+    <div class="card">
+      <div class="card-label">版本与环境</div>
+      <dl class="kv">
+        <dt>Google 电话版本</dt><dd id="ov-dialer-version">—</dd>
+        <dt>Android SDK</dt><dd id="ov-api-level">—</dd>
+        <dt>Xposed 框架</dt><dd id="ov-framework-version">—</dd>
+        <dt>内核</dt><dd id="ov-kernel-version">—</dd>
+        <dt>音频策略摘要</dt><dd id="ov-audio-policy">—</dd>
+      </dl>
+    </div>
+
+    <div class="card">
+      <div class="card-label">音频校准</div>
+      <dl class="kv">
+        <dt>下行提取</dt><dd id="ov-cal-downlink">—</dd>
+        <dt>上行注入</dt><dd id="ov-cal-uplink">—</dd>
+        <dt>麦克风隔离</dt><dd id="ov-cal-mic">—</dd>
+        <dt>特权终止</dt><dd id="ov-cal-term">—</dd>
+      </dl>
+      <p class="card-hint" id="ov-cal-note">校准需要真机手动测试电话（下行识别、对端听到测试语音、麦克风隔离、人工恢复、故障注入），本页不代为判定。</p>
+      <div class="card-row card-row-end">
+        <button type="button" class="btn btn-secondary btn-small" id="ov-goto-cal">查看校准入口</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-row">
+        <div class="card-label">最近错误</div>
+        <button type="button" class="btn btn-ghost btn-small" id="ov-clear-errors">清空</button>
+      </div>
+      <ul class="error-list" id="ov-errors"></ul>
+    </div>
+  </section>
+
+  <section id="page-rules" class="page" aria-labelledby="h-rules">
+    <h2 id="h-rules">规则 <span id="rules-dirty" class="chip chip-dirty" hidden>未保存</span></h2>
+
+    <div class="card">
+      <label class="field">
+        <span class="field-label">名单模式</span>
+        <select id="rules-mode">
+          <option value="BLACKLIST">黑名单：只接管命中项</option>
+          <option value="WHITELIST">白名单：接管名单外号码</option>
+          <option value="COMBINED">组合：黑名单命中或白名单外</option>
+        </select>
+      </label>
+
+      <label class="field">
+        <span class="field-label">黑名单（每行一个完整号码）</span>
+        <textarea id="rules-blacklist" rows="5" placeholder="+8613800138000"></textarea>
+      </label>
+
+      <label class="field">
+        <span class="field-label">白名单（每行一个完整号码）</span>
+        <textarea id="rules-whitelist" rows="5" placeholder="+8613800138000"></textarea>
+      </label>
+
+      <div id="rules-warn" class="notice notice-warn" hidden></div>
+
+      <div class="card-row">
+        <div>
+          <div class="card-label">未知/隐藏号码</div>
+          <div class="card-hint">默认人工处理，不自动接管。</div>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="rules-unknown" aria-label="接管未知号码">
+          <span class="switch-track" aria-hidden="true"></span>
+        </label>
+      </div>
+
+      <div class="grid-2">
+        <label class="field">
+          <span class="field-label">号码地区码</span>
+          <input type="text" id="rules-region" inputmode="latin" maxlength="2" placeholder="CN">
+        </label>
+        <label class="field">
+          <span class="field-label">接听延迟（毫秒，0–30000）</span>
+          <input type="number" id="rules-delay" min="0" max="30000" step="500">
+        </label>
+      </div>
+
+      <label class="field">
+        <span class="field-label">最长 AI 通话（毫秒，10000–600000）</span>
+        <input type="number" id="rules-duration" min="10000" max="600000" step="1000">
+      </label>
+    </div>
+
+    <div class="card">
+      <div class="card-label">号码匹配试算</div>
+      <p class="card-hint">本地近似匹配（仅做字符规范化与名单比对）；最终命中以后端 libphonenumber 规范化结果为准。</p>
+      <div class="card-row">
+        <input type="tel" id="rules-trial-number" placeholder="+8613800138000" aria-label="试算号码">
+        <button type="button" class="btn btn-secondary btn-small" id="rules-trial-btn">试算</button>
+      </div>
+      <ul class="issues" id="rules-trial-result"></ul>
+    </div>
+
+    <ul class="issues" id="rules-issues"></ul>
+    <div class="actions">
+      <button type="button" class="btn btn-primary" id="rules-save">保存规则</button>
+    </div>
+  </section>
+
+  <section id="page-ai" class="page" aria-labelledby="h-ai">
+    <h2 id="h-ai">AI <span id="ai-dirty" class="chip chip-dirty" hidden>未保存</span></h2>
+
+    <div class="notice notice-warn">
+      密钥只显示“已配置/未配置”，不显示原值。真实连通性测试会使用你的密钥向所填地址发起真实请求并可能计费；WebUI 无法读取密钥，因此真实测试必须在 AgentCall APK 内执行（本页不代为发起）。
+    </div>
+
+    <div class="card" data-endpoint="asr">
+      <div class="card-label">语音识别（ASR）</div>
+      <label class="field">
+        <span class="field-label">HTTPS Base URL</span>
+        <input type="text" id="ai-asr-url" inputmode="latin" placeholder="必须在 APK 内填写真实地址">
+      </label>
+      <label class="field">
+        <span class="field-label">模型</span>
+        <input type="text" id="ai-asr-model" inputmode="latin" placeholder="模型名">
+      </label>
+      <div class="secret-row">
+        <span class="field-label">密钥</span>
+        <span id="ai-asr-secret-state" class="badge badge-neutral">未配置</span>
+        <button type="button" class="btn btn-ghost btn-small" id="ai-asr-replace">替换</button>
+        <button type="button" class="btn btn-ghost btn-small" id="ai-asr-clear">清除</button>
+        <button type="button" class="btn btn-ghost btn-small" id="ai-asr-cancel" hidden>取消</button>
+      </div>
+      <div id="ai-asr-secret-wrap" class="field" hidden>
+        <span class="field-label">新密钥（仅在保存前驻留内存，经 stdin 提交）</span>
+        <input type="password" id="ai-asr-secret" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="card-row card-row-end">
+        <button type="button" class="btn btn-secondary btn-small" id="ai-asr-test">校验地址格式</button>
+      </div>
+      <ul class="issues" id="ai-asr-issues"></ul>
+    </div>
+
+    <div class="card" data-endpoint="llm">
+      <div class="card-label">对话模型（LLM）</div>
+      <label class="field">
+        <span class="field-label">HTTPS Base URL</span>
+        <input type="text" id="ai-llm-url" inputmode="latin" placeholder="必须在 APK 内填写真实地址">
+      </label>
+      <label class="field">
+        <span class="field-label">模型</span>
+        <input type="text" id="ai-llm-model" inputmode="latin" placeholder="模型名">
+      </label>
+      <div class="secret-row">
+        <span class="field-label">密钥</span>
+        <span id="ai-llm-secret-state" class="badge badge-neutral">未配置</span>
+        <button type="button" class="btn btn-ghost btn-small" id="ai-llm-replace">替换</button>
+        <button type="button" class="btn btn-ghost btn-small" id="ai-llm-clear">清除</button>
+        <button type="button" class="btn btn-ghost btn-small" id="ai-llm-cancel" hidden>取消</button>
+      </div>
+      <div id="ai-llm-secret-wrap" class="field" hidden>
+        <span class="field-label">新密钥（仅在保存前驻留内存，经 stdin 提交）</span>
+        <input type="password" id="ai-llm-secret" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="card-row card-row-end">
+        <button type="button" class="btn btn-secondary btn-small" id="ai-llm-test">校验地址格式</button>
+      </div>
+      <ul class="issues" id="ai-llm-issues"></ul>
+    </div>
+
+    <div class="card" data-endpoint="tts">
+      <div class="card-label">语音合成（TTS）</div>
+      <label class="field">
+        <span class="field-label">HTTPS Base URL</span>
+        <input type="text" id="ai-tts-url" inputmode="latin" placeholder="必须在 APK 内填写真实地址">
+      </label>
+      <label class="field">
+        <span class="field-label">模型</span>
+        <input type="text" id="ai-tts-model" inputmode="latin" placeholder="模型名">
+      </label>
+      <div class="secret-row">
+        <span class="field-label">密钥</span>
+        <span id="ai-tts-secret-state" class="badge badge-neutral">未配置</span>
+        <button type="button" class="btn btn-ghost btn-small" id="ai-tts-replace">替换</button>
+        <button type="button" class="btn btn-ghost btn-small" id="ai-tts-clear">清除</button>
+        <button type="button" class="btn btn-ghost btn-small" id="ai-tts-cancel" hidden>取消</button>
+      </div>
+      <div id="ai-tts-secret-wrap" class="field" hidden>
+        <span class="field-label">新密钥（仅在保存前驻留内存，经 stdin 提交）</span>
+        <input type="password" id="ai-tts-secret" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="card-row card-row-end">
+        <button type="button" class="btn btn-secondary btn-small" id="ai-tts-test">校验地址格式</button>
+      </div>
+      <ul class="issues" id="ai-tts-issues"></ul>
+    </div>
+
+    <div class="card">
+      <label class="field">
+        <span class="field-label">音色</span>
+        <input type="text" id="ai-voice" inputmode="latin" maxlength="64" placeholder="供应商音色标识，例如 alloy">
+      </label>
+    </div>
+
+    <ul class="issues" id="ai-issues"></ul>
+    <div class="actions">
+      <button type="button" class="btn btn-primary" id="ai-save">保存 AI 配置</button>
+    </div>
+  </section>
+
+  <section id="page-dialog" class="page" aria-labelledby="h-dialog">
+    <h2 id="h-dialog">对话 <span id="dlg-dirty" class="chip chip-dirty" hidden>未保存</span></h2>
+
+    <div class="card">
+      <label class="field">
+        <span class="field-label">开场白</span>
+        <textarea id="dlg-opening" rows="3"></textarea>
+      </label>
+      <label class="field">
+        <span class="field-label">提示词</span>
+        <textarea id="dlg-prompt" rows="8" placeholder="模型只生成对话，不执行工具、设备命令或身份/付款操作。"></textarea>
+      </label>
+      <label class="field">
+        <span class="field-label">语速（0.5–2.0）</span>
+        <input type="number" id="dlg-speed" min="0.5" max="2" step="0.05">
+      </label>
+      <p class="card-hint">语音与文本会发送给配置的供应商；本模块不保存原始录音或完整转写。</p>
+    </div>
+
+    <ul class="issues" id="dlg-issues"></ul>
+    <div class="actions">
+      <button type="button" class="btn btn-primary" id="dlg-save">保存对话配置</button>
+    </div>
+  </section>
+
+  <section id="page-diag" class="page" aria-labelledby="h-diag">
+    <h2 id="h-diag">诊断</h2>
+
+    <div class="card">
+      <div class="card-label">服务操作</div>
+      <div class="actions actions-wrap">
+        <button type="button" class="btn btn-secondary btn-small" id="diag-refresh">重试连接</button>
+        <button type="button" class="btn btn-secondary btn-small" id="diag-repair">重新配对</button>
+        <button type="button" class="btn btn-secondary btn-small" id="diag-reload">重新加载配置</button>
+        <button type="button" class="btn btn-warn btn-small" id="diag-disable">停用自动接管</button>
+        <button type="button" class="btn btn-danger btn-small" id="diag-shutdown">关闭桥接服务</button>
+      </div>
+      <ul class="issues" id="diag-issues"></ul>
+    </div>
+
+    <div class="card">
+      <div class="card-label">环境（来自 bridge diagnose）</div>
+      <dl class="kv" id="diag-env"></dl>
+    </div>
+
+    <div class="card">
+      <div class="card-label">能力状态</div>
+      <dl class="kv" id="diag-cap"></dl>
+      <p class="card-hint">“接口可见/待对端确认”都不等于可用；只有真机手动测试电话通过后才会标记已验证。</p>
+    </div>
+
+    <div class="card">
+      <div class="card-label">校准入口</div>
+      <p class="card-hint">校准在 APK 的校准页完成：手持无耳机路由、手动测试电话、麦克风隔离与人工恢复验证。任一环境字段变化都会使旧校准失效；本页不代替真机验证。</p>
+      <div class="actions actions-wrap">
+        <button type="button" class="btn btn-secondary btn-small" id="diag-cal-open">展开校准检查清单</button>
+        <button type="button" class="btn btn-secondary btn-small" id="diag-copy-report">复制脱敏诊断</button>
+      </div>
+      <ul class="checklist" id="diag-cal-list" hidden>
+        <li>绑定 ROM 指纹 / SDK / 内核 / Google 电话版本 / 框架版本 / 桥接版本</li>
+        <li>下行识别：对端语音可被本机识别</li>
+        <li>上行注入：对端能听到测试语音</li>
+        <li>麦克风隔离：隔离期间环境声音不进入上行</li>
+        <li>人工恢复：交还后人工通话正常</li>
+        <li>故障注入：进程失效后通话被终止且麦克风恢复</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <div class="card-row">
+        <div class="card-label">脱敏日志</div>
+        <div class="actions actions-wrap">
+          <button type="button" class="btn btn-ghost btn-small" id="diag-log-refresh">刷新</button>
+          <button type="button" class="btn btn-ghost btn-small" id="diag-log-copy">复制</button>
+        </div>
+      </div>
+      <pre class="log" id="diag-log">（尚未读取）</pre>
+    </div>
+
+    <div class="card">
+      <div class="card-label">已知限制（未验证）</div>
+      <ul class="limits">
+        <li>真实桥接路径未在真机 KernelSU WebView 中验证（当前环境无设备）。</li>
+        <li>默认拨号角色、Hook 心跳、真实 API 连通性由 APK 侧检查，本页不伪造结论。</li>
+        <li>日志读取依赖管理器的文件接口；接口不可用时本页显示只读提示而不是假数据。</li>
+      </ul>
+    </div>
+  </section>
+
+</main>
+
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+<script src="bridge.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

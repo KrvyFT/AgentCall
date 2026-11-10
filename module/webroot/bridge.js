@@ -1,0 +1,1164 @@
+/**
+ * AgentCall WebUI 的桥接层：固定 CLI 映射 + 配置 schema + 展示安全helpers。
+ *
+ * 设计边界（spec §6.4/§11）：
+ * - 只调用模块内固定包装器 agentcallctl 的六条命令；不存在任意 shell 拼接路径，
+ *   任何用户输入都不会进入命令行字符串。
+ * - 配置写入只从 stdin 进入：本文件把补丁 JSON 写入 root 私有目录下的临时文件，
+ *   命令行里只有固定的重定向路径，因此密钥不可能出现在 argv。
+ * - 管理器缺少受控文件写入接口（ksu.io）时进入 readonly：读取可用，保存一律拒绝，
+ *   绝不降级成 base64/echo 之类会泄漏到 argv 的“替代方案”，也绝不显示保存成功。
+ * - 没有管理器注入接口（普通浏览器）时进入 demo：数据显式标注为演示，保存失败。
+ * - 保存成功与否以后端回读为准（revision 与密钥状态同时核对），不伪造成功。
+ */
+(function (root, factory) {
+  "use strict";
+  var api = factory(root);
+  root.AgentCallBridge = api;
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = api;
+  }
+})(typeof globalThis !== "undefined" ? globalThis : this, function (root) {
+  "use strict";
+
+  var MODULE_ID = "agentcall";
+  var MODULE_ROOT = "/data/adb/modules/" + MODULE_ID;
+  var DATA_ROOT = "/data/adb/agentcall";
+  var INBOX_DIR = DATA_ROOT + "/inbox";
+  var INBOX_PATH = INBOX_DIR + "/config-set.json";
+  var LOG_PATH = DATA_ROOT + "/logs/service.log";
+  var MODULE_DIR_PATTERN = /^\/data\/adb\/modules\/[A-Za-z][A-Za-z0-9._-]+$/;
+  var OPERATIONS = ["status", "config-get", "config-set", "pair", "diagnose", "shutdown"];
+  /** 与 AgentCallCli.MAX_STDIN_BYTES 一致：控制帧 64 KiB 预留 1 KiB。 */
+  var CONFIG_WRITE_LIMIT_BYTES = 64 * 1024 - 1024;
+  var COMMAND_TIMEOUT_MS = 20000;
+  var LOG_TAIL_BYTES = 64 * 1024;
+  var MAX_LOG_ENTRIES = 50;
+  var DEFAULT_OPENING_LINE = "您好，我是机主的 AI 电话助理，请问有什么事？";
+  var MODES = ["BLACKLIST", "WHITELIST", "COMBINED"];
+  var SECRET_KINDS = ["ASR", "LLM", "TTS"];
+  var ENDPOINT_FIELDS = { ASR: "asr", LLM: "llm", TTS: "tts" };
+  var SPEED_MIN = 0.5;
+  var SPEED_MAX = 2.0;
+  /** 与后端 RpcCodec.PATCH_KEYS 保持一致的固定字段表（漂移由测试守护）。 */
+  var PATCH_KEYS = [
+    "enabled",
+    "mode",
+    "blacklist",
+    "whitelist",
+    "region",
+    "handleUnknownNumbers",
+    "answerDelayMs",
+    "maxCallDurationMs",
+    "enabledPhoneAccounts",
+    "asr",
+    "llm",
+    "tts",
+    "voice",
+    "speed",
+    "openingLine",
+    "prompt",
+    "secrets",
+  ];
+
+  var CODE = {
+    BRIDGE_UNAVAILABLE: "bridge_unavailable",
+    SECRET_TRANSPORT_UNSUPPORTED: "secret_transport_unsupported",
+    MODULE_DIR_UNRESOLVED: "module_dir_unresolved",
+    UNSUPPORTED_OPERATION: "unsupported_operation",
+    PAYLOAD_NOT_ALLOWED: "payload_not_allowed",
+    PAYLOAD_INVALID: "payload_invalid",
+    TRANSPORT_FAILED: "transport_failed",
+    RESPONSE_INVALID: "response_invalid",
+    SAVE_UNCONFIRMED: "save_unconfirmed",
+    INBOX_WRITE_FAILED: "inbox_write_failed",
+    IO_UNAVAILABLE: "io_unavailable",
+    VALIDATION_FAILED: "validation_failed",
+  };
+
+  var ERROR_TEXT = {
+    bridge_unavailable: "未检测到 KernelSU 管理器的桥接接口（普通浏览器或未注入）。当前为只读演示状态，无法保存。",
+    secret_transport_unsupported: "当前管理器不提供受控文件写入接口，无法在不暴露密钥的前提下提交配置，已拒绝保存。",
+    module_dir_unresolved: "无法确认模块安装目录，已拒绝执行任何命令。",
+    unsupported_operation: "只允许 status/config-get/config-set/pair/diagnose/shutdown 六条固定命令。",
+    payload_not_allowed: "该命令不接受参数。",
+    payload_invalid: "请求内容不符合后端固定字段表，已被拒绝。",
+    transport_failed: "无法连接 AgentCall 桥接服务（未启动或已退出）。",
+    response_invalid: "桥接服务返回的内容无法解析。",
+    save_unconfirmed: "写入结果未被后端回读确认，因此不视为已保存。",
+    inbox_write_failed: "无法写入受控临时文件，已拒绝保存。",
+    io_unavailable: "当前管理器没有可用的文件接口。",
+    validation_failed: "表单未通过校验。",
+    config_conflict: "配置已被其他入口修改（版本冲突），本次没有覆盖写入。请重新加载后再保存。",
+    config_invalid: "配置未通过后端校验，请按提示修正。",
+    secret_invalid: "密钥不能为空。",
+    peer_version_mismatch: "APK 或 Google 电话已升级，配对已失效，必须重新配对。",
+    peer_unpaired: "桥接服务尚未配对，请先重新配对。",
+    pair_requires_root: "首次配对必须由 root CLI 执行。",
+    cli_container_missing: "模块内缺少桥接运行时容器，请重新安装模块。",
+    config_schema_unsupported: "配置 schema 比当前桥接版本更新，已拒绝覆盖。",
+    config_corrupt: "配置文件损坏，需要人工处理。",
+    config_storage_failed: "配置文件读写失败。",
+    config_root_rejected: "配置目录不在允许范围内。",
+    pairing_invalid: "配对记录字段非法，需要重新配对。",
+    forbidden: "当前角色无权调用该命令。",
+    usage_invalid: "命令用法不正确。",
+    response_id_mismatch: "响应与请求不匹配，已丢弃。",
+  };
+
+  // ---------------------------------------------------------------- 通用工具
+
+  function hasOwn(object, key) {
+    return Object.prototype.hasOwnProperty.call(object, key);
+  }
+
+  function toText(value) {
+    return value === null || value === undefined ? "" : String(value);
+  }
+
+  function trimText(value) {
+    return toText(value).replace(/^\s+|\s+$/g, "");
+  }
+
+  function isPlainObject(value) {
+    return !!value && typeof value === "object" && !Array.isArray(value);
+  }
+
+  function isIntegerValue(value) {
+    return typeof value === "number" && isFinite(value) && Math.floor(value) === value;
+  }
+
+  function utf8ByteLength(text) {
+    var source = toText(text);
+    if (typeof TextEncoder !== "undefined") {
+      return new TextEncoder().encode(source).length;
+    }
+    if (typeof encodeURIComponent === "function") {
+      return encodeURIComponent(source).replace(/%[0-9A-F]{2}/gi, "_").length;
+    }
+    return source.length;
+  }
+
+  function toBase64Utf8(text) {
+    var source = toText(text);
+    if (typeof TextEncoder !== "undefined" && typeof btoa === "function") {
+      var bytes = new TextEncoder().encode(source);
+      var binary = "";
+      for (var index = 0; index < bytes.length; index += 1) {
+        binary += String.fromCharCode(bytes[index]);
+      }
+      return btoa(binary);
+    }
+    if (typeof Buffer !== "undefined") {
+      return Buffer.from(source, "utf8").toString("base64");
+    }
+    throw new Error("no base64 encoder");
+  }
+
+  function fromBase64Utf8(text) {
+    var source = toText(text);
+    if (source === "") return "";
+    if (typeof TextDecoder !== "undefined" && typeof atob === "function") {
+      var binary = atob(source);
+      var bytes = new Uint8Array(binary.length);
+      for (var index = 0; index < binary.length; index += 1) {
+        bytes[index] = binary.charCodeAt(index);
+      }
+      return new TextDecoder("utf-8").decode(bytes);
+    }
+    if (typeof Buffer !== "undefined") {
+      return Buffer.from(source, "base64").toString("utf8");
+    }
+    throw new Error("no base64 decoder");
+  }
+
+  // 展示层：文本一律写 textContent，HTML 只做转义字符串，任何地方都不拼 innerHTML。
+  function setText(element, value) {
+    if (!element) return;
+    element.textContent = value === null || value === undefined ? "" : String(value);
+  }
+
+  function escapeHtml(value) {
+    return toText(value).replace(/[&<>"']/g, function (character) {
+      if (character === "&") return "&amp;";
+      if (character === "<") return "&lt;";
+      if (character === ">") return "&gt;";
+      if (character === '"') return "&quot;";
+      return "&#39;";
+    });
+  }
+
+  /** 脱敏文本：把疑似凭据字段的值替换为 ***，用于日志/导出前的二次过滤。 */
+  function redactText(value) {
+    return toText(value)
+      .replace(/((?:api[_-]?key|apikey|authorization|bearer|token|secret|password)\s*[:=]\s*)("?[^\s",}]+)/gi, "$1***")
+      .replace(/(sk-[A-Za-z0-9_-]{8,})/g, "sk-***");
+  }
+
+  function parseList(text) {
+    var raw = toText(text);
+    if (trimText(raw) === "") return { entries: [], dropped: 0 };
+    var pieces = raw.split(/[\n,;]+/);
+    var entries = [];
+    var dropped = 0;
+    for (var index = 0; index < pieces.length; index += 1) {
+      var value = trimText(pieces[index]);
+      if (value === "") {
+        dropped += 1;
+        continue;
+      }
+      entries.push(value);
+    }
+    return { entries: entries, dropped: dropped };
+  }
+
+  /** 保守的号码比较键：去掉空白/标点，00 前缀按国际写法展开；无法比较返回 null。 */
+  function normalizeDigits(raw) {
+    var source = toText(raw);
+    var kept = source.replace(/[^0-9+]/g, "");
+    if (kept === "") return null;
+    var plusIndex = kept.indexOf("+");
+    if (plusIndex > 0) return null;
+    if (kept.split("+").length > 2) return null;
+    var digits = kept.replace(/\+/g, "");
+    if (digits === "") return null;
+    if (kept.charAt(0) !== "+" && digits.indexOf("00") === 0) {
+      digits = digits.slice(2);
+    }
+    if (digits === "") return null;
+    return digits;
+  }
+
+  function isPhoneLike(raw) {
+    var source = trimText(raw);
+    if (source === "") return false;
+    if (!/^\+?[0-9\s\-().]+$/.test(source)) return false;
+    var digits = source.replace(/[^0-9]/g, "");
+    return digits.length >= 3;
+  }
+
+  function parseIntegerField(value) {
+    var text = trimText(value);
+    if (text === "" || !/^-?[0-9]+$/.test(text)) return null;
+    var parsed = Number(text);
+    return isIntegerValue(parsed) ? parsed : null;
+  }
+
+  function validateBaseUrl(url) {
+    var value = trimText(url);
+    if (value === "") return null;
+    if (/\s/.test(value)) {
+      return { code: "ENDPOINT_URL_INVALID", message: "地址中不能包含空白字符" };
+    }
+    var parsed;
+    try {
+      parsed = new URL(value);
+    } catch (error) {
+      return { code: "ENDPOINT_URL_INVALID", message: "地址不是合法 URL（需要完整 scheme 与主机名）" };
+    }
+    if (parsed.protocol !== "https:") {
+      return { code: "ENDPOINT_HTTPS_REQUIRED", message: "远程 API 必须使用 HTTPS" };
+    }
+    if (!parsed.hostname) {
+      return { code: "ENDPOINT_URL_INVALID", message: "地址缺少主机名" };
+    }
+    if (parsed.username || parsed.password) {
+      return { code: "ENDPOINT_URL_INVALID", message: "地址中不能内嵌用户名或密码" };
+    }
+    return null;
+  }
+
+  // ---------------------------------------------------------------- 管理器探测
+
+  function readModuleDir(ksu) {
+    if (!ksu || typeof ksu.moduleInfo !== "function") return MODULE_ROOT;
+    var raw;
+    try {
+      raw = ksu.moduleInfo();
+    } catch (error) {
+      return MODULE_ROOT;
+    }
+    var parsed;
+    try {
+      parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+    } catch (error) {
+      return null;
+    }
+    if (!isPlainObject(parsed)) return null;
+    var directory = parsed.moduleDir;
+    if (typeof directory === "string" && MODULE_DIR_PATTERN.test(directory)) return directory;
+    return null;
+  }
+
+  function detectSupport(scope) {
+    var source = scope || root || {};
+    var ksu = source.ksu;
+    if (!ksu || typeof ksu !== "object") {
+      return { mode: "demo", hasBridge: false, hasExec: false, hasIo: false, ioVersion: 0, moduleDir: null, reason: "no_manager_bridge" };
+    }
+    if (typeof ksu.exec !== "function") {
+      return { mode: "demo", hasBridge: false, hasExec: false, hasIo: false, ioVersion: 0, moduleDir: null, reason: "exec_missing" };
+    }
+    var moduleDir = readModuleDir(ksu);
+    var ioVersion = 0;
+    var hasIo = false;
+    if (typeof ksu.io === "function") {
+      try {
+        var io = ksu.io();
+        if (io && typeof io.FileOutputStream === "function" && typeof io.File === "function") {
+          ioVersion = typeof io.version === "function" ? Number(io.version()) || 0 : 0;
+          hasIo = ioVersion >= 1;
+        }
+      } catch (error) {
+        hasIo = false;
+        ioVersion = 0;
+      }
+    }
+    if (moduleDir === null) {
+      return { mode: "readonly", hasBridge: true, hasExec: true, hasIo: hasIo, ioVersion: ioVersion, moduleDir: null, reason: "module_dir_unresolved" };
+    }
+    if (!hasIo) {
+      return { mode: "readonly", hasBridge: true, hasExec: true, hasIo: false, ioVersion: 0, moduleDir: moduleDir, reason: "io_missing" };
+    }
+    return { mode: "kernelsu", hasBridge: true, hasExec: true, hasIo: true, ioVersion: ioVersion, moduleDir: moduleDir, reason: "ok" };
+  }
+
+  // ---------------------------------------------------------------- 固定命令执行
+
+  function parseCliResult(raw) {
+    if (!raw) return { ok: false, code: CODE.TRANSPORT_FAILED, message: ERROR_TEXT.transport_failed };
+    var stdout = toText(raw.stdout);
+    var lines = stdout.split(/\r?\n/);
+    var line = "";
+    for (var index = 0; index < lines.length; index += 1) {
+      if (trimText(lines[index]) !== "") line = trimText(lines[index]);
+    }
+    if (line === "") {
+      return { ok: false, code: CODE.TRANSPORT_FAILED, message: ERROR_TEXT.transport_failed };
+    }
+    var parsed;
+    try {
+      parsed = JSON.parse(line);
+    } catch (error) {
+      return { ok: false, code: CODE.RESPONSE_INVALID, message: ERROR_TEXT.response_invalid };
+    }
+    if (isPlainObject(parsed) && isPlainObject(parsed.error)) {
+      var code = toText(parsed.error.code) || "unknown_error";
+      return { ok: false, code: code, message: toText(parsed.error.message) || errorText(code) };
+    }
+    if (raw.errno !== 0 && raw.errno !== undefined) {
+      return { ok: false, code: CODE.TRANSPORT_FAILED, message: ERROR_TEXT.transport_failed };
+    }
+    if (!isPlainObject(parsed)) {
+      return { ok: false, code: CODE.RESPONSE_INVALID, message: ERROR_TEXT.response_invalid };
+    }
+    return { ok: true, data: parsed };
+  }
+
+  function errorText(code) {
+    if (hasOwn(ERROR_TEXT, code)) return ERROR_TEXT[code];
+    return "桥接返回错误：" + toText(code);
+  }
+
+  function createBridge(options) {
+    var opts = options || {};
+    var scope = opts.scope || root || {};
+    var ksu = hasOwn(opts, "ksu") ? opts.ksu : scope.ksu;
+    var support = detectSupport({ ksu: ksu });
+    var state = { revision: null, logs: [], sequence: 0 };
+
+    function recordLog(operation, errno, code) {
+      state.logs.push({
+        at: Date.now(),
+        operation: operation,
+        errno: typeof errno === "number" ? errno : -1,
+        code: toText(code),
+      });
+      if (state.logs.length > MAX_LOG_ENTRIES) state.logs.shift();
+    }
+
+    function reject(code, message) {
+      recordLog("client", -1, code);
+      return Promise.resolve({ ok: false, code: code, message: message || errorText(code), source: "none" });
+    }
+
+    function controlPath() {
+      return support.moduleDir + "/bin/agentcallctl";
+    }
+
+    function commandFor(operation) {
+      var control = controlPath();
+      if (operation === "config-set") {
+        // 固定字符串：只有固定重定向路径，没有用户数据，也没有任何密钥。
+        return control + " config-set < " + INBOX_PATH;
+      }
+      return control + " " + operation;
+    }
+
+    function runCommand(command) {
+      return new Promise(function (resolve) {
+        var callbackName = "__agentcall_cb_" + Date.now() + "_" + state.sequence;
+        state.sequence += 1;
+        var settled = false;
+        var timer = null;
+
+        function finish(result) {
+          if (settled) return;
+          settled = true;
+          if (timer && typeof timer.unref === "function") timer.unref();
+          try {
+            delete root[callbackName];
+          } catch (error) {
+            /* 清理失败不影响结果 */
+          }
+          resolve(result);
+        }
+
+        root[callbackName] = function (errno, stdout, stderr) {
+          finish({ errno: Number(errno) || 0, stdout: toText(stdout), stderr: toText(stderr) });
+        };
+
+        timer = setTimeout(function () {
+          finish({ errno: -1, stdout: "", stderr: "" });
+        }, COMMAND_TIMEOUT_MS);
+        if (timer && typeof timer.unref === "function") timer.unref();
+
+        try {
+          var returned = ksu.exec(command, "{}", callbackName);
+          if (returned && typeof returned.then === "function") {
+            returned.then(
+              function (value) {
+                finish({ errno: Number(value && value.errno) || 0, stdout: toText(value && value.stdout), stderr: toText(value && value.stderr) });
+              },
+              function () {
+                finish({ errno: -1, stdout: "", stderr: "" });
+              },
+            );
+          }
+        } catch (error) {
+          finish({ errno: -1, stdout: "", stderr: "" });
+        }
+      });
+    }
+
+    function writeInbox(text) {
+      var io;
+      try {
+        io = ksu.io();
+      } catch (error) {
+        return { ok: false, reason: "io" };
+      }
+      try {
+        var directory = io.File(INBOX_DIR);
+        if (!directory.exists() && !directory.mkdirs() && !directory.exists()) {
+          return { ok: false, reason: "directory" };
+        }
+        var target = io.File(INBOX_PATH);
+        if (target.exists() && typeof target.isSymlink === "function" && target.isSymlink()) {
+          target.delete();
+        } else if (target.exists()) {
+          target.delete();
+        }
+        var output = io.FileOutputStream();
+        var streamId = output.open(INBOX_PATH, false);
+        if (!streamId) return { ok: false, reason: "open" };
+        var written = output.write(streamId, toBase64Utf8(text));
+        var flushed = output.flush(streamId);
+        var closed = output.close(streamId);
+        if (!written || !flushed || !closed) return { ok: false, reason: "write" };
+        // 纵深防御：临时文件从 0644 收紧到 0000，只有 root（CAP_DAC_OVERRIDE）能读；
+        // 目录本身由 agentcallctl 以 0700 创建，未授权进程无法穿越。
+        try {
+          var created = io.File(INBOX_PATH);
+          if (created && typeof created.setReadable === "function") {
+            created.setReadable(false, false);
+            created.setWritable(false, false);
+          }
+        } catch (error) {
+          /* 权限收紧失败不阻断保存：目录仍为 0700 且文件随即删除 */
+        }
+        return { ok: true };
+      } catch (error) {
+        return { ok: false, reason: "exception" };
+      }
+    }
+
+    function deleteInbox() {
+      try {
+        var file = ksu.io().File(INBOX_PATH);
+        if (file.exists()) file.delete();
+      } catch (error) {
+        /* 删除失败不改变保存结论 */
+      }
+    }
+
+    function verifyWrite(data, expectedRevision, secrets) {
+      if (!isPlainObject(data) || !isPlainObject(data.config)) return CODE.SAVE_UNCONFIRMED;
+      if (data.config.revision !== expectedRevision + 1) return CODE.SAVE_UNCONFIRMED;
+      var states = isPlainObject(data.secrets) ? data.secrets : {};
+      if (isPlainObject(secrets)) {
+        for (var index = 0; index < SECRET_KINDS.length; index += 1) {
+          var kind = SECRET_KINDS[index];
+          var intent = secrets[kind];
+          if (!isPlainObject(intent)) continue;
+          if (intent.action === "replace" && states[kind] !== "CONFIGURED") return CODE.SAVE_UNCONFIRMED;
+          if (intent.action === "clear" && states[kind] !== "MISSING") return CODE.SAVE_UNCONFIRMED;
+        }
+      }
+      return null;
+    }
+
+    function saveConfig(payload) {
+      var validated = validateConfigWritePayload(payload);
+      if (!validated.ok) return reject(CODE.PAYLOAD_INVALID, validated.message);
+      var text = JSON.stringify(validated.write);
+      if (utf8ByteLength(text) > CONFIG_WRITE_LIMIT_BYTES) {
+        return reject(CODE.PAYLOAD_INVALID, "配置补丁超过 stdin 上限（" + CONFIG_WRITE_LIMIT_BYTES + " 字节）");
+      }
+      var written = writeInbox(text);
+      if (!written.ok) {
+        recordLog("config-set", -1, CODE.INBOX_WRITE_FAILED);
+        return reject(CODE.INBOX_WRITE_FAILED, errorText(CODE.INBOX_WRITE_FAILED) + "（" + written.reason + "）");
+      }
+      return runCommand(commandFor("config-set"))
+        .then(function (raw) {
+          deleteInbox();
+          var parsed = parseCliResult(raw);
+          recordLog("config-set", raw.errno, parsed.ok ? "ok" : parsed.code);
+          if (!parsed.ok) {
+            var failure = { ok: false, code: parsed.code, message: parsed.message, source: "bridge" };
+            if (parsed.code === "config_conflict") failure.conflict = true;
+            return failure;
+          }
+          var problem = verifyWrite(parsed.data, validated.write.expectedRevision, validated.write.patch && validated.write.patch.secrets);
+          if (problem) {
+            return { ok: false, code: problem, message: errorText(problem), source: "bridge" };
+          }
+          state.revision = parsed.data.config.revision;
+          return { ok: true, source: "bridge", data: parsed.data };
+        })
+        .then(function (result) {
+          deleteInbox();
+          return result;
+        });
+    }
+
+    function call(operation, payload) {
+      var name = toText(operation);
+      if (OPERATIONS.indexOf(name) === -1) {
+        return reject(CODE.UNSUPPORTED_OPERATION, errorText(CODE.UNSUPPORTED_OPERATION) + "（收到：" + name.slice(0, 32) + "）");
+      }
+      if (support.mode === "demo") return reject(CODE.BRIDGE_UNAVAILABLE);
+      if (support.moduleDir === null) return reject(CODE.MODULE_DIR_UNRESOLVED);
+      if (name === "config-set") {
+        if (!support.hasIo) return reject(CODE.SECRET_TRANSPORT_UNSUPPORTED);
+        return saveConfig(payload);
+      }
+      if (payload !== undefined && payload !== null) {
+        return reject(CODE.PAYLOAD_NOT_ALLOWED);
+      }
+      return runCommand(commandFor(name)).then(function (raw) {
+        var parsed = parseCliResult(raw);
+        recordLog(name, raw.errno, parsed.ok ? "ok" : parsed.code);
+        if (!parsed.ok) return { ok: false, code: parsed.code, message: parsed.message, source: "bridge" };
+        if (name === "config-get" && parsed.data.config && typeof parsed.data.config.revision === "number") {
+          state.revision = parsed.data.config.revision;
+        }
+        return { ok: true, source: "bridge", data: parsed.data };
+      });
+    }
+
+    function readLog(maxBytes) {
+      if (support.mode === "demo") return Promise.resolve({ ok: false, code: CODE.BRIDGE_UNAVAILABLE, message: errorText(CODE.BRIDGE_UNAVAILABLE) });
+      if (!support.hasIo || support.moduleDir === null) {
+        return Promise.resolve({ ok: false, code: CODE.IO_UNAVAILABLE, message: errorText(CODE.IO_UNAVAILABLE) });
+      }
+      try {
+        var io = ksu.io();
+        var file = io.File(LOG_PATH);
+        if (!file.exists() || !file.isFile()) return Promise.resolve({ ok: true, text: "", truncated: false });
+        var limit = typeof maxBytes === "number" && maxBytes > 0 ? Math.min(maxBytes, LOG_TAIL_BYTES) : LOG_TAIL_BYTES;
+        var text = "";
+        var truncated = false;
+        if (typeof io.RandomAccessFile === "function") {
+          var access = io.RandomAccessFile();
+          var handle = access.open(LOG_PATH, "r");
+          if (handle) {
+            var length = access.length(handle);
+            var start = Math.max(0, length - limit);
+            truncated = start > 0;
+            if (typeof access.seek === "function") access.seek(handle, start);
+            text = fromBase64Utf8(access.readBytes(handle, Math.min(limit, length - start)));
+            access.close(handle);
+          }
+        } else {
+          var input = io.FileInputStream();
+          var stream = input.open(LOG_PATH);
+          if (stream) {
+            text = fromBase64Utf8(input.read(stream, limit));
+            input.close(stream);
+          }
+        }
+        return Promise.resolve({ ok: true, text: redactText(text), truncated: truncated });
+      } catch (error) {
+        return Promise.resolve({ ok: false, code: CODE.IO_UNAVAILABLE, message: errorText(CODE.IO_UNAVAILABLE) });
+      }
+    }
+
+    return {
+      mode: support.mode,
+      support: support,
+      call: call,
+      readLog: readLog,
+      logs: function () {
+        return state.logs.slice();
+      },
+      lastKnownRevision: function () {
+        return state.revision;
+      },
+      controlPath: controlPath,
+    };
+  }
+
+  // ---------------------------------------------------------------- 负载校验
+
+  function validateSecretsPatch(secrets) {
+    if (!isPlainObject(secrets)) return "secrets 必须是对象";
+    var kinds = Object.keys(secrets);
+    for (var index = 0; index < kinds.length; index += 1) {
+      var kind = kinds[index];
+      if (SECRET_KINDS.indexOf(kind) === -1) return "未知密钥类别：" + kind;
+      var intent = secrets[kind];
+      if (!isPlainObject(intent)) return "密钥动作必须是对象";
+      var keys = Object.keys(intent);
+      if (intent.action === "keep" || intent.action === "clear") {
+        if (keys.length !== 1) return "keep/clear 动作不接受额外字段";
+      } else if (intent.action === "replace") {
+        if (keys.length !== 2 || keys.indexOf("value") === -1) return "replace 动作只接受 value";
+        if (typeof intent.value !== "string" || trimText(intent.value) === "") return "替换密钥的值不能为空";
+      } else {
+        return "密钥动作必须是 keep/replace/clear";
+      }
+    }
+    return null;
+  }
+
+  function validateEndpointPatch(value, field) {
+    if (!isPlainObject(value)) return field + " 必须是对象或 null";
+    var keys = Object.keys(value);
+    for (var index = 0; index < keys.length; index += 1) {
+      if (keys[index] !== "baseUrl" && keys[index] !== "model") return field + " 只接受 baseUrl/model";
+    }
+    if (typeof value.baseUrl !== "string" || typeof value.model !== "string") return field + " 字段必须是字符串";
+    return null;
+  }
+
+  function validateConfigWritePayload(payload) {
+    if (!isPlainObject(payload)) return { ok: false, message: "需要 { expectedRevision, patch } 对象" };
+    var keys = Object.keys(payload);
+    if (keys.length !== 2 || !hasOwn(payload, "expectedRevision") || !hasOwn(payload, "patch")) {
+      return { ok: false, message: "只接受 expectedRevision 与 patch 两个字段" };
+    }
+    if (!isIntegerValue(payload.expectedRevision) || payload.expectedRevision < 0) {
+      return { ok: false, message: "expectedRevision 必须是非负整数" };
+    }
+    if (!isPlainObject(payload.patch)) return { ok: false, message: "patch 必须是对象" };
+    var patch = payload.patch;
+    var patchKeys = Object.keys(patch);
+    for (var index = 0; index < patchKeys.length; index += 1) {
+      if (PATCH_KEYS.indexOf(patchKeys[index]) === -1) return { ok: false, message: "未知配置字段：" + patchKeys[index] };
+    }
+    if (hasOwn(patch, "enabled") && typeof patch.enabled !== "boolean") return { ok: false, message: "enabled 必须是布尔值" };
+    if (hasOwn(patch, "mode") && MODES.indexOf(patch.mode) === -1) return { ok: false, message: "mode 取值非法" };
+    if (hasOwn(patch, "region") && typeof patch.region !== "string") return { ok: false, message: "region 必须是字符串" };
+    if (hasOwn(patch, "handleUnknownNumbers") && typeof patch.handleUnknownNumbers !== "boolean") {
+      return { ok: false, message: "handleUnknownNumbers 必须是布尔值" };
+    }
+    if (hasOwn(patch, "answerDelayMs") && !isIntegerValue(patch.answerDelayMs)) return { ok: false, message: "answerDelayMs 必须是整数" };
+    if (hasOwn(patch, "maxCallDurationMs") && !isIntegerValue(patch.maxCallDurationMs)) {
+      return { ok: false, message: "maxCallDurationMs 必须是整数" };
+    }
+    if (hasOwn(patch, "voice") && typeof patch.voice !== "string") return { ok: false, message: "voice 必须是字符串" };
+    if (hasOwn(patch, "openingLine") && typeof patch.openingLine !== "string") return { ok: false, message: "openingLine 必须是字符串" };
+    if (hasOwn(patch, "prompt") && typeof patch.prompt !== "string") return { ok: false, message: "prompt 必须是字符串" };
+    if (hasOwn(patch, "speed") && (typeof patch.speed !== "number" || !isFinite(patch.speed))) {
+      return { ok: false, message: "speed 必须是有限数值" };
+    }
+    if (hasOwn(patch, "enabledPhoneAccounts")) {
+      if (!Array.isArray(patch.enabledPhoneAccounts)) return { ok: false, message: "enabledPhoneAccounts 必须是数组" };
+      for (var phoneIndex = 0; phoneIndex < patch.enabledPhoneAccounts.length; phoneIndex += 1) {
+        if (typeof patch.enabledPhoneAccounts[phoneIndex] !== "string") return { ok: false, message: "enabledPhoneAccounts 必须是字符串数组" };
+      }
+    }
+    var lists = ["blacklist", "whitelist"];
+    for (var listIndex = 0; listIndex < lists.length; listIndex += 1) {
+      var listName = lists[listIndex];
+      if (!hasOwn(patch, listName)) continue;
+      if (!Array.isArray(patch[listName])) return { ok: false, message: listName + " 必须是数组" };
+      for (var itemIndex = 0; itemIndex < patch[listName].length; itemIndex += 1) {
+        if (typeof patch[listName][itemIndex] !== "string") return { ok: false, message: listName + " 必须是字符串数组" };
+      }
+    }
+    var endpoints = ["asr", "llm", "tts"];
+    for (var endpointIndex = 0; endpointIndex < endpoints.length; endpointIndex += 1) {
+      if (!hasOwn(patch, endpoints[endpointIndex])) continue;
+      // 后端只接受 {baseUrl,model} 对象；null 会被 RpcCodec 拒绝，清除端点必须用空对象值。
+      var endpointProblem = validateEndpointPatch(patch[endpoints[endpointIndex]], endpoints[endpointIndex]);
+      if (endpointProblem) return { ok: false, message: endpointProblem };
+    }
+    if (hasOwn(patch, "secrets")) {
+      var secretProblem = validateSecretsPatch(patch.secrets);
+      if (secretProblem) return { ok: false, message: secretProblem };
+    }
+    return { ok: true, write: { expectedRevision: payload.expectedRevision, patch: patch } };
+  }
+
+  // ---------------------------------------------------------------- 表单与补丁
+
+  function formFromRedacted(redacted) {
+    var config = (redacted && redacted.config) || {};
+    var secrets = (redacted && redacted.secrets) || {};
+
+    function endpointFor(kind) {
+      var raw = config[ENDPOINT_FIELDS[kind]];
+      return {
+        baseUrl: raw && typeof raw.baseUrl === "string" ? raw.baseUrl : "",
+        model: raw && typeof raw.model === "string" ? raw.model : "",
+        secretState: secrets[kind] === "CONFIGURED" ? "CONFIGURED" : "MISSING",
+        secretIntent: "keep",
+        secretValue: "",
+      };
+    }
+
+    return {
+      enabled: config.enabled === true,
+      mode: MODES.indexOf(config.mode) === -1 ? "BLACKLIST" : config.mode,
+      blacklistText: Array.isArray(config.blacklist) ? config.blacklist.join("\n") : "",
+      whitelistText: Array.isArray(config.whitelist) ? config.whitelist.join("\n") : "",
+      region: typeof config.region === "string" && config.region !== "" ? config.region : "CN",
+      handleUnknownNumbers: config.handleUnknownNumbers === true,
+      answerDelayMs: isIntegerValue(config.answerDelayMs) ? String(config.answerDelayMs) : "3000",
+      maxCallDurationMs: isIntegerValue(config.maxCallDurationMs) ? String(config.maxCallDurationMs) : "180000",
+      asr: endpointFor("ASR"),
+      llm: endpointFor("LLM"),
+      tts: endpointFor("TTS"),
+      voice: typeof config.voice === "string" ? config.voice : "",
+      speed: typeof config.speed === "number" && isFinite(config.speed) ? String(config.speed) : "1",
+      openingLine: typeof config.openingLine === "string" ? config.openingLine : DEFAULT_OPENING_LINE,
+      prompt: typeof config.prompt === "string" ? config.prompt : "",
+    };
+  }
+
+  function issue(code, field, message, blocking) {
+    return { code: code, field: field, message: message, blocking: blocking !== false };
+  }
+
+  function issueText(code, field) {
+    var label = field ? "（" + field + "）" : "";
+    if (code === "RULE_NUMBER_OVERLAP") return "同一号码规范化后同时出现在黑名单与白名单" + label;
+    if (code === "RULE_NUMBER_UNPARSEABLE") return "号码无法可靠解析或规范化为完整号码" + label;
+    if (code === "REGION_UNSUPPORTED") return "地区代码不受支持" + label;
+    if (code === "ANSWER_DELAY_OUT_OF_RANGE") return "接听延迟必须在 0–30000 ms" + label;
+    if (code === "MAX_CALL_DURATION_OUT_OF_RANGE") return "最长 AI 通话必须在 10000–600000 ms" + label;
+    if (code === "CONFIG_CONFLICT") return "配置版本冲突，本次没有覆盖写入；请重新加载再保存";
+    if (code === "PEER_VERSION_MISMATCH") return "APK 或 Google 电话已升级，配对失效，需要重新配对";
+    if (code === "SECRET_EMPTY") return "密钥不能为空";
+    return "后端拒绝该配置" + label;
+  }
+
+  function validateForm(form) {
+    var issues = [];
+    var source = form || {};
+
+    if (MODES.indexOf(source.mode) === -1) {
+      issues.push(issue("MODE_INVALID", "mode", "名单模式只能是黑名单/白名单/组合"));
+    }
+
+    var region = trimText(source.region).toUpperCase();
+    if (!/^[A-Z]{2}$/.test(region)) {
+      issues.push(issue("REGION_UNSUPPORTED", "region", "地区必须是两位 ISO 国家/地区代码，例如 CN"));
+    }
+
+    var delay = parseIntegerField(source.answerDelayMs);
+    if (delay === null) {
+      issues.push(issue("ANSWER_DELAY_NOT_INTEGER", "answerDelayMs", "接听延迟必须是整数毫秒"));
+    } else if (delay < 0 || delay > 30000) {
+      issues.push(issue("ANSWER_DELAY_OUT_OF_RANGE", "answerDelayMs", "接听延迟必须在 0–30000 ms"));
+    }
+
+    var duration = parseIntegerField(source.maxCallDurationMs);
+    if (duration === null) {
+      issues.push(issue("MAX_CALL_DURATION_NOT_INTEGER", "maxCallDurationMs", "最长通话必须是整数毫秒"));
+    } else if (duration < 10000 || duration > 600000) {
+      issues.push(issue("MAX_CALL_DURATION_OUT_OF_RANGE", "maxCallDurationMs", "最长 AI 通话必须在 10000–600000 ms"));
+    }
+
+    var blacklist = parseList(source.blacklistText);
+    var whitelist = parseList(source.whitelistText);
+    [["blacklist", blacklist], ["whitelist", whitelist]].forEach(function (pair) {
+      pair[1].entries.forEach(function (entry) {
+        if (!isPhoneLike(entry)) {
+          issues.push(issue("RULE_NUMBER_UNPARSEABLE", pair[0], "名单项无法解析为号码：" + entry.slice(0, 32)));
+        }
+      });
+    });
+    var blacklistKeys = {};
+    blacklist.entries.forEach(function (entry) {
+      var key = normalizeDigits(entry);
+      if (key) blacklistKeys[key] = entry;
+    });
+    whitelist.entries.forEach(function (entry) {
+      var key = normalizeDigits(entry);
+      if (key && hasOwn(blacklistKeys, key)) {
+        issues.push(issue("RULE_NUMBER_OVERLAP", "blacklist,whitelist", "号码同时出现在两个名单：" + entry.slice(0, 32)));
+      }
+    });
+
+    SECRET_KINDS.forEach(function (kind) {
+      var field = ENDPOINT_FIELDS[kind];
+      var endpoint = source[field] || {};
+      var baseUrl = trimText(endpoint.baseUrl);
+      var model = trimText(endpoint.model);
+      var urlProblem = validateBaseUrl(baseUrl);
+      if (urlProblem) issues.push(issue(urlProblem.code, field + ".baseUrl", urlProblem.message));
+      if ((baseUrl === "") !== (model === "")) {
+        issues.push(issue("ENDPOINT_INCOMPLETE", field, "地址与模型必须同时填写或同时留空；同时留空表示清除该项 API"));
+      }
+      var intent = endpoint.secretIntent || "keep";
+      if (intent === "replace") {
+        if (trimText(endpoint.secretValue) === "") {
+          issues.push(issue("SECRET_EMPTY", field + ".secretValue", "替换密钥时不能留空"));
+        } else if (trimText(endpoint.secretValue) !== toText(endpoint.secretValue)) {
+          issues.push(issue("SECRET_WHITESPACE", field + ".secretValue", "密钥首尾包含空白，已按去除空白后的值提交", false));
+        }
+      } else if (intent === "clear") {
+        if (trimText(endpoint.secretValue) !== "") {
+          issues.push(issue("SECRET_CONFLICT", field + ".secretValue", "不能同时清除并替换密钥"));
+        }
+      } else if (intent !== "keep") {
+        issues.push(issue("SECRET_INTENT_INVALID", field + ".secretIntent", "密钥动作非法"));
+      }
+    });
+
+    var speed = toText(source.speed).trim();
+    if (speed === "" || !isFinite(Number(speed))) {
+      issues.push(issue("SPEED_INVALID", "speed", "语速必须是数值"));
+    } else if (Number(speed) < SPEED_MIN || Number(speed) > SPEED_MAX) {
+      issues.push(issue("SPEED_OUT_OF_RANGE", "speed", "语速必须在 " + SPEED_MIN + "–" + SPEED_MAX));
+    }
+
+    if (toText(source.openingLine).length > 200) {
+      issues.push(issue("OPENING_LINE_LONG", "openingLine", "开场白超过 200 字，可能影响回合时延", false));
+    }
+    if (toText(source.prompt).length > 4000) {
+      issues.push(issue("PROMPT_LONG", "prompt", "提示词超过 4000 字，可能超出回合预算", false));
+    }
+    if (toText(source.voice).length > 64) {
+      issues.push(issue("VOICE_LONG", "voice", "音色标识超过 64 字符", false));
+    }
+
+    if (source.mode === "WHITELIST" || source.mode === "COMBINED") {
+      if (whitelist.entries.length === 0) {
+        issues.push(issue("WHITELIST_EMPTY", "whitelist", "空白名单：该模式下会接管所有可识别的号码", false));
+      }
+    }
+    if (source.mode === "BLACKLIST" && blacklist.entries.length === 0) {
+      issues.push(issue("BLACKLIST_EMPTY", "blacklist", "空黑名单：不会自动接管任何号码", false));
+    }
+
+    return {
+      issues: issues,
+      blocking: issues.filter(function (item) {
+        return item.blocking;
+      }),
+      warnings: issues.filter(function (item) {
+        return !item.blocking;
+      }),
+    };
+  }
+
+  function endpointPatch(endpoint) {
+    var baseUrl = trimText((endpoint || {}).baseUrl);
+    var model = trimText((endpoint || {}).model);
+    // 空端点表示清除（后端会规范化为 null，绝不持久化空端点）。
+    return { baseUrl: baseUrl, model: model };
+  }
+
+  function secretsPatch(form) {
+    var patch = {};
+    SECRET_KINDS.forEach(function (kind) {
+      var endpoint = (form || {})[ENDPOINT_FIELDS[kind]] || {};
+      var intent = endpoint.secretIntent || "keep";
+      if (intent === "replace") {
+        patch[kind] = { action: "replace", value: trimText(endpoint.secretValue) };
+      } else if (intent === "clear") {
+        patch[kind] = { action: "clear" };
+      } else {
+        patch[kind] = { action: "keep" };
+      }
+    });
+    return patch;
+  }
+
+  function buildConfigPatch(form, baseline) {
+    var validation = validateForm(form);
+    if (validation.blocking.length > 0) {
+      return {
+        ok: false,
+        code: CODE.VALIDATION_FAILED,
+        issues: validation.issues,
+        blocking: validation.blocking,
+        warnings: validation.warnings,
+      };
+    }
+    var baseConfig = baseline && baseline.config ? baseline.config : {};
+    var revision = isIntegerValue(baseConfig.revision) ? baseConfig.revision : 0;
+    var patch = {
+      enabled: source(form, "enabled") === true,
+      mode: form.mode,
+      blacklist: parseList(form.blacklistText).entries,
+      whitelist: parseList(form.whitelistText).entries,
+      region: trimText(form.region).toUpperCase(),
+      handleUnknownNumbers: form.handleUnknownNumbers === true,
+      answerDelayMs: parseIntegerField(form.answerDelayMs),
+      maxCallDurationMs: parseIntegerField(form.maxCallDurationMs),
+      asr: endpointPatch(form.asr),
+      llm: endpointPatch(form.llm),
+      tts: endpointPatch(form.tts),
+      voice: trimText(form.voice),
+      speed: Number(toText(form.speed).trim()),
+      openingLine: toText(form.openingLine),
+      prompt: toText(form.prompt),
+      secrets: secretsPatch(form),
+    };
+    // 页面不编辑 PhoneAccount，因此补丁绝不覆盖它：避免把 APK 写入的启用项清空。
+    return {
+      ok: true,
+      issues: validation.issues,
+      warnings: validation.warnings,
+      write: { expectedRevision: revision, patch: patch },
+    };
+  }
+
+  function source(object, key) {
+    return object ? object[key] : undefined;
+  }
+
+  function issuesFromBackend(code, message) {
+    var text = toText(message);
+    var name = toText(code);
+    if (name === "config_invalid") {
+      var marker = "config rejected:";
+      var index = text.indexOf(marker);
+      if (index === -1) {
+        return [issue("CONFIG_INVALID", "", "配置未通过后端校验", true)];
+      }
+      var rest = trimText(text.slice(index + marker.length));
+      var pieces = rest.split(/,(?=[A-Z][A-Z0-9_]*@)/);
+      var mapped = [];
+      pieces.forEach(function (piece) {
+        var entry = trimText(piece);
+        if (entry === "") return;
+        var at = entry.indexOf("@");
+        var issueCode = at === -1 ? entry : entry.slice(0, at);
+        var field = at === -1 ? "" : entry.slice(at + 1);
+        mapped.push(issue(issueCode, field, issueText(issueCode, field), true));
+      });
+      return mapped.length > 0 ? mapped : [issue("CONFIG_INVALID", "", "配置未通过后端校验", true)];
+    }
+    if (name === "config_conflict") {
+      return [issue("CONFIG_CONFLICT", "", issueText("CONFIG_CONFLICT"), true)];
+    }
+    if (name === "secret_invalid") {
+      return [issue("SECRET_EMPTY", "secrets", issueText("SECRET_EMPTY"), true)];
+    }
+    if (name === "peer_version_mismatch" || name === "peer_unpaired") {
+      return [issue("PEER_VERSION_MISMATCH", "pairing", issueText("PEER_VERSION_MISMATCH"), true)];
+    }
+    if (name === "transport_failed" || name === "bridge_unavailable") {
+      return [issue("BRIDGE_UNREACHABLE", "", "桥接服务不可达，配置没有保存", true)];
+    }
+    return [issue(name || "UNKNOWN_ERROR", "", errorText(name), true)];
+  }
+
+  function isRepairRequired(code) {
+    return code === "peer_version_mismatch" || code === "peer_unpaired";
+  }
+
+  /**
+   * 总开关是独立写入：只提交 { enabled }，不夹带同一页面上其它未保存字段，
+   * 尤其不提交正在编辑的密钥意图。开关不应因别的表单字段非法而被阻断。
+   */
+  function buildEnabledPatch(enabled, baseline) {
+    if (typeof enabled !== "boolean") {
+      return { ok: false, code: CODE.PAYLOAD_INVALID, message: "enabled 必须是布尔值" };
+    }
+    var baseConfig = baseline && baseline.config ? baseline.config : {};
+    var revision = isIntegerValue(baseConfig.revision) ? baseConfig.revision : 0;
+    return { ok: true, write: { expectedRevision: revision, patch: { enabled: enabled } } };
+  }
+
+  function saveEnabled(bridge, enabled, baseline) {
+    var built = buildEnabledPatch(enabled, baseline);
+    if (!built.ok) {
+      return Promise.resolve({ ok: false, code: built.code, message: built.message, issues: [], warnings: [], source: "client" });
+    }
+    return Promise.resolve(bridge.call("config-set", built.write)).then(function (result) {
+      if (!result || result.ok !== true) {
+        var code = (result && result.code) || CODE.TRANSPORT_FAILED;
+        return {
+          ok: false,
+          code: code,
+          message: (result && result.message) || errorText(code),
+          issues: issuesFromBackend(code, result && result.message),
+          warnings: [],
+          source: (result && result.source) || "none",
+          conflict: code === "config_conflict",
+          repair: isRepairRequired(code),
+        };
+      }
+      return {
+        ok: true,
+        source: "bridge",
+        data: result.data,
+        form: formFromRedacted(result.data),
+        warnings: [],
+        issues: [],
+      };
+    });
+  }
+
+  function saveConfig(bridge, form, baseline) {
+    var built = buildConfigPatch(form, baseline);
+    if (!built.ok) {
+      return Promise.resolve({
+        ok: false,
+        code: built.code,
+        issues: built.blocking,
+        warnings: built.warnings,
+        source: "client",
+      });
+    }
+    return Promise.resolve(bridge.call("config-set", built.write)).then(function (result) {
+      if (!result || result.ok !== true) {
+        var code = (result && result.code) || CODE.TRANSPORT_FAILED;
+        return {
+          ok: false,
+          code: code,
+          message: (result && result.message) || errorText(code),
+          issues: issuesFromBackend(code, result && result.message),
+          warnings: built.warnings,
+          source: (result && result.source) || "none",
+          conflict: code === "config_conflict",
+          repair: isRepairRequired(code),
+        };
+      }
+      return {
+        ok: true,
+        source: "bridge",
+        data: result.data,
+        form: formFromRedacted(result.data),
+        warnings: built.warnings,
+        issues: [],
+      };
+    });
+  }
+
+  // ---------------------------------------------------------------- 演示数据
+
+  var DEMO = {
+    demo: true,
+    note: "演示数据：当前没有连接 KernelSU 管理器的真实桥接，下列数值为模拟示例，任何保存都会被拒绝。",
+    status: {
+      bridgeVersion: "0.0-demo",
+      protocolVersion: 1,
+      revision: 0,
+      enabled: false,
+      paired: false,
+      uptimeMs: 0,
+      activeConnections: 0,
+      rejectedConnections: 0,
+    },
+    config: {
+      config: {
+        enabled: false,
+        mode: "BLACKLIST",
+        blacklist: [],
+        whitelist: [],
+        region: "CN",
+        handleUnknownNumbers: false,
+        answerDelayMs: 3000,
+        maxCallDurationMs: 180000,
+        enabledPhoneAccounts: [],
+        asr: null,
+        llm: null,
+        tts: null,
+        voice: "",
+        speed: 1.0,
+        openingLine: DEFAULT_OPENING_LINE,
+        prompt: "",
+        revision: 0,
+      },
+      secrets: { ASR: "MISSING", LLM: "MISSING", TTS: "MISSING" },
+    },
+    diagnose: {
+      environment: {
+        apiLevel: 0,
+        romFingerprint: "demo",
+        kernelVersion: "demo",
+        dialerPackageVersion: "demo",
+        frameworkVersion: "demo",
+        bridgeVersion: "0.0-demo",
+        audioPolicyDigest: "demo",
+        simCarrier: "unknown",
+        transport: "unknown",
+        route: "unknown",
+      },
+      downlinkExtraction: "NOT_DETECTED",
+      uplinkInjection: "NOT_DETECTED",
+      microphoneIsolation: "NOT_DETECTED",
+      privilegedTermination: "NOT_DETECTED",
+      checkedAtMs: 0,
+      notes: "demo",
+    },
+  };
+
+  return {
+    MODULE_ID: MODULE_ID,
+    MODULE_ROOT: MODULE_ROOT,
+    DATA_ROOT: DATA_ROOT,
+    INBOX_DIR: INBOX_DIR,
+    INBOX_PATH: INBOX_PATH,
+    LOG_PATH: LOG_PATH,
+    OPERATIONS: OPERATIONS.slice(),
+    PATCH_KEYS: PATCH_KEYS.slice(),
+    SECRET_KINDS: SECRET_KINDS.slice(),
+    ENDPOINT_FIELDS: ENDPOINT_FIELDS,
+    MODES: MODES.slice(),
+    CONFIG_WRITE_LIMIT_BYTES: CONFIG_WRITE_LIMIT_BYTES,
+    DEFAULT_OPENING_LINE: DEFAULT_OPENING_LINE,
+    CODE: CODE,
+    DEMO: DEMO,
+    detectSupport: detectSupport,
+    createBridge: createBridge,
+    validateConfigWritePayload: validateConfigWritePayload,
+    formFromRedacted: formFromRedacted,
+    validateForm: validateForm,
+    buildConfigPatch: buildConfigPatch,
+    buildEnabledPatch: buildEnabledPatch,
+    saveEnabled: saveEnabled,
+    saveConfig: saveConfig,
+    issuesFromBackend: issuesFromBackend,
+    isRepairRequired: isRepairRequired,
+    errorText: errorText,
+    validateBaseUrl: validateBaseUrl,
+    normalizeDigits: normalizeDigits,
+    isPhoneLike: isPhoneLike,
+    parseList: parseList,
+    setText: setText,
+    escapeHtml: escapeHtml,
+    redactText: redactText,
+    toBase64Utf8: toBase64Utf8,
+    fromBase64Utf8: fromBase64Utf8,
+  };
+});
