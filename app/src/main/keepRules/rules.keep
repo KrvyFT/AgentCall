@@ -12,6 +12,14 @@
 # 入口包内由发现/注册逻辑按名引用的类型保留名字，便于诊断与后续 Hook 接线。
 -keepnames class org.krvyft.agentcall.hook.** { *; }
 
+# Telecom 的 Call.Callback 音频路由回调是 @SystemApi：公开 SDK 里看不到，但运行时存在，
+# 我们按 JVM 签名声明以接受框架虚分派。R8 看不到这条虚调用，必须显式保留成员
+# （onStateChanged 等公开回调是库方法覆写，R8 自己会保留；这里只补隐藏的两个）。
+-keepclassmembers class org.krvyft.agentcall.hook.** {
+    public void onCallAudioStateChanged(android.telecom.Call, android.telecom.CallAudioState);
+    public void onCallEndpointChanged(android.telecom.Call, android.telecom.CallEndpoint);
+}
+
 # If your project uses WebView with JS, uncomment the following
 # and specify the fully qualified class name to the JavaScript interface
 # class:
