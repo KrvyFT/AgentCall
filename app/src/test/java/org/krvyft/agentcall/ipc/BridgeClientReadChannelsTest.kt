@@ -73,8 +73,12 @@ class BridgeClientReadChannelsTest {
         assertNull(facts.supervisionPhase)
         unknown.close()
 
-        // 字段整体缺失同样只能是 null，不能猜成 true。
-        val missing = client(FakeControlTransport { request -> RpcResponse(id = request.id, payload = "{}") })
+        // 已知字段整体缺失同样只能是 null，不能猜成 true（空负载 {} 另见下面的不可用用例）。
+        val missing = client(
+            FakeControlTransport { request ->
+                RpcResponse(id = request.id, payload = "{\"supervisionPhase\":\"IDLE\"}")
+            },
+        )
         val empty = (missing.status() as BridgeRead.Available).value
         assertNull(empty.hookConnected)
         assertNull(empty.dialerDefaultRole)
@@ -256,17 +260,14 @@ class BridgeClientReadChannelsTest {
         assertEquals(BridgeRead.Unavailable(BridgeClient.ERROR_EVENTS_PAYLOAD), notAnArray.pollEvents(0L))
         notAnArray.close()
 
-        val badEvent = client(
+        // 缺少 nextSeq/dropped 的批次是整体非法的（游标不可信）。
+        val badBatch = client(
             FakeControlTransport { request ->
-                RpcResponse(
-                    id = request.id,
-                    payload = "{\"events\":[{\"seq\":1,\"sessionId\":{\"processEpoch\":\"e\"}," +
-                        "\"state\":\"RINGING\"}],\"nextSeq\":1,\"dropped\":0}",
-                )
+                RpcResponse(id = request.id, payload = "{\"events\":[],\"nextSeq\":1}")
             },
         )
-        assertEquals(BridgeRead.Unavailable(BridgeClient.ERROR_EVENTS_PAYLOAD), badEvent.pollEvents(0L))
-        badEvent.close()
+        assertEquals(BridgeRead.Unavailable(BridgeClient.ERROR_EVENTS_PAYLOAD), badBatch.pollEvents(0L))
+        badBatch.close()
     }
 
     @Test
@@ -275,6 +276,119 @@ class BridgeClientReadChannelsTest {
         val client = client(control)
         assertEquals(BridgeRead.Unavailable(BridgeClient.ERROR_EVENTS_PAYLOAD), client.pollEvents(-1L))
         assertTrue("an invalid cursor must never reach the bridge", control.requests.isEmpty())
+        client.close()
+    }
+
+    // ------------------------------------------- 桥接进程代次（7B3 FIX ROUND 1 / CRITICAL）
+
+    /**
+     * status.uptimeMs 是**进程重启信标**：它此前被解析后丢弃，于是桥接重启后 APP 既收不到
+     * cursor_ahead（新进程的 latest 可能已超过旧游标），也没有任何其它信号——新进程的前
+     * lastSeq 条事件（通常包含新来电的 RINGING）被静默跳过。这里只锁定“信标被如实读出”，
+     * 重启判定与基线重置在 SessionEventPollerTest 里用假桥接验证。
+     */
+    @Test
+    fun statusSurfacesTheBridgeUptimeBeaconAndRejectsAnEmptyPayload() = runTest {
+        val control = FakeControlTransport { request ->
+            RpcResponse(id = request.id, payload = STATUS_PAYLOAD)
+        }
+        val client = client(control)
+        assertEquals(1L, (client.status() as BridgeRead.Available).value.uptimeMs)
+        assertEquals(BridgeRead.Available(1L), client.uptimeMs())
+        client.close()
+
+        // 空负载 {} 不是“status 可用，字段恰好缺失”：它必须整体不可用（statusAvailable=false）。
+        val empty = client(FakeControlTransport { request -> RpcResponse(id = request.id, payload = "{}") })
+        assertEquals(BridgeRead.Unavailable(BridgeClient.ERROR_STATUS_PAYLOAD), empty.status())
+        assertEquals(BridgeRead.Unavailable(BridgeClient.ERROR_STATUS_PAYLOAD), empty.uptimeMs())
+        empty.close()
+
+        // 只有未知键的负载同样不是 status。
+        val unknown = client(
+            FakeControlTransport { request -> RpcResponse(id = request.id, payload = "{\"nope\":1}") },
+        )
+        assertEquals(BridgeRead.Unavailable(BridgeClient.ERROR_STATUS_PAYLOAD), unknown.status())
+        unknown.close()
+    }
+
+    @Test
+    fun aMissingUptimeBeaconIsUnavailableInsteadOfZero() = runTest {
+        val client = client(
+            FakeControlTransport { request ->
+                RpcResponse(id = request.id, payload = "{\"supervisionPhase\":\"IDLE\"}")
+            },
+        )
+        assertEquals(BridgeRead.Unavailable(BridgeClient.ERROR_STATUS_PAYLOAD), client.uptimeMs())
+        client.close()
+    }
+
+    // ------------------------------------------- 批次容错（7B3 FIX ROUND 1 / minors）
+
+    /**
+     * 一条结构非法的事件（缺 callId/seq）只丢弃它自己并计数：绝不因此拒绝整批——否则一条
+     * 坏事件会让同一批里的真实 RINGING 一起消失（并让轮询器反复读到同一批）。
+     */
+    @Test
+    fun oneStructurallyInvalidEventIsSkippedAndCountedInsteadOfRejectingTheBatch() = runTest {
+        val payload = "{\"events\":[" +
+            "{\"seq\":1,\"sessionId\":{\"processEpoch\":\"epoch-1\",\"callId\":\"call-a\"}," +
+            "\"state\":\"RINGING\",\"presentation\":\"ALLOWED\",\"direction\":\"INCOMING\"," +
+            "\"phoneAccount\":\"acct-1\",\"isEmergency\":false,\"isConference\":false," +
+            "\"activeCallCount\":1,\"number\":\"+8613800138000\",\"source\":\"UNKNOWN\"}," +
+            "{\"seq\":2,\"sessionId\":{\"processEpoch\":\"epoch-1\"},\"state\":\"RINGING\"}," +
+            "{\"seq\":3,\"sessionId\":{\"processEpoch\":\"epoch-1\",\"callId\":\"call-c\"}," +
+            "\"state\":\"RINGING\"}" +
+            "],\"nextSeq\":3,\"dropped\":0}"
+        val control = FakeControlTransport { request -> RpcResponse(id = request.id, payload = payload) }
+        val client = client(control)
+
+        val batch = (client.pollEvents(0L) as BridgeRead.Available).value
+
+        assertEquals(listOf(1L, 3L), batch.events.map { it.seq })
+        assertEquals("the skipped event must be counted", 1, batch.skipped)
+        assertEquals(1, client.invalidEventCount)
+        client.close()
+    }
+
+    /** 会话 token 上界必须与 core 的 RpcCodec.MAX_SESSION_FIELD_CHARS 一致（64）。 */
+    @Test
+    fun sessionTokensLongerThanTheCoreLimitAreStructurallyInvalid() = runTest {
+        assertEquals(64, BridgeClient.MAX_SESSION_TOKEN_CHARS)
+        assertEquals(
+            org.krvyft.agentcall.core.protocol.RpcCodec.MAX_SESSION_FIELD_CHARS,
+            BridgeClient.MAX_SESSION_TOKEN_CHARS,
+        )
+        val tooLong = "e".repeat(65)
+        val payload = "{\"events\":[{\"seq\":1,\"sessionId\":{\"processEpoch\":\"" + tooLong +
+            "\",\"callId\":\"call-a\"},\"state\":\"RINGING\"}],\"nextSeq\":1,\"dropped\":0}"
+        val client = client(FakeControlTransport { request -> RpcResponse(id = request.id, payload = payload) })
+        val batch = (client.pollEvents(0L) as BridgeRead.Available).value
+        assertEquals("an over-long token is a skipped event, not a fabricated one", emptyList<Long>(), batch.events.map { it.seq })
+        assertEquals(1, batch.skipped)
+        client.close()
+    }
+
+    /**
+     * cursor_ahead 的 0 游标重读必须把“这是另一个进程的事件”告知调用方：轮询器要先清空
+     * 本地基线（否则重读回来的 seq 1..lastSeq 会被当成重复而丢弃）。
+     */
+    @Test
+    fun eventsCursorAheadMarksTheRetriedBatchAsAReset() = runTest {
+        val control = FakeControlTransport { request ->
+            when (request.payload) {
+                "{\"sinceSeq\":9}" -> RpcResponse(
+                    id = request.id,
+                    error = RpcError(BridgeClient.ERROR_CURSOR_AHEAD, "cursor is ahead"),
+                )
+                else -> RpcResponse(id = request.id, payload = EVENTS_PAYLOAD)
+            }
+        }
+        val client = client(control)
+
+        val batch = (client.pollEvents(9L) as BridgeRead.Available).value
+
+        assertTrue("the retried batch must tell the poller to clear its baseline", batch.reset)
+        assertEquals(listOf(1L, 2L, 3L), batch.events.map { it.seq })
         client.close()
     }
 

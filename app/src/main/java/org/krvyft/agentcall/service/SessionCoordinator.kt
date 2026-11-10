@@ -226,6 +226,18 @@ class SessionCoordinator(
     }
 
     /**
+     * 事件流里的监督端交还事实（Task 7B3 FIX ROUND 1）。
+     *
+     * 事实**绑定会话**：只有 [session] 仍是当前会话时才执行交还；上一通/别的 callId 的
+     * handback 只记诊断，绝不动当前通话。监督端的结果语义决定处理方式：
+     * `confirmed`/`not_owned` 已经在监督端放掉这通电话（不必再发 handover RPC），
+     * `revoke_failed`/`unknown` 必须重试撤销，`restore_failed` 则绝不能显示成交还成功。
+     */
+    fun onSupervisorHandback(session: SessionId, outcome: SupervisorHandback) {
+        addInput(Input.HandbackFact(session, outcome))
+    }
+
+    /**
      * 取消消费者、当前会话子 Job 与所有后台协程；停止当前音频会话、撤销本地租约。
      * 重复调用安全，关闭后 [start]/[onEvent] 不再生效。
      */
@@ -291,6 +303,18 @@ class SessionCoordinator(
         data object ApiFailed : Input {
             override val safetyRelevant: Boolean get() = true
         }
+
+        /**
+         * 监督端自己的交还结果（事件流事实，携带会话身份与监督端的裁决）。
+         *
+         * 走无界优先通道：一条 `handback_revoke_failed` 丢了就等于没人向监督端撤销所有权。
+         */
+        data class HandbackFact(
+            val session: SessionId,
+            val outcome: SupervisorHandback,
+        ) : Input {
+            override val safetyRelevant: Boolean get() = true
+        }
     }
 
     private fun addInput(input: Input) {
@@ -328,6 +352,7 @@ class SessionCoordinator(
             is Input.Event -> handleEvent(input.event)
             is Input.CommandFinished -> handleCommandResult(input)
             is Input.ConfigChanged -> handleConfigChanged(input.config)
+            is Input.HandbackFact -> handleHandbackFact(input)
             Input.ApiFailed -> {
                 val runtime = current ?: return
                 val effects = runtime.reducer.onApiFailure()
@@ -363,10 +388,8 @@ class SessionCoordinator(
                 val runtime = current ?: return
                 reduceAndApply(runtime, event, handbackViaServer = true)
             }
-            is SessionEvent.Takeover -> {
-                val runtime = current ?: return
-                reduceAndApply(runtime, event, handbackViaServer = true)
-            }
+            is SessionEvent.Takeover -> handleTakeover(event)
+            is SessionEvent.SessionEnded -> handleSessionEnded(event.sessionId)
             is SessionEvent.PeerLost -> {
                 val runtime = current ?: return
                 reduceAndApply(runtime, event, handbackViaServer = false)
@@ -390,13 +413,75 @@ class SessionCoordinator(
             return
         }
         if (snapshot.state == CallState.RINGING) {
-            // 新代次/新 callId 的新来电：先退役旧会话（取消它的子 Job、关闭音频），再建新 reducer。
+            // 新来电绝不顶掉仍是 IDLE/ENDED 以外的当前会话（FIX ROUND 1）：正在响铃/已接听/
+            // 已接管的通话不会被第二路响铃退役（那会停掉音频/会话/心跳，且不发 handover）。
+            // 第二路响铃继续响给用户听，APP 不为它建会话。
+            if (!canReplaceCurrent(runtime)) {
+                observer.onDiagnostic("incoming_call_ignored", runtime.session)
+                return
+            }
+            // 当前会话确实已经 IDLE/ENDED：先退役（取消子 Job、关闭音频），再建新 reducer。
             retire(runtime, "session_replaced")
             startRuntime(snapshot)
             return
         }
         // 旧进程代次或别的 callId 的迟到快照：绝不产生命令、绝不作用到当前通话。
         observer.onDiagnostic("stale_snapshot_ignored", null)
+    }
+
+    /** 只有 IDLE/ENDED 的当前会话允许被新来电替换（FIX ROUND 1 的裁定）。 */
+    private fun canReplaceCurrent(runtime: CallRuntime): Boolean {
+        val state = runtime.reducer.state
+        return state == SessionState.IDLE || state == SessionState.ENDED
+    }
+
+    /** 事件流里的交还事实：会话不匹配时绝不作用到当前通话。 */
+    private suspend fun handleTakeover(event: SessionEvent.Takeover) {
+        val runtime = current ?: return
+        if (event.sessionId != null && event.sessionId != runtime.session) {
+            observer.onDiagnostic("stale_takeover_ignored", event.sessionId)
+            return
+        }
+        reduceAndApply(runtime, event, handbackViaServer = true)
+    }
+
+    /**
+     * 监督端交还事实：先按会话绑定裁决，再按监督端结果语义决定撤销路径与可见结论。
+     */
+    private suspend fun handleHandbackFact(fact: Input.HandbackFact) {
+        val runtime = current
+        if (runtime == null || runtime.session != fact.session) {
+            observer.onDiagnostic("stale_supervisor_handback_ignored", fact.session)
+            return
+        }
+        // confirmed/not_owned/restore_failed：监督端已经执行过撤销，再发 handover 只会得到
+        // NOT_OWNED；revoke_failed/unknown：所有权可能仍在监督端，必须重试撤销。
+        val viaServer = fact.outcome == SupervisorHandback.REVOKE_FAILED ||
+            fact.outcome == SupervisorHandback.UNKNOWN
+        reduceAndApply(
+            runtime,
+            SessionEvent.Takeover(TakeoverReason.UNKNOWN, fact.session),
+            handbackViaServer = viaServer,
+        )
+        // restore_failed：即使本地的撤销已确认，监督端也没能恢复人工音频——绝不能显示“已交还成功”。
+        if (fact.outcome == SupervisorHandback.RESTORE_FAILED) {
+            observer.onHandedBack(fact.session, RevokeOutcome.REVOKE_FAILED)
+        }
+    }
+
+    /**
+     * 通话已经不存在（监督端 `call_disconnected`）：结束会话但**不下发挂断**。
+     *
+     * 不向 bridge 发 handover：监督端自己的终止/恢复闭环负责真实路由与麦克风，这里只释放
+     * 本地租约、停止本地音频并结束会话（reducer 复用既有断开路径，不伪造快照字段）。
+     */
+    private suspend fun handleSessionEnded(sessionId: SessionId) {
+        val runtime = current
+        if (runtime == null || runtime.session != sessionId) {
+            observer.onDiagnostic("stale_session_ended_ignored", sessionId)
+            return
+        }
+        reduceAndApply(runtime, SessionEvent.SessionEnded(sessionId), handbackViaServer = false)
     }
 
     private suspend fun startRuntime(snapshot: CallSnapshot) {

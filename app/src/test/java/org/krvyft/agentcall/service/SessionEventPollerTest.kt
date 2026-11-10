@@ -36,6 +36,7 @@ import org.krvyft.agentcall.core.port.MonotonicClock
 import org.krvyft.agentcall.core.session.SessionReducer
 import org.krvyft.agentcall.ipc.BridgeRead
 import org.krvyft.agentcall.ipc.EventsBatch
+import org.krvyft.agentcall.ipc.SessionEpochSource
 import org.krvyft.agentcall.ipc.SessionEventSource
 import org.krvyft.agentcall.ipc.SessionWireEvent
 
@@ -301,15 +302,22 @@ class SessionEventPollerTest {
     }
 
     @Test
-    fun handbackFactsBecomeTakeoverAndNeverFabricateReadyOrPeerLoss() {
+    fun handbackFactsBecomeSessionBoundTakeoverAndNeverFabricateReadyOrPeerLoss() {
         val hookHandback = ringing(1, handbackReason = "user_unmuted")
-        assertEquals(listOf(SessionEvent.Takeover(TakeoverReason.UNKNOWN)), SessionEventMapping.map(hookHandback))
+        assertEquals(
+            listOf(SessionEvent.Takeover(TakeoverReason.UNKNOWN, session)),
+            SessionEventMapping.map(hookHandback),
+        )
 
         val supervisorHandback = supervisor(2, outcome = "handback_confirmed", state = CallState.ACTIVE)
-        assertEquals(listOf(SessionEvent.Takeover(TakeoverReason.UNKNOWN)), SessionEventMapping.map(supervisorHandback))
+        assertEquals(
+            "a supervisor handback must carry its session, never be applied to 'whatever is current'",
+            listOf(SessionEvent.Takeover(TakeoverReason.UNKNOWN, session)),
+            SessionEventMapping.map(supervisorHandback),
+        )
 
         // 事件流里没有“就绪”或“对端失联”的事实源：绝不能从事件里编造。
-        for (event in listOf(ringing(1), hookHandback, supervisor(2, "handback_confirmed", CallState.ACTIVE))) {
+        for (event in listOf(ringing(1), hookHandback, supervisorHandback)) {
             for (mapped in SessionEventMapping.map(event)) {
                 assertFalse(mapped is SessionEvent.ReadyChanged)
                 assertFalse(mapped is SessionEvent.PeerLost)
@@ -317,12 +325,69 @@ class SessionEventPollerTest {
         }
     }
 
+    /**
+     * 监督端的四种 handback 结果不能混为一谈：它们以 [SupervisorHandback] 交给协调器，
+     * 由后者决定是否重试 handover RPC、以及能否显示“已交还”。
+     */
     @Test
-    fun supervisorDisconnectNeedsTheHookSnapshotInsteadOfInventingDirectionAndPresentation() {
+    fun supervisorHandbackOutcomesKeepTheirOwnMeaning() {
+        assertEquals(
+            SupervisorHandback.CONFIRMED,
+            SessionEventMapping.supervisorHandback(supervisor(2, "handback_confirmed", CallState.ACTIVE)),
+        )
+        assertEquals(
+            SupervisorHandback.NOT_OWNED,
+            SessionEventMapping.supervisorHandback(supervisor(2, "handback_not_owned", CallState.ACTIVE)),
+        )
+        assertEquals(
+            SupervisorHandback.REVOKE_FAILED,
+            SessionEventMapping.supervisorHandback(supervisor(2, "handback_revoke_failed", CallState.ACTIVE)),
+        )
+        assertEquals(
+            SupervisorHandback.RESTORE_FAILED,
+            SessionEventMapping.supervisorHandback(supervisor(2, "handback_restore_failed", CallState.ACTIVE)),
+        )
+        assertEquals(
+            SupervisorHandback.UNKNOWN,
+            SessionEventMapping.supervisorHandback(supervisor(2, "handback_whatever", CallState.ACTIVE)),
+        )
+        // 监督端的断开事实不是 handback，也不是 Takeover。
+        assertNull(SessionEventMapping.supervisorHandback(supervisor(2, "call_disconnected", CallState.DISCONNECTED)))
+        // HOOK 事件没有监督端结果语义。
+        assertNull(SessionEventMapping.supervisorHandback(ringing(1)))
+    }
+
+    /** 轮询器把监督端交还事实连同会话身份与结果语义交给协调器（生产接线）。 */
+    @Test
+    fun thePollerRoutesSupervisorHandbacksWithTheirSessionAndOutcome() = runTest {
+        val source = FakeSource { cursor ->
+            batch(supervisor(1, "handback_revoke_failed", CallState.ACTIVE), nextSeq = 1, since = cursor)
+        }
+        val facts = mutableListOf<Pair<SessionId, SupervisorHandback>>()
+        val poller = TestScopePoller(
+            source,
+            publish = { error("a wired supervisor handback must not go through the plain publish path") },
+            onSupervisorHandback = { id, outcome -> facts += id to outcome },
+        )
+        poller.start()
+        try {
+            runCurrent()
+            assertEquals(listOf(session to SupervisorHandback.REVOKE_FAILED), facts)
+        } finally {
+            poller.stop()
+        }
+    }
+
+    @Test
+    fun supervisorDisconnectEndsTheSessionWithoutInventingDirectionAndPresentation() {
         // 监督端事实只有 state=DISCONNECTED；快照字段一律 null。绝不补方向/呈现/紧急等默认值。
         val supervisorDisconnect = supervisor(2, outcome = "call_disconnected", state = CallState.DISCONNECTED)
-        assertEquals(emptyList<SessionEvent>(), SessionEventMapping.map(supervisorDisconnect))
-        // 真实断开由同一 feed 里前面的 HOOK 完整快照表达。
+        assertEquals(
+            "a supervisor disconnect is a session fact, not a fabricated CallSnapshot",
+            listOf(SessionEvent.SessionEnded(session)),
+            SessionEventMapping.map(supervisorDisconnect),
+        )
+        // HOOK 快照仍然按完整事实映射（同一 feed 里它才是 StateChanged 的来源）。
         val hookDisconnect = ringing(1).copy(state = CallState.DISCONNECTED)
         val mapped = SessionEventMapping.map(hookDisconnect).single() as SessionEvent.StateChanged
         assertEquals(CallState.DISCONNECTED, mapped.snapshot.state)
@@ -335,18 +400,266 @@ class SessionEventPollerTest {
         val source = FakeSource { cursor -> batch(incomplete, nextSeq = 1, since = cursor) }
         val published = mutableListOf<SessionEvent>()
         val errors = mutableListOf<String>()
-        val poller = TestScopePoller(source, { published += it }, onError = { errors += it })
+        val diagnostics = mutableListOf<String>()
+        val poller = TestScopePoller(
+            source,
+            { published += it },
+            onError = { errors += it },
+            onDiagnostic = { diagnostics += it },
+        )
         poller.start()
         try {
             advance(1_000)
             assertEquals("an incomplete snapshot must never reach the coordinator", emptyList<SessionEvent>(), published)
-            assertEquals(listOf(SessionEventPoller.ERROR_EVENT_INCOMPLETE), errors)
+            assertEquals(
+                "an incomplete snapshot is a diagnostic, never a transport failure",
+                emptyList<String>(),
+                errors,
+            )
+            assertEquals(listOf(SessionEventPoller.ERROR_EVENT_INCOMPLETE), diagnostics)
             assertEquals("the cursor must advance past the unusable event", 1L, poller.lastSeq)
             assertEquals(0L, source.cursors.first())
             assertTrue(
                 "every later poll must carry the advanced cursor, got " + source.cursors,
                 source.cursors.drop(1).all { it == 1L },
             )
+        } finally {
+            poller.stop()
+        }
+    }
+
+    // ------------------------------------------- 桥接重启：两种模式（CRITICAL / FIX ROUND 1）
+
+    /**
+     * 模式 A：旧游标 > 新进程的 latest（桥接重启后 APP 游标超前）。
+     *
+     * 客户端用 0 重读并把批次标成 reset；轮询器必须**先清空基线再应用**，否则重读回来的
+     * seq 1..lastSeq 会被当成重复丢弃，事件流永远死掉（生产上的真实故障）。
+     */
+    @Test
+    fun aClientReportedResetClearsTheBaselineBeforeTheRetriedBatchIsApplied() = runTest {
+        // 模拟 BridgeClient 的 cursor_ahead 重读结果：从 0 读，标记 reset。
+        val source = FakeSource { cursor ->
+            BridgeRead.Available(
+                EventsBatch(listOf(ringing(1)), nextSeq = 1, dropped = 0, reset = cursor == 7L),
+            )
+        }
+        val published = mutableListOf<SessionEvent>()
+        val poller = TestScopePoller(source, { published += it }, initialCursor = 7L)
+        poller.start()
+        try {
+            runCurrent()
+            assertEquals("the retried cursor_ahead read must carry the old cursor first", listOf(7L), source.cursors)
+            assertEquals("the new call's first event must be delivered, not deduped", 1, published.size)
+            assertEquals(CallState.RINGING, (published.single() as SessionEvent.StateChanged).snapshot.state)
+            assertEquals(1L, poller.lastSeq)
+            assertEquals(1L, poller.baselineResetCount)
+        } finally {
+            poller.stop()
+        }
+    }
+
+    /**
+     * 模式 B：旧游标 ≤ 新进程的 latest（桥接重启后新进程已经记录了更多事件）。
+     *
+     * 桥接不会返回 cursor_ahead，返回的批次看起来完全正常——新进程的 seq 1..oldCursor 被
+     * 静默跳过（通常正是新来电的 RINGING）。只有 uptime 信标能发现重启：轮询器必须先清空
+     * 基线、从 0 重读，再应用批次。
+     */
+    @Test
+    fun aRestartedBridgeWhoseLatestSequenceIsAheadStillDeliversTheNewCallsFirstEvents() = runTest {
+        val bridge = RestartingFakeBridge(uptimeMs = 10_000L)
+        bridge.record(ringing(0, id = session), source = "UNKNOWN")
+        bridge.record(ringing(0, id = session), source = "UNKNOWN")
+        val published = mutableListOf<SessionEvent>()
+        val poller = TestScopePoller(bridge, { published += it }, epochSource = bridge)
+        poller.start()
+        try {
+            runCurrent()
+            assertEquals(2, published.size)
+            assertEquals(2L, poller.lastSeq)
+
+            // 桥接重启：事件环从 0 开始，uptime 回退；新来电的 RINGING 是 seq 1。
+            bridge.restart(uptimeMs = 100L)
+            bridge.record(ringing(0, id = other), source = "UNKNOWN")
+            bridge.record(ringing(0, id = other, handbackReason = null), source = "UNKNOWN")
+            bridge.record(ringing(0, id = session, state = CallState.DISCONNECTED), source = "UNKNOWN")
+
+            advance(500)
+
+            assertEquals("a restart must resync from the start of the new ring", 0L, bridge.cursors.last())
+            assertEquals("the restart must be counted", 1L, poller.baselineResetCount)
+            assertTrue(
+                "the new call's RINGING must be delivered, got " + published,
+                published.any {
+                    it is SessionEvent.StateChanged &&
+                        it.snapshot.id == other &&
+                        it.snapshot.state == CallState.RINGING
+                },
+            )
+            assertEquals(3L, poller.lastSeq)
+        } finally {
+            poller.stop()
+        }
+    }
+
+    /**
+     * 服务重启后不得重放旧事件：已投递的游标必须持久化，新轮询器从它继续。
+     */
+    @Test
+    fun theDeliveredCursorIsPersistedSoAServiceRestartDoesNotReplayStaleEvents() = runTest {
+        val store = InMemoryCursorStore()
+        val first = FakeSource { cursor -> batch(ringing(1), ringing(2), nextSeq = 2, since = cursor) }
+        val firstPoller = TestScopePoller(first, {}, cursorStore = store)
+        firstPoller.start()
+        try {
+            advance(500)
+            assertEquals(2L, firstPoller.lastSeq)
+            assertEquals(SessionEventCursor(2L, null), store.cursor)
+        } finally {
+            firstPoller.stop()
+        }
+
+        // 服务重启（新轮询器），桥接没有重启：从 2 继续，绝不重放 seq 1..2。
+        val second = FakeSource { cursor -> batch(nextSeq = cursor, since = cursor) }
+        val published = mutableListOf<SessionEvent>()
+        val secondPoller = TestScopePoller(second, { published += it }, cursorStore = store)
+        secondPoller.start()
+        try {
+            runCurrent()
+            assertEquals(listOf(2L), second.cursors)
+            assertEquals(2L, secondPoller.restoredCursor)
+            assertEquals("no stale handback may be replayed", emptyList<SessionEvent>(), published)
+        } finally {
+            secondPoller.stop()
+        }
+    }
+
+    /** 服务重启 + 桥接在此期间也重启：持久化的 uptime 让新模式 B 仍能重新同步。 */
+    @Test
+    fun aPersistedUptimeDetectsARestartThatHappenedWhileTheServiceWasDead() = runTest {
+        val store = InMemoryCursorStore(SessionEventCursor(seq = 5L, uptimeMs = 10_000L))
+        val bridge = RestartingFakeBridge(uptimeMs = 100L)
+        bridge.record(ringing(0, id = other), source = "UNKNOWN")
+        bridge.record(ringing(0, id = other), source = "UNKNOWN")
+        bridge.record(ringing(0, id = other), source = "UNKNOWN")
+        val published = mutableListOf<SessionEvent>()
+        val poller = TestScopePoller(bridge, { published += it }, epochSource = bridge, cursorStore = store)
+        poller.start()
+        try {
+            runCurrent()
+            assertEquals("the persisted uptime must expose the restart before the first poll", 0L, bridge.cursors.first())
+            assertEquals("the resynced ring is delivered from its start", 3, published.size)
+            assertTrue(
+                "the new process's first event must be delivered",
+                (published.first() as SessionEvent.StateChanged).snapshot.id == other,
+            )
+            assertEquals(3L, poller.lastSeq)
+        } finally {
+            poller.stop()
+        }
+    }
+
+    // ------------------------------------------- 批次容错/诊断（minors）
+
+    /** stop() 必须取消在途批次：本批剩余事件绝不能在服务停止后再投递。 */
+    @Test
+    fun stopInsideABatchDropsTheRestOfIt() = runTest {
+        val source = FakeSource { cursor -> batch(ringing(1), ringing(2), ringing(3), nextSeq = 3, since = cursor) }
+        var poller: SessionEventPoller? = null
+        val published = mutableListOf<SessionEvent>()
+        poller = TestScopePoller(source, { published += it; poller?.stop() })
+        poller.start()
+        try {
+            runCurrent()
+            assertEquals("the rest of the batch must be dropped after stop()", 1, published.size)
+        } finally {
+            poller.stop()
+        }
+    }
+
+    /** 映射/投递抛异常不能静默杀死轮询循环：上报固定码并继续轮询。 */
+    @Test
+    fun aThrowableFromAPublishIsDiagnosedAndNeverKillsTheLoop() = runTest {
+        // 每次轮询都推进一条：失败那批之后仍能看到“循环还活着且还能投递”。
+        val source = FakeSource { cursor -> batch(ringing(cursor + 1), nextSeq = cursor + 1, since = cursor) }
+        val diagnostics = mutableListOf<String>()
+        val published = mutableListOf<SessionEvent>()
+        var throwOnce = true
+        val poller = TestScopePoller(
+            source,
+            publish = {
+                if (throwOnce) {
+                    throwOnce = false
+                    throw IllegalStateException("boom")
+                }
+                published += it
+            },
+            onDiagnostic = { diagnostics += it },
+        )
+        poller.start()
+        try {
+            runCurrent()
+            assertEquals(listOf(SessionEventPoller.ERROR_DELIVER_FAILED), diagnostics)
+            advance(500)
+            assertEquals("the loop must keep polling after a delivery failure", 2, source.cursors.size)
+            assertEquals(1, published.size)
+            assertEquals(1L, poller.deliverFailureCount)
+        } finally {
+            poller.stop()
+        }
+    }
+
+    /** 客户端跳过了一条非法事件：轮询器仍投递其余事件，并把跳过数如实上报为诊断。 */
+    @Test
+    fun skippedWireEventsAreDiagnosedWithoutDroppingTheRestOfTheBatch() = runTest {
+        val source = FakeSource { cursor ->
+            BridgeRead.Available(EventsBatch(listOf(ringing(2)), nextSeq = 2, dropped = 0, skipped = 1))
+        }
+        val published = mutableListOf<SessionEvent>()
+        val diagnostics = mutableListOf<String>()
+        val poller = TestScopePoller(source, { published += it }, onDiagnostic = { diagnostics += it })
+        poller.start()
+        try {
+            runCurrent()
+            assertEquals(1, published.size)
+            assertEquals(listOf(SessionEventPoller.ERROR_EVENT_INVALID), diagnostics)
+            assertEquals(1L, poller.invalidEventCount)
+            assertEquals(2L, poller.lastSeq)
+        } finally {
+            poller.stop()
+        }
+    }
+
+    /** 诊断（不完整快照/坏事件）必须上报，且成功恢复后清除——它绝不是交还失败。 */
+    @Test
+    fun diagnosticsAreReportedAndClearedOnRecovery() = runTest {
+        var incomplete = true
+        val source = FakeSource { cursor ->
+            if (incomplete) {
+                incomplete = false
+                BridgeRead.Available(EventsBatch(listOf(ringing(1).copy(isEmergency = null)), nextSeq = 1, dropped = 0))
+            } else {
+                batch(nextSeq = cursor, since = cursor)
+            }
+        }
+        val diagnostics = mutableListOf<String>()
+        val errors = mutableListOf<String>()
+        var recovered = 0
+        val poller = TestScopePoller(
+            source,
+            {},
+            onError = { errors += it },
+            onDiagnostic = { diagnostics += it },
+            onRecovered = { recovered += 1 },
+        )
+        poller.start()
+        try {
+            runCurrent()
+            assertEquals(listOf(SessionEventPoller.ERROR_EVENT_INCOMPLETE), diagnostics)
+            assertEquals("an incomplete snapshot is a diagnostic, never a transport failure", emptyList<String>(), errors)
+            advance(500)
+            assertEquals("a clean poll must clear the diagnostic residue", 1, recovered)
         } finally {
             poller.stop()
         }
@@ -359,6 +672,11 @@ class SessionEventPollerTest {
         publish: (SessionEvent) -> Unit,
         initialCursor: Long = 0L,
         onError: (String) -> Unit = {},
+        epochSource: SessionEpochSource? = null,
+        cursorStore: SessionEventCursorStore = NoSessionEventCursorStore,
+        onDiagnostic: (String) -> Unit = {},
+        onRecovered: () -> Unit = {},
+        onSupervisorHandback: ((SessionId, SupervisorHandback) -> Unit)? = null,
     ): SessionEventPoller = SessionEventPoller(
         source = source,
         publish = publish,
@@ -369,7 +687,50 @@ class SessionEventPollerTest {
         backoffBaseMs = SessionEventPoller.BACKOFF_BASE_MS,
         backoffMaxMs = SessionEventPoller.BACKOFF_MAX_MS,
         onError = onError,
+        epochSource = epochSource,
+        cursorStore = cursorStore,
+        onDiagnostic = onDiagnostic,
+        onRecovered = onRecovered,
+        onSupervisorHandback = onSupervisorHandback ?: { id, _ ->
+            publish(SessionEvent.Takeover(TakeoverReason.UNKNOWN, id))
+        },
     )
+
+    /** 模拟“每进程一份”的事件环：重启后 uptime 回退、seq 从 1 重新开始。 */
+    private class RestartingFakeBridge(uptimeMs: Long) : SessionEventSource, SessionEpochSource {
+        val cursors = mutableListOf<Long>()
+        private var uptime = uptimeMs
+        private var latest = 0L
+        private val ring = mutableListOf<SessionWireEvent>()
+
+        fun record(event: SessionWireEvent, source: String) {
+            latest += 1
+            ring += event.copy(seq = latest, source = source)
+        }
+
+        fun restart(uptimeMs: Long) {
+            uptime = uptimeMs
+            latest = 0L
+            ring.clear()
+        }
+
+        override suspend fun uptimeMs(): BridgeRead<Long> = BridgeRead.Available(uptime)
+
+        override suspend fun pollEvents(sinceSeq: Long): BridgeRead<EventsBatch> {
+            cursors += sinceSeq
+            if (sinceSeq > latest) return BridgeRead.Unavailable(SessionEventPoller.ERROR_CURSOR_AHEAD)
+            val events = ring.filter { it.seq > sinceSeq }
+            return BridgeRead.Available(EventsBatch(events, latest, dropped = 0))
+        }
+    }
+
+    private class InMemoryCursorStore(var cursor: SessionEventCursor? = null) : SessionEventCursorStore {
+        override fun read(): SessionEventCursor? = cursor
+
+        override fun write(cursor: SessionEventCursor) {
+            this.cursor = cursor
+        }
+    }
 
     private fun TestScope.advance(ms: Long) {
         advanceTimeBy(ms)
@@ -395,11 +756,12 @@ class SessionEventPollerTest {
         conference: Boolean = false,
         activeCalls: Int = 1,
         handbackReason: String? = null,
+        state: CallState = CallState.RINGING,
     ): SessionWireEvent = SessionWireEvent(
         seq = seq,
         sessionId = id,
         epoch = id.processEpoch,
-        state = CallState.RINGING,
+        state = state,
         presentation = presentation,
         direction = direction,
         phoneAccount = "acct-1",

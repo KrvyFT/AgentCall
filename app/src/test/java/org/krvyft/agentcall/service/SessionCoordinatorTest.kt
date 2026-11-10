@@ -188,18 +188,35 @@ class SessionCoordinatorTest {
             advance(3_100)
             assertEquals(listOf(SentCommand(sessionA, CallCommand.Answer)), calls.sent)
 
-            // A 的接听结果迟迟未回；此时进程重建后的新会话 B 到达，A 必须被退役。
+            // A 的接听结果迟迟未回；此时第二路来电 B 到达。B 绝不能顶掉仍在 ANSWER_PENDING
+            // 的 A（FIX ROUND 1：只有 IDLE/ENDED 的会话才允许被新来电替换）。
+            coordinator.onEvent(SessionEvent.StateChanged(ringing(sessionB)))
+            advance(100)
+            assertEquals("the pending call must not be replaced", sessionA, coordinator.activeSession)
+            assertEquals(SessionState.ANSWER_PENDING, coordinator.state)
+            assertTrue("no audio for a stale session", events.isEmpty())
+
+            // A 真正断开：会话结束（撤销必须等在途接听落地），迟到结果被忽略而不是当成成功。
+            coordinator.onEvent(SessionEvent.StateChanged(disconnected(sessionA)))
+            advance(100)
+            lateAnswer.complete(CommandResult.Accepted)
+            advance(100)
+            assertNull("the ended session must be retired", coordinator.activeSession)
+            assertTrue(
+                "a late answer result must not open audio or start a conversation, got " + events,
+                events.none { it.startsWith("audio.opened") || it.startsWith("conversation.") },
+            )
+
+            // 之后 B 才成为当前会话；A 的迟到 Accepted 已不可能被当成 B 的接听成功。
             coordinator.onEvent(SessionEvent.StateChanged(ringing(sessionB)))
             advance(100)
             assertEquals(sessionB, coordinator.activeSession)
             assertEquals(SessionState.PREPARING, coordinator.state)
-            assertTrue("no audio for a stale session", events.isEmpty())
-
-            // A 的迟到 Accepted 绝不能被当成 B 的接听成功。
-            lateAnswer.complete(CommandResult.Accepted)
             advance(100)
-            assertTrue("a stale answer result must not open audio", events.isEmpty())
-            assertEquals(sessionB, coordinator.activeSession)
+            assertTrue(
+                "a stale answer result must not open audio, got " + events,
+                events.none { it.startsWith("audio.opened") || it.startsWith("conversation.") },
+            )
             assertEquals(SessionState.PREPARING, coordinator.state)
 
             // B 自己仍按正常倒计时接听一次；旧结果没有产生任何第二条命令。
@@ -211,7 +228,10 @@ class SessionCoordinatorTest {
                 ),
                 calls.sent,
             )
-            assertTrue("stale command result must not start a conversation", events.isEmpty())
+            assertTrue(
+                "stale command result must not start a conversation, got " + events,
+                events.none { it.startsWith("audio.opened") || it.startsWith("conversation.") },
+            )
             assertEquals(SessionState.ANSWER_PENDING, coordinator.state)
         } finally {
             coordinator.close()
@@ -593,6 +613,340 @@ class SessionCoordinatorTest {
         }
     }
 
+    // ------------------------------------------- 会话绑定/第二路响铃（7B3 FIX ROUND 1）
+
+    /**
+     * IMPORTANT 1：事件流里的 handback 绑定会话。别的/上一通电话的交还事实只记诊断，
+     * 绝不撤销、不恢复、不停当前通话的音频——旧实现把它作用到“当前会话”上。
+     */
+    @Test
+    fun aTakeoverForAnotherSessionNeverRevokesTheCurrentCall() = runTest {
+        val events = mutableListOf<String>()
+        val audio = FakeAudioBridge(events)
+        val conversation = FakeConversation(events)
+        val revoker = FakeRevoker(events)
+        val observer = RecordingObserver(events)
+        val coordinator = coordinator(FakeCallControl(), audio, conversation, revoker, observer)
+        coordinator.start()
+        try {
+            coordinator.onEvent(SessionEvent.StateChanged(ringing(sessionA)))
+            coordinator.onEvent(SessionEvent.ReadyChanged(true))
+            advance(3_100)
+            coordinator.onEvent(SessionEvent.StateChanged(active(sessionA)))
+            advance(100)
+            assertEquals(SessionState.ACTIVE_AI, coordinator.state)
+            assertEquals(listOf("audio.opened:call-a", "conversation.started:call-a"), events)
+
+            coordinator.onEvent(SessionEvent.Takeover(TakeoverReason.UNKNOWN, sessionB))
+            advance(100)
+
+            assertEquals("a foreign handback must not touch the current call", SessionState.ACTIVE_AI, coordinator.state)
+            assertEquals(listOf("audio.opened:call-a", "conversation.started:call-a"), events)
+            assertTrue("a foreign handback must never revoke", revoker.revoked.isEmpty())
+            assertTrue("a foreign handback must not be reported", observer.handedBack.isEmpty())
+            assertTrue(
+                "the ignored handback must be diagnosed, got " + observer.diagnostics,
+                "stale_takeover_ignored" in observer.diagnostics,
+            )
+
+            // 本会话的 handback 仍然生效（绑定只过滤“别人的”）。
+            coordinator.onEvent(SessionEvent.Takeover(TakeoverReason.UNKNOWN, sessionA))
+            advance(100)
+            assertEquals(SessionState.HANDOFF, coordinator.state)
+            assertEquals(listOf(sessionA), revoker.revoked)
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    /**
+     * IMPORTANT 4：第二路来电在 AI 通话期间到达时，**绝不能退役当前会话**（那会停掉音频/
+     * 会话并取消 APP 心跳，且不发 handover）。新来电继续响铃给用户，APP 不为它建会话。
+     */
+    @Test
+    fun aSecondIncomingRingingNeverRetiresTheOwnedCallOrAnswersIt() = runTest {
+        val events = mutableListOf<String>()
+        val calls = FakeCallControl()
+        val audio = FakeAudioBridge(events)
+        val conversation = FakeConversation(events)
+        val heartbeat = CountingHeartbeat()
+        val observer = RecordingObserver(events)
+        val coordinator = coordinator(
+            calls,
+            audio,
+            conversation,
+            FakeRevoker(events),
+            observer,
+            heartbeat = heartbeat,
+        )
+        coordinator.start()
+        try {
+            coordinator.onEvent(SessionEvent.StateChanged(ringing(sessionA)))
+            coordinator.onEvent(SessionEvent.ReadyChanged(true))
+            advance(3_100)
+            coordinator.onEvent(SessionEvent.StateChanged(active(sessionA)))
+            advance(100)
+            assertEquals(SessionState.ACTIVE_AI, coordinator.state)
+            assertTrue("the APP heartbeat must be running", heartbeat.beats > 0)
+
+            // 第二路来电（不同 callId）在 AI 通话期间到达。
+            coordinator.onEvent(SessionEvent.StateChanged(ringing(sessionB)))
+            advance(5_000)
+
+            assertEquals("the AI call must keep owning the session", sessionA, coordinator.activeSession)
+            assertEquals(SessionState.ACTIVE_AI, coordinator.state)
+            assertEquals(
+                "the current call keeps audio and conversation",
+                listOf("audio.opened:call-a", "conversation.started:call-a"),
+                events,
+            )
+            assertTrue(
+                "the APP heartbeat must keep running, got " + heartbeat.beats,
+                heartbeat.beats >= 5,
+            )
+            assertEquals(
+                "no second call may be answered",
+                listOf(SentCommand(sessionA, CallCommand.Answer)),
+                calls.sent,
+            )
+            assertTrue(
+                "the ignored incoming call must be diagnosed, got " + observer.diagnostics,
+                "incoming_call_ignored" in observer.diagnostics,
+            )
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    /** 当前会话只是 IDLE（RINGING 没命中名单）时，新来电仍可替换——旧行为不能退化。 */
+    @Test
+    fun anIdleSessionIsStillReplaceableByANewIncomingCall() = runTest {
+        val events = mutableListOf<String>()
+        val other = config.copy(blacklist = listOf("+8613800000000"))
+        val coordinator = SessionCoordinator(
+            config = other,
+            calls = FakeCallControl(),
+            audio = FakeAudioBridge(events),
+            conversation = FakeConversation(events),
+            clock = MonotonicClock { testScheduler.currentTime },
+            revoker = FakeRevoker(events),
+            observer = RecordingObserver(events),
+            dispatcher = StandardTestDispatcher(testScheduler),
+            tickIntervalMs = 1_000,
+        )
+        coordinator.start()
+        try {
+            // 名单外的号码：RINGING 不命中，当前会话停在 IDLE。
+            coordinator.onEvent(SessionEvent.StateChanged(snapshot(sessionA, CallState.RINGING).copy(number = "+8613900000000")))
+            advance(100)
+            assertEquals(SessionState.IDLE, coordinator.state)
+
+            coordinator.onEvent(SessionEvent.StateChanged(ringing(sessionB)))
+            advance(100)
+
+            assertEquals("an IDLE session must not block the next call", sessionB, coordinator.activeSession)
+            assertEquals(SessionState.ELIGIBLE, coordinator.state)
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    /**
+     * IMPORTANT 2：监督端 `call_disconnected` 映射成的 [SessionEvent.SessionEnded] 必须结束
+     * 会话（HOOK 失联/故障时可能永远没有完整 DISCONNECTED 快照）：不挂断、不伪造快照、
+     * 不向 bridge 发 handover，但释放本地租约/音频/隔离并退役会话。
+     */
+    @Test
+    fun aSupervisorSessionEndedEndsTheOwnedCallWithoutHangup() = runTest {
+        val events = mutableListOf<String>()
+        val calls = FakeCallControl()
+        val audio = FakeAudioBridge(events)
+        val conversation = FakeConversation(events)
+        val revoker = FakeRevoker(events)
+        val observer = RecordingObserver(events)
+        val leases = LeaseRegistry()
+        val heartbeat = CountingHeartbeat()
+        val coordinator = coordinator(
+            calls, audio, conversation, revoker, observer, leases = leases, heartbeat = heartbeat,
+        )
+        coordinator.start()
+        try {
+            coordinator.onEvent(SessionEvent.StateChanged(ringing(sessionA)))
+            coordinator.onEvent(SessionEvent.ReadyChanged(true))
+            advance(3_100)
+            coordinator.onEvent(SessionEvent.StateChanged(active(sessionA)))
+            advance(100)
+            assertEquals(SessionState.ACTIVE_AI, coordinator.state)
+            assertTrue(leases.isLive(sessionA))
+            assertTrue(heartbeat.beats > 0)
+
+            coordinator.onEvent(SessionEvent.SessionEnded(sessionA))
+            advance(100)
+
+            assertEquals(SessionState.ENDED, observer.states.last { it.first == sessionA }.second)
+            assertNull("an ended session must be retired", coordinator.activeSession)
+            assertEquals(
+                "a call that no longer exists must never receive a Hangup",
+                listOf(SentCommand(sessionA, CallCommand.Answer)),
+                calls.sent,
+            )
+            assertTrue("the local audio must be released", events.contains("audio.stopped:call-a"))
+            assertTrue("the AI conversation must stop", events.contains("conversation.cancelled:call-a"))
+            assertTrue("the local lease must be revoked", !leases.isLive(sessionA))
+            assertTrue(
+                "the supervisor already owns termination: no handover RPC may be sent",
+                revoker.revoked.isEmpty(),
+            )
+            assertEquals(listOf(sessionA), observer.handedBack)
+            assertEquals(listOf(RevokeOutcome.NOT_OWNED), observer.outcomes)
+            // 退役后心跳 Job 随 callJob 取消：不再有新心跳。
+            val beatsAfterEnd = heartbeat.beats
+            advance(5_000)
+            assertEquals("the heartbeat must stop with the session", beatsAfterEnd, heartbeat.beats)
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    @Test
+    fun aSupervisorSessionEndedForAnotherSessionIsIgnored() = runTest {
+        val events = mutableListOf<String>()
+        val observer = RecordingObserver(events)
+        val coordinator = coordinator(
+            FakeCallControl(), FakeAudioBridge(events), FakeConversation(events), FakeRevoker(events), observer,
+        )
+        coordinator.start()
+        try {
+            coordinator.onEvent(SessionEvent.StateChanged(ringing(sessionA)))
+            coordinator.onEvent(SessionEvent.ReadyChanged(true))
+            advance(3_100)
+            coordinator.onEvent(SessionEvent.StateChanged(active(sessionA)))
+            advance(100)
+
+            coordinator.onEvent(SessionEvent.SessionEnded(sessionB))
+            advance(100)
+
+            assertEquals(SessionState.ACTIVE_AI, coordinator.state)
+            assertEquals(sessionA, coordinator.activeSession)
+            assertTrue(
+                "the ignored session end must be diagnosed, got " + observer.diagnostics,
+                "stale_session_ended_ignored" in observer.diagnostics,
+            )
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    /**
+     * IMPORTANT 1（续）：监督端的 handback 结果语义必须保留——
+     * `revoke_failed` 走 handover RPC 重试；`not_owned`/`confirmed` 不必再发 RPC；
+     * `restore_failed` 绝不能显示为“已交还成功”。
+     */
+    @Test
+    fun supervisorHandbackOutcomesChangeTheRevokePathAndTheReportedOutcome() = runTest {
+        // revoke_failed：所有权可能仍在监督端 → 必须重试 handover。
+        val retryEvents = mutableListOf<String>()
+        val retryObserver = RecordingObserver(retryEvents)
+        val retryRevoker = FakeRevoker(retryEvents)
+        val retry = coordinator(
+            FakeCallControl(), FakeAudioBridge(retryEvents), FakeConversation(retryEvents), retryRevoker, retryObserver,
+        )
+        retry.start()
+        try {
+            activeAi(retry)
+            retry.onSupervisorHandback(sessionA, SupervisorHandback.REVOKE_FAILED)
+            advance(100)
+            assertEquals(listOf(sessionA), retryRevoker.revoked)
+            assertEquals(SessionState.HANDOFF, retry.state)
+            assertEquals(listOf(RevokeOutcome.CONFIRMED), retryObserver.outcomes)
+        } finally {
+            retry.close()
+        }
+
+        // not_owned：监督端本来就不持有 → 不发多余的 handover RPC。
+        val notOwnedEvents = mutableListOf<String>()
+        val notOwnedObserver = RecordingObserver(notOwnedEvents)
+        val notOwnedRevoker = FakeRevoker(notOwnedEvents)
+        val notOwned = coordinator(
+            FakeCallControl(), FakeAudioBridge(notOwnedEvents), FakeConversation(notOwnedEvents),
+            notOwnedRevoker, notOwnedObserver,
+        )
+        notOwned.start()
+        try {
+            activeAi(notOwned)
+            notOwned.onSupervisorHandback(sessionA, SupervisorHandback.NOT_OWNED)
+            advance(100)
+            assertTrue("the supervisor already released it", notOwnedRevoker.revoked.isEmpty())
+            assertEquals(listOf(RevokeOutcome.NOT_OWNED), notOwnedObserver.outcomes)
+        } finally {
+            notOwned.close()
+        }
+
+        // restore_failed：撤销可能已成功，但人工音频没恢复 → 绝不能报告“已交还成功”。
+        val restoreEvents = mutableListOf<String>()
+        val restoreObserver = RecordingObserver(restoreEvents)
+        val restoreRevoker = FakeRevoker(restoreEvents)
+        val restore = coordinator(
+            FakeCallControl(), FakeAudioBridge(restoreEvents), FakeConversation(restoreEvents),
+            restoreRevoker, restoreObserver,
+        )
+        restore.start()
+        try {
+            activeAi(restore)
+            restore.onSupervisorHandback(sessionA, SupervisorHandback.RESTORE_FAILED)
+            advance(100)
+            assertTrue("a failed restore needs no revoke retry", restoreRevoker.revoked.isEmpty())
+            assertEquals(
+                "the final report must be unconfirmed, got " + restoreObserver.outcomes,
+                RevokeOutcome.REVOKE_FAILED,
+                restoreObserver.outcomes.last(),
+            )
+            val report = HandbackJournal.record(sessionA, restoreObserver.outcomes.last())
+            assertEquals(
+                HandbackOutcome.Unconfirmed(report),
+                HandbackJournal.outcomeFor(AgentCallStatus(activeSession = sessionA, lastHandback = report), sessionA),
+            )
+        } finally {
+            restore.close()
+        }
+    }
+
+    @Test
+    fun aSupervisorHandbackForAnotherSessionIsIgnored() = runTest {
+        val events = mutableListOf<String>()
+        val revoker = FakeRevoker(events)
+        val observer = RecordingObserver(events)
+        val coordinator = coordinator(
+            FakeCallControl(), FakeAudioBridge(events), FakeConversation(events), revoker, observer,
+        )
+        coordinator.start()
+        try {
+            activeAi(coordinator)
+
+            coordinator.onSupervisorHandback(sessionB, SupervisorHandback.REVOKE_FAILED)
+            advance(100)
+
+            assertEquals(SessionState.ACTIVE_AI, coordinator.state)
+            assertTrue("a foreign handback must never revoke the current call", revoker.revoked.isEmpty())
+            assertTrue(
+                "the ignored handback must be diagnosed, got " + observer.diagnostics,
+                "stale_supervisor_handback_ignored" in observer.diagnostics,
+            )
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    /** 让协调器进入 A 的 ACTIVE_AI（音频/会话已开）。 */
+    private suspend fun TestScope.activeAi(coordinator: SessionCoordinator) {
+        coordinator.onEvent(SessionEvent.StateChanged(ringing(sessionA)))
+        coordinator.onEvent(SessionEvent.ReadyChanged(true))
+        advance(3_100)
+        coordinator.onEvent(SessionEvent.StateChanged(active(sessionA)))
+        advance(100)
+        assertEquals(SessionState.ACTIVE_AI, coordinator.state)
+    }
+
     // ------------------------------------------------------------------ 装配
 
     private fun TestScope.coordinator(
@@ -666,6 +1020,18 @@ class SessionCoordinatorTest {
                 awaitCancellation()
             } finally {
                 events += "conversation.cancelled:" + id.callId
+            }
+        }
+    }
+
+    /** 记录心跳次数的泵：第二路响铃/会话结束时用它证明心跳没被取消/被取消。 */
+    private class CountingHeartbeat : HeartbeatPump {
+        var beats = 0
+
+        override suspend fun run(id: SessionId) {
+            while (true) {
+                beats += 1
+                kotlinx.coroutines.delay(1_000)
             }
         }
     }

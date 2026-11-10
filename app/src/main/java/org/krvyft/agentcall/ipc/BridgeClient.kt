@@ -186,6 +186,12 @@ data class BridgeStatusFacts(
     val paired: Boolean? = null,
     val enabled: Boolean? = null,
     val bridgeVersion: String? = null,
+    /**
+     * 桥接进程已经运行的毫秒数（`status.uptimeMs`）：**进程重启信标**。
+     *
+     * 同一进程内单调递增；重启后回退。null = 负载没有提供（调用方不得假设“没重启”）。
+     */
+    val uptimeMs: Long? = null,
 )
 
 /**
@@ -211,16 +217,36 @@ data class SessionWireEvent(
     val outcome: String? = null,
 )
 
-/** 一次 `session.events` 轮询的结果：[nextSeq] 是下一次请求的游标，[dropped] 是桥接丢弃总数。 */
+/**
+ * 一次 `session.events` 轮询的结果：[nextSeq] 是下一次请求的游标，[dropped] 是桥接丢弃总数。
+ *
+ * [skipped] 是因结构非法而被客户端跳过的事件数（一条坏事件绝不拒绝整批）；
+ * [reset] 表示客户端为拿到本批而**从 0 重读**（`cursor_ahead`），调用方必须先清空本地基线，
+ * 否则本批的 seq 1..lastSeq 会被去重逻辑当成重复而丢弃。
+ */
 data class EventsBatch(
     val events: List<SessionWireEvent>,
     val nextSeq: Long,
     val dropped: Long,
+    val skipped: Int = 0,
+    val reset: Boolean = false,
 )
 
 /** 只读事件源（生产是 [BridgeClient]；测试注入假实现）。 */
 fun interface SessionEventSource {
     suspend fun pollEvents(sinceSeq: Long): BridgeRead<EventsBatch>
+}
+
+/**
+ * 桥接进程的 uptime（ms）信标（Task 7B3 FIX ROUND 1）。
+ *
+ * 事件环是**每进程一份**的，seq 在重启后从头开始；只靠 `cursor_ahead` 无法发现“新进程的
+ * latest 已经超过旧游标”的情况（那时桥接会返回一个看起来完全正常的批次，新来电的前几条
+ * 事件被静默跳过）。轮询器每次轮询前读这个信标，回退即视为重启并清空本地基线。
+ */
+fun interface SessionEpochSource {
+    /** @return 桥接 uptime；[BridgeRead.Unavailable] 表示无法确定（调用方 fail closed）。 */
+    suspend fun uptimeMs(): BridgeRead<Long>
 }
 
 /**
@@ -259,7 +285,7 @@ class BridgeClient(
     private val attachRetryAttempts: Int = ATTACH_RETRY_ATTEMPTS,
     private val attachRetryDelayMs: Long = ATTACH_RETRY_DELAY_MS,
     private val logger: (String) -> Unit = {},
-) : CallControl, AudioBridge, SessionEventSource {
+) : CallControl, AudioBridge, SessionEventSource, SessionEpochSource {
 
     init {
         // 监督端把 >=5000 ms 的静默判为失联（core 的 SessionLimits.HEARTBEAT_TIMEOUT_MS）：
@@ -289,6 +315,11 @@ class BridgeClient(
 
     /** 错配的响应、非法帧等协议违规次数（诊断用）。 */
     val protocolViolationCount: Long get() = protocolViolations
+
+    private val invalidEvents = AtomicLong(0)
+
+    /** `session.events` 里因结构非法被跳过的事件总数（一条坏事件不拒绝整批）。 */
+    val invalidEventCount: Long get() = invalidEvents.get()
 
     /** 最近一次成功心跳的注入时钟时刻（ms）；-1 表示还没有成功过。 */
     @Volatile
@@ -355,6 +386,11 @@ class BridgeClient(
         }
         val json = parseObject(response.payload.toByteArray(Charsets.UTF_8))
             ?: return BridgeRead.Unavailable(ERROR_STATUS_PAYLOAD)
+        // 空负载 {}（或只有未知键）不是“status 可用、字段恰好缺失”：它没有携带任何可观测
+        // 事实，必须整体不可用（否则 statusAvailable 会把一次空回答当成“读到了 status”）。
+        if (json.keySet().none { it in STATUS_KEYS }) {
+            return BridgeRead.Unavailable(ERROR_STATUS_PAYLOAD)
+        }
         return BridgeRead.Available(
             BridgeStatusFacts(
                 hookConnected = booleanOrUnknownString(json, "hookConnected"),
@@ -367,8 +403,22 @@ class BridgeClient(
                 paired = json.boolean("paired"),
                 enabled = json.boolean("enabled"),
                 bridgeVersion = json.string("bridgeVersion"),
+                uptimeMs = json.long("uptimeMs")?.takeIf { it >= 0L },
             ),
         )
+    }
+
+    /**
+     * 桥接 uptime 信标（进程重启检测）。
+     *
+     * 与 [status] 同一条只读请求；没有 `uptimeMs` 的负载返回 [ERROR_STATUS_PAYLOAD]，
+     * 绝不把“缺失”当成 0（0 会让每一次轮询都被判成重启）。
+     */
+    override suspend fun uptimeMs(): BridgeRead<Long> = when (val facts = status()) {
+        is BridgeRead.Unavailable -> facts
+        is BridgeRead.Available -> facts.value.uptimeMs
+            ?.let { BridgeRead.Available(it) }
+            ?: BridgeRead.Unavailable(ERROR_STATUS_PAYLOAD)
     }
 
     /**
@@ -426,18 +476,20 @@ class BridgeClient(
      */
     override suspend fun pollEvents(sinceSeq: Long): BridgeRead<EventsBatch> {
         if (sinceSeq < 0L) return BridgeRead.Unavailable(ERROR_EVENTS_PAYLOAD)
-        val first = pollEventsOnce(sinceSeq)
+        val first = pollEventsOnce(sinceSeq, reset = false)
         if (first is BridgeRead.Unavailable &&
             first.code == ERROR_CURSOR_AHEAD &&
             sinceSeq != 0L
         ) {
             logger("bridge.session_events_cursor_ahead")
-            return pollEventsOnce(0L)
+            // 重读的批次必须标 reset：调用方要先清空基线，否则重读回来的 seq 1..lastSeq
+            // 会被当成重复而丢弃（这正是生产上 cursor_ahead 重置不可达的原因之一）。
+            return pollEventsOnce(0L, reset = true)
         }
         return first
     }
 
-    private suspend fun pollEventsOnce(sinceSeq: Long): BridgeRead<EventsBatch> {
+    private suspend fun pollEventsOnce(sinceSeq: Long, reset: Boolean): BridgeRead<EventsBatch> {
         val payload = "{\"sinceSeq\":" + sinceSeq + "}"
         val response = controlRequest(RolePolicy.METHOD_SESSION_EVENTS, null, payload)
             ?: return BridgeRead.Unavailable(ERROR_BRIDGE_UNAVAILABLE)
@@ -456,15 +508,27 @@ class BridgeClient(
         val dropped = json.long("dropped") ?: return BridgeRead.Unavailable(ERROR_EVENTS_PAYLOAD)
         if (nextSeq < 0L || dropped < 0L) return BridgeRead.Unavailable(ERROR_EVENTS_PAYLOAD)
         val parsed = ArrayList<SessionWireEvent>(array.asJsonArray.size())
+        var skipped = 0
         for (element in array.asJsonArray) {
-            if (!element.isJsonObject) return BridgeRead.Unavailable(ERROR_EVENTS_PAYLOAD)
+            if (!element.isJsonObject) {
+                // 一条坏事件只跳过它自己：拒绝整批会让同一批里的真实 RINGING 一起消失。
+                skipped += 1
+                continue
+            }
             val event = decodeWireEvent(element.asJsonObject)
-                ?: return BridgeRead.Unavailable(ERROR_EVENTS_PAYLOAD)
+            if (event == null) {
+                skipped += 1
+                continue
+            }
             parsed += event
+        }
+        if (skipped > 0) {
+            invalidEvents.addAndGet(skipped.toLong())
+            logger("bridge.session_events_invalid_event")
         }
         // 桥接保证 seq 升序；这里仍显式排序，避免乱序负载让去重游标倒退。
         parsed.sortBy { it.seq }
-        return BridgeRead.Available(EventsBatch(parsed, nextSeq, dropped))
+        return BridgeRead.Available(EventsBatch(parsed, nextSeq, dropped, skipped = skipped, reset = reset))
     }
 
     /**
@@ -1182,10 +1246,22 @@ class BridgeClient(
         /** 桥接事件游标超前（进程重启/环已清空）：客户端重置为 0 再读一次。 */
         const val ERROR_CURSOR_AHEAD: String = "cursor_ahead"
 
-        /** 会话 token 的线格式上界：桥接只接受短机器码（7A1/7C 的会话字段约束）。 */
-        const val MAX_SESSION_TOKEN_CHARS: Int = 256
+        /**
+         * 会话 token 的线格式上界，必须与 core 的控制协议一致
+         * （[org.krvyft.agentcall.core.protocol.RpcCodec.MAX_SESSION_FIELD_CHARS] = 64）：
+         * 比 core 宽松会让 APP 接受一个 core 侧根本不承认的 SessionId。
+         */
+        const val MAX_SESSION_TOKEN_CHARS: Int = RpcCodec.MAX_SESSION_FIELD_CHARS
 
         private val ENCODE_STOP: ByteArray = "{\"type\":\"stop\"}".toByteArray(Charsets.UTF_8)
+
+        /** status 负载里至少要有其中一个键，否则不是一次可用的 status 读取。 */
+        private val STATUS_KEYS = setOf(
+            "bridgeVersion", "protocolVersion", "revision", "enabled", "paired", "uptimeMs",
+            "activeConnections", "rejectedConnections", "supervisionPhase", "supervisionOwned",
+            "microphoneIsolated", "supervisionBlocked", "supervisionLastFault",
+            "hookConnected", "dialerDefaultRole",
+        )
 
         private val ACK_KEYS = setOf("type", "seq", "ok")
         private val ACK_WITH_CODE_KEYS = setOf("type", "seq", "ok", "code")
