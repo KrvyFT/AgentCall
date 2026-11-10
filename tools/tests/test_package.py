@@ -5,9 +5,16 @@ structurally valid synthetic DEX files, and never invoke Gradle, the Android SDK
 or the network.  The synthetic DEX containers are parseable by the production DEX
 reader but are not loadable by ART; real-container verification is exercised by
 make build/package-check against the AGP release artifacts.
+
+DEX coverage is anchored on the container manifest emitted by
+:bridge:packageRuntime, never on the app APK.  The fixtures therefore build a
+*bridge* APK whose dex set is the manifest source, and keep the app APK's dex
+layout independent of it.
 """
 
+import contextlib
 import hashlib
+import io
 import shutil
 import struct
 import sys
@@ -23,6 +30,8 @@ if str(TOOLS_DIR) not in sys.path:
 
 import check_package  # noqa: E402
 import package  # noqa: E402
+
+APPLICATION_ID = "org.krvyft.agentcall"
 
 
 def _uleb128(value):
@@ -150,8 +159,59 @@ def write_apk(path, dex_names=("classes.dex",), classes=None):
     })
 
 
+def write_bridge_apk(path, dex_layout):
+    """A *bridge* release APK fixture (what :bridge:packageRuntime consumes)."""
+    write_zip(path, {
+        "AndroidManifest.xml": b"\x03\x00~x08\x00bridge-manifest-fixture",
+        "resources.arsc": b"\x02\x00\x0c\x00arsc-fixture",
+        **{name: minimal_dex(classes) for name, classes in dex_layout.items()},
+    })
+
+
 def write_container(path, dex_layout):
     write_zip(path, {name: minimal_dex(classes) for name, classes in dex_layout.items()})
+
+
+def write_manifest(container, manifest, source_apk=None):
+    return package.write_dex_manifest(
+        container, manifest, source_apk_path=source_apk)
+
+
+def write_container_with_manifest(container, manifest, dex_layout, source_apk=None):
+    write_container(container, dex_layout)
+    return write_manifest(container, manifest, source_apk=source_apk)
+
+
+def rebuild_zip(source, target, drop=(), replace=None, add=None):
+    """Copy a ZIP, dropping/replacing/adding entries (keeps entry metadata)."""
+    with zipfile.ZipFile(source) as src, zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as out:
+        for info in src.infolist():
+            name = info.filename
+            if name in drop:
+                continue
+            payload = (replace or {}).get(name, src.read(name))
+            out.writestr(info, payload)
+        for name, data in (add or {}).items():
+            out.writestr(name, data)
+    return target
+
+
+def rebuild_jar_bytes(data, drop=(), replace=None):
+    """Copy JAR bytes, dropping/replacing entries."""
+    source = zipfile.ZipFile(io.BytesIO(data))
+    out = io.BytesIO()
+    with source, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as target:
+        for info in source.infolist():
+            if info.filename in drop:
+                continue
+            payload = (replace or {}).get(info.filename, source.read(info.filename))
+            target.writestr(info, payload)
+    return out.getvalue()
+
+
+def read_zip_entry(path, name):
+    with zipfile.ZipFile(path) as archive:
+        return archive.read(name)
 
 
 def write_module(root, version="1.0", version_code=1, extra=None):
@@ -190,11 +250,18 @@ class PackagingFixture(unittest.TestCase):
         self.module = self.tmp / "module"
         self.module.mkdir()
         write_module(self.module)
+        # The app APK is deliberately independent of the DEX container: nothing
+        # in packaging may derive coverage from it.
         self.apk = self.tmp / "app-release-unsigned.apk"
         write_apk(self.apk)
+        self.bridge_apk = self.tmp / "bridge-release-unsigned.apk"
+        write_bridge_apk(self.bridge_apk, {"classes.dex": all_classes()})
         self.jar = self.tmp / "agentcall-bridge.jar"
         write_container(self.jar, {"classes.dex": all_classes()})
+        self.manifest = self.tmp / "agentcall-bridge.dex-manifest.json"
+        write_manifest(self.jar, self.manifest, source_apk=self.bridge_apk)
         self.dist = self.tmp / "dist"
+
         def signer(source, target):
             shutil.copyfile(source, target)
             return "test-signer"
@@ -207,6 +274,8 @@ class PackagingFixture(unittest.TestCase):
             module_dir=self.module,
             apk_path=self.apk,
             bridge_jar=self.jar,
+            bridge_manifest=self.manifest,
+            bridge_apk=self.bridge_apk,
             dist_dir=self.dist,
             signer=self.signer,
             version_reader=lambda path: self.version,
@@ -224,10 +293,21 @@ class PackagingFixture(unittest.TestCase):
         kwargs = dict(
             version_reader=lambda path: self.version,
             signing_probe=lambda path: "debug (CN=Android Debug)",
+            package_reader=lambda path: APPLICATION_ID,
         )
         kwargs.update(overrides)
         return check_package.inspect_package(
             self.dist / "agentcall-1.0.zip", self.dist / "agentcall-1.0.apk", **kwargs)
+
+    def inspect_rebuilt(self, zip_path, **overrides):
+        kwargs = dict(
+            version_reader=lambda path: self.version,
+            signing_probe=lambda path: "debug (CN=Android Debug)",
+            package_reader=lambda path: APPLICATION_ID,
+        )
+        kwargs.update(overrides)
+        return check_package.inspect_package(
+            zip_path, self.dist / "agentcall-1.0.apk", **kwargs)
 
 
 class PackagingTests(PackagingFixture):
@@ -247,12 +327,15 @@ class PackagingTests(PackagingFixture):
             names = archive.namelist()
             self.assertEqual(names, sorted(names), "ZIP entries must be ordered")
             self.assertIn("bridge/agentcall-bridge.jar", names)
+            self.assertIn(package.DEX_MANIFEST_ENTRY, names)
             self.assertIn("bin/agentcallctl", names)
             self.assertIn("webroot/index.html", names)
             props = archive.read("module.prop").decode("utf-8")
             self.assertIn("version=1.0", props)
             self.assertIn("versionCode=1", props)
             self.assertEqual(archive.read("bridge/agentcall-bridge.jar"), self.jar.read_bytes())
+            self.assertEqual(
+                archive.read(package.DEX_MANIFEST_ENTRY), self.manifest.read_bytes())
 
         sums = sums_path.read_text(encoding="utf-8").splitlines()
         expected = {
@@ -265,12 +348,18 @@ class PackagingTests(PackagingFixture):
             self.assertEqual(expected[name], digest)
         self.assertEqual(result.sha256["agentcall-1.0.zip"], expected["agentcall-1.0.zip"])
 
+    def test_module_zip_and_sums_are_world_readable(self):
+        self.package()
+        self.assertEqual((self.dist / "agentcall-1.0.zip").stat().st_mode & 0o777, 0o644)
+        self.assertEqual((self.dist / "SHA256SUMS").stat().st_mode & 0o777, 0o644)
+
     def test_module_scripts_are_executable_and_data_files_are_not(self):
         result = self.package()
         modes = {entry.name: entry.mode for entry in result.entries}
         for script in ("customize.sh", "service.sh", "uninstall.sh", "bin/agentcallctl"):
             self.assertEqual(modes[script], 0o755, script)
-        for data in ("module.prop", "webroot/index.html", "bridge/agentcall-bridge.jar"):
+        for data in ("module.prop", "webroot/index.html", "bridge/agentcall-bridge.jar",
+                     package.DEX_MANIFEST_ENTRY):
             self.assertEqual(modes[data], 0o644, data)
 
     def test_packaging_is_byte_deterministic(self):
@@ -282,7 +371,7 @@ class PackagingTests(PackagingFixture):
         self.assertEqual(first_bytes, (second_dir / "agentcall-1.0.zip").read_bytes())
         self.assertEqual(first_apk, (second_dir / "agentcall-1.0.apk").read_bytes())
 
-    def test_module_tests_and_keystores_are_not_packaged(self):
+    def test_webroot_tests_are_not_packaged(self):
         (self.module / "webroot" / "tests").mkdir()
         (self.module / "webroot" / "tests" / "fixture.test.mjs").write_text(
             'const SECRET = "sk-live-DO-NOT-LEAK-9f8e7d6c";\n', encoding="utf-8")
@@ -302,6 +391,7 @@ class PackagingTests(PackagingFixture):
     def test_missing_cli_class_fails(self):
         write_container(self.jar, {"classes.dex": [
             name for name in all_classes() if not name.endswith("AgentCallCli")]})
+        write_manifest(self.jar, self.manifest)
         self.assert_packaging_fails("AgentCallCli")
 
     def test_missing_webroot_fails(self):
@@ -327,15 +417,81 @@ class PackagingTests(PackagingFixture):
         (self.module / "webroot" / "signing.jks").write_bytes(b"not a real keystore")
         self.assert_packaging_fails("signing.jks")
 
-    def test_missing_secondary_dex_fails(self):
-        write_apk(self.apk, dex_names=("classes.dex", "classes2.dex"))
+    # --- DEX coverage is anchored on the container manifest (Critical 1) ---
+
+    def test_packaging_requires_the_container_manifest(self):
+        self.manifest.unlink()
+        self.assert_packaging_fails("dex manifest is missing")
+
+    def test_container_missing_manifest_dex_fails(self):
+        # The manifest advertises classes2.dex but the container lost it.
+        other = self.tmp / "full.jar"
+        write_container(other, {
+            "classes.dex": all_classes(),
+            "classes2.dex": ["fixture/Extra"],
+        })
+        write_manifest(other, self.manifest)
         write_container(self.jar, {"classes.dex": all_classes()})
         self.assert_packaging_fails("classes2.dex")
 
-    def test_required_class_only_in_secondary_dex_fails(self):
-        write_apk(self.apk, dex_names=("classes.dex", "classes2.dex"))
-        classes = all_classes()
+    def test_container_extra_dex_not_declared_by_manifest_fails(self):
+        # A container dex the manifest never attested must fail closed.
+        single = self.tmp / "single.jar"
+        write_container(single, {"classes.dex": all_classes()})
+        write_manifest(single, self.manifest)
         write_container(self.jar, {
+            "classes.dex": all_classes(),
+            "classes2.dex": ["fixture/Extra"],
+        })
+        self.assert_packaging_fails("not declared")
+
+    def test_manifest_hash_mismatch_fails(self):
+        write_container(self.jar, {"classes.dex": all_classes()})
+        write_manifest(self.jar, self.manifest)
+        # Same entry names, different bytes: name-only coverage is not enough.
+        write_container(self.jar, {"classes.dex": all_classes() + ["fixture/Marker"]})
+        self.assert_packaging_fails("does not match")
+
+    def test_coverage_uses_container_manifest_not_app_apk(self):
+        # The app APK is multidex while the bridge container/manifest are single
+        # dex.  Passing the app APK to the coverage check (the old behaviour)
+        # fails this test; the container is the only PACKAGED dex source.
+        write_apk(self.apk, dex_names=("classes.dex", "classes2.dex"))
+        result = self.package()
+        self.assertTrue(result.zip_path.is_file())
+        inspection = self.inspect()
+        self.assertTrue(inspection.ok, inspection.problems)
+
+    def test_bridge_apk_with_extra_dex_not_in_manifest_fails(self):
+        write_bridge_apk(self.bridge_apk, {
+            "classes.dex": all_classes(),
+            "classes2.dex": ["fixture/Extra"],
+        })
+        self.assert_packaging_fails("classes2.dex")
+
+    def test_bridge_apk_dex_hash_mismatch_fails(self):
+        write_bridge_apk(self.bridge_apk, {
+            "classes.dex": all_classes() + ["fixture/Marker"],
+        })
+        self.assert_packaging_fails("sha256")
+
+    def test_bridge_apk_source_hash_mismatch_fails(self):
+        # The manifest records which APK produced it; swapping in another APK
+        # with identical dex bytes must still fail.
+        write_manifest(self.jar, self.manifest, source_apk=self.apk)
+        self.assert_packaging_fails("source APK sha256")
+
+    def test_manifest_with_bad_schema_fails(self):
+        self.manifest.write_text('{"schema": 99, "dex": []}\n', encoding="utf-8")
+        self.assert_packaging_fails("unsupported schema")
+
+    def test_manifest_with_bad_json_fails(self):
+        self.manifest.write_text("not json\n", encoding="utf-8")
+        self.assert_packaging_fails("not JSON")
+
+    def test_required_class_only_in_secondary_dex_fails(self):
+        classes = all_classes()
+        write_container_with_manifest(self.jar, self.manifest, {
             "classes.dex": [name for name in classes if name != "kotlin/Unit"],
             "classes2.dex": ["kotlin/Unit"],
         })
@@ -343,7 +499,7 @@ class PackagingTests(PackagingFixture):
 
     def test_missing_kotlin_runtime_fails(self):
         classes = [name for name in all_classes() if name != "kotlin/Unit"]
-        write_container(self.jar, {"classes.dex": classes})
+        write_container_with_manifest(self.jar, self.manifest, {"classes.dex": classes})
         self.assert_packaging_fails("kotlin/Unit")
 
     def test_unsigned_apk_is_reported_by_checker(self):
@@ -360,6 +516,7 @@ class CheckPackageTests(PackagingFixture):
         self.assertTrue(inspection.ok, inspection.problems)
         self.assertEqual(inspection.facts["version"], "1.0")
         self.assertEqual(inspection.facts["version_code"], 1)
+        self.assertEqual(inspection.facts["application_id"], APPLICATION_ID)
         self.assertIn("debug", inspection.facts["signing"])
         self.assertEqual(inspection.facts["sha256"]["agentcall-1.0.zip"],
                          hashlib.sha256((self.dist / "agentcall-1.0.zip").read_bytes()).hexdigest())
@@ -369,6 +526,18 @@ class CheckPackageTests(PackagingFixture):
         inspection = self.inspect(version_reader=lambda path: package.Version("9.9", 9))
         self.assertFalse(inspection.ok)
         self.assertTrue(any("version" in problem for problem in inspection.problems))
+
+    def test_version_read_failure_is_reported_without_traceback(self):
+        self.package()
+
+        def broken_reader(path):
+            raise package.PackagingError("aapt2 could not read the APK")
+
+        inspection = self.inspect(version_reader=broken_reader)
+        self.assertFalse(inspection.ok)
+        self.assertTrue(any("cannot read the packaged APK version" in problem
+                            for problem in inspection.problems))
+        self.assertNotIn("version", inspection.facts)
 
     def test_tampered_zip_detected(self):
         self.package()
@@ -388,34 +557,147 @@ class CheckPackageTests(PackagingFixture):
 
     def test_missing_webroot_in_zip_detected(self):
         self.package()
-        rebuilt = self.tmp / "rebuilt.zip"
-        with zipfile.ZipFile(self.dist / "agentcall-1.0.zip") as source, \
-                zipfile.ZipFile(rebuilt, "w") as target:
-            for info in source.infolist():
-                if info.filename == "webroot/app.js":
-                    continue
-                target.writestr(info, source.read(info.filename))
-        inspection = check_package.inspect_package(
-            rebuilt, self.dist / "agentcall-1.0.apk", sha_sums_path=None,
-            version_reader=lambda path: self.version,
-            signing_probe=lambda path: "debug (CN=Android Debug)")
+        rebuilt = rebuild_zip(self.dist / "agentcall-1.0.zip", self.tmp / "rebuilt.zip",
+                              drop=("webroot/app.js",))
+        inspection = self.inspect_rebuilt(rebuilt, sha_sums_path=None)
         self.assertFalse(inspection.ok)
         self.assertTrue(any("webroot/app.js" in problem for problem in inspection.problems))
 
     def test_leaked_secret_in_zip_detected(self):
         self.package()
-        rebuilt = self.tmp / "rebuilt.zip"
-        with zipfile.ZipFile(self.dist / "agentcall-1.0.zip") as source, \
-                zipfile.ZipFile(rebuilt, "w") as target:
-            for info in source.infolist():
-                target.writestr(info, source.read(info.filename))
-            target.writestr("webroot/leak.txt", "sk-" + "a" * 32)
-        inspection = check_package.inspect_package(
-            rebuilt, self.dist / "agentcall-1.0.apk", sha_sums_path=None,
-            version_reader=lambda path: self.version,
-            signing_probe=lambda path: "debug (CN=Android Debug)")
+        rebuilt = rebuild_zip(self.dist / "agentcall-1.0.zip", self.tmp / "rebuilt.zip",
+                              add={"webroot/leak.txt": "sk-" + "a" * 32})
+        inspection = self.inspect_rebuilt(rebuilt, sha_sums_path=None)
         self.assertFalse(inspection.ok)
         self.assertTrue(any("sk-" in problem for problem in inspection.problems))
+
+    def test_unverified_signing_is_a_problem(self):
+        self.package()
+        inspection = self.inspect(
+            signing_probe=lambda path: check_package.SIGNING_UNVERIFIED)
+        self.assertFalse(inspection.ok)
+        self.assertTrue(any("could not be verified" in problem
+                            for problem in inspection.problems))
+
+    def test_unverified_signing_can_be_accepted_explicitly(self):
+        self.package()
+        inspection = self.inspect(
+            signing_probe=lambda path: check_package.SIGNING_UNVERIFIED,
+            allow_unverified_signing=True)
+        self.assertTrue(inspection.ok, inspection.problems)
+        self.assertIn("signing_warning", inspection.facts)
+
+    def test_unsigned_signing_is_a_problem(self):
+        self.package()
+        inspection = self.inspect(
+            signing_probe=lambda path: "unsigned (apksigner verify failed)")
+        self.assertFalse(inspection.ok)
+        self.assertTrue(any("unsigned" in problem for problem in inspection.problems))
+
+    def test_expected_signer_is_enforced(self):
+        self.package()
+        inspection = self.inspect(expected_signer="CN=Release Key")
+        self.assertFalse(inspection.ok)
+        self.assertTrue(any("expected signer" in problem for problem in inspection.problems))
+
+    def test_wrong_application_id_detected(self):
+        self.package()
+        inspection = self.inspect(package_reader=lambda path: "com.example.other")
+        self.assertFalse(inspection.ok)
+        self.assertTrue(any("applicationId" in problem for problem in inspection.problems))
+
+    def test_missing_manifest_entry_detected(self):
+        self.package()
+        rebuilt = rebuild_zip(self.dist / "agentcall-1.0.zip", self.tmp / "rebuilt.zip",
+                              drop=(package.DEX_MANIFEST_ENTRY,))
+        inspection = self.inspect_rebuilt(rebuilt, sha_sums_path=None)
+        self.assertFalse(inspection.ok)
+        self.assertTrue(any(package.DEX_MANIFEST_ENTRY in problem
+                            for problem in inspection.problems))
+
+    def test_checker_rejects_container_missing_manifest_dex(self):
+        layout = {"classes.dex": all_classes(), "classes2.dex": ["fixture/Extra"]}
+        write_bridge_apk(self.bridge_apk, layout)
+        write_container_with_manifest(self.jar, self.manifest, layout)
+        self.package()
+        stripped = rebuild_jar_bytes(
+            read_zip_entry(self.dist / "agentcall-1.0.zip", "bridge/agentcall-bridge.jar"),
+            drop=("classes2.dex",))
+        rebuilt = rebuild_zip(self.dist / "agentcall-1.0.zip", self.tmp / "rebuilt.zip",
+                              replace={"bridge/agentcall-bridge.jar": stripped})
+        inspection = self.inspect_rebuilt(rebuilt, sha_sums_path=None)
+        self.assertFalse(inspection.ok)
+        self.assertTrue(any("classes2.dex" in problem for problem in inspection.problems))
+
+    def test_checker_does_not_use_app_apk_for_dex_coverage(self):
+        write_apk(self.apk, dex_names=("classes.dex", "classes2.dex"))
+        self.package()
+        inspection = self.inspect()
+        self.assertTrue(inspection.ok, inspection.problems)
+
+
+class CheckPackageCliTests(PackagingFixture):
+    def call_main(self, *argv, **readers):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = check_package.main(list(argv), **readers)
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_main_returns_zero_for_valid_package(self):
+        self.package()
+        code, output, errors = self.call_main(
+            "--dist", str(self.dist),
+            version_reader=lambda path: self.version,
+            signing_probe=lambda path: "debug (CN=Android Debug)",
+            package_reader=lambda path: APPLICATION_ID)
+        self.assertEqual(code, 0, output + errors)
+        self.assertIn("Status: PASS", output)
+
+    def test_main_returns_one_for_tampered_package(self):
+        self.package()
+        (self.dist / "agentcall-1.0.zip").write_bytes(
+            (self.dist / "agentcall-1.0.zip").read_bytes() + b"tampered")
+        code, output, errors = self.call_main(
+            "--dist", str(self.dist),
+            version_reader=lambda path: self.version,
+            signing_probe=lambda path: "debug (CN=Android Debug)",
+            package_reader=lambda path: APPLICATION_ID)
+        self.assertEqual(code, 1, output + errors)
+        self.assertIn("Status: FAIL", output)
+        self.assertIn("FAIL:", output)
+
+    def test_main_returns_one_without_a_matching_apk(self):
+        self.package()
+        (self.dist / "agentcall-1.0.apk").unlink()
+        code, output, errors = self.call_main("--dist", str(self.dist))
+        self.assertEqual(code, 1, output)
+        self.assertIn("no matching agentcall-*.apk", errors)
+
+    def test_main_exits_for_missing_dist(self):
+        with self.assertRaises(SystemExit) as raised:
+            self.call_main("--dist", str(self.tmp / "absent"))
+        self.assertIn("does not exist", str(raised.exception.code))
+
+    def test_discover_selects_current_version_among_stale_artifacts(self):
+        self.package()
+        shutil.copyfile(self.dist / "agentcall-1.0.zip", self.dist / "agentcall-0.9.zip")
+        shutil.copyfile(self.dist / "agentcall-1.0.apk", self.dist / "agentcall-0.9.apk")
+        with contextlib.redirect_stdout(io.StringIO()):
+            zip_path, apk_path = check_package._discover(self.dist)
+        self.assertEqual(zip_path.name, "agentcall-1.0.zip")
+        self.assertEqual(apk_path.name, "agentcall-1.0.apk")
+
+    def test_main_passes_with_stale_older_artifacts(self):
+        self.package()
+        shutil.copyfile(self.dist / "agentcall-1.0.zip", self.dist / "agentcall-0.9.zip")
+        shutil.copyfile(self.dist / "agentcall-1.0.apk", self.dist / "agentcall-0.9.apk")
+        code, output, errors = self.call_main(
+            "--dist", str(self.dist),
+            version_reader=lambda path: self.version,
+            signing_probe=lambda path: "debug (CN=Android Debug)",
+            package_reader=lambda path: APPLICATION_ID)
+        self.assertEqual(code, 0, output + errors)
 
 
 if __name__ == "__main__":

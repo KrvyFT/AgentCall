@@ -20,3 +20,12 @@ local.properties
 /bridge/build/outputs/agentcall/
 __pycache__/
 *.pyc
+
+# 签名私钥/证书绝不入库（tools/package.py 也拒绝打包这些后缀）
+*.keystore
+*.jks
+*.p12
+*.pepk
+
+# apksigner v4 签名旁文件（不属于发布物）
+*.idsig

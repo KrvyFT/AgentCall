@@ -59,7 +59,7 @@ flock /tmp/agentcall-gradle.lock ./gradlew :core:testDebugUnitTest :bridge:testD
 | --- | --- |
 | `make test` | JVM 单测（core/bridge/app）+ WebUI node 测试 + Python 打包测试 + 模块脚本 `sh -n` |
 | `make build` | `:app:assembleRelease`、`:bridge:packageRuntime`、`tools/package.py` 打包 |
-| `make package-check` | 校验 `dist/` 结构、DEX 入口、版本、签名、密钥泄漏与 SHA-256 |
+| `make package-check` | 校验 `dist/` 结构、DEX 容器与 manifest、applicationId、版本、签名、密钥泄漏与 SHA-256 |
 | `make lint` | `:app:lintDebug`（完整验收矩阵的一部分，不计入 `make test`） |
 
 ## 打包与签名
@@ -72,18 +72,28 @@ python3 tools/check_package.py    # 失败即非零退出
 
 产物（`dist/` 已在 `.gitignore` 中，不提交）：
 
-- `dist/agentcall-<version>.zip`：KernelSU 模块 ZIP，条目排序、固定时间戳、脚本 0755；
-  包含 `bridge/agentcall-bridge.jar`（AGP release APK 的全部 `classes*.dex`）与 `webroot/` 静态资源，
-  不含 `webroot/tests/`、不含任何签名私钥。
-- `dist/agentcall-<version>.apk`：`app-release-unsigned.apk` 用本机 debug keystore 重签。
+- `dist/agentcall-<version>.zip`：KernelSU 模块 ZIP，条目按名排序、固定时间戳、脚本 0755、数据文件 0644；
+  包含 `bridge/agentcall-bridge.jar`（bridge release APK 的全部 `classes*.dex`）、
+  `bridge/agentcall-bridge.dex-manifest.json`（每个 dex 的 name/SHA-256/size 与来源 APK 摘要）
+  与 `webroot/` 静态资源；不含 `webroot/tests/`、不含任何签名私钥。
+- `dist/agentcall-<version>.apk`：`app-release-unsigned.apk` 用本机 debug keystore 重签；
+  apksigner 的 v4 `.idsig` 旁文件不生成（不属于发布物）。
 - `dist/SHA256SUMS`：`sha256sum` 兼容格式。
+
+**DEX 覆盖只用容器 manifest**：`:bridge:packageRuntime` 从 bridge release APK 收集 dex 并写出
+manifest，打包与 `check_package.py` 都拿容器与 manifest 比对（名称 + SHA-256 + size），
+存在 bridge APK 时再交叉核对一次；**不使用 app APK**——app APK 是另一个产物，
+单 dex 时比对无意义、多 dex 时会误报。
 
 **版本单一来源**是构建出的 APK 的 `versionName/versionCode`：ZIP 里的 `module.prop` 由它渲染，
 源 `module/module.prop` 与之不一致时打包直接失败，文件命名也来自同一个版本号。
 
-**签名类型**：只使用本机 Android debug keystore（`$HOME/.android/debug.keystore`），
-产物是 **debug 签名**，不是发布密钥，不能作为正式分发版本。仓库不包含任何私钥；
-检查器会拒绝打包任何 `*.keystore/*.jks/*.p12` 或私钥/令牌材料。
+**签名类型**：默认只使用本机 Android debug keystore（`$HOME/.android/debug.keystore`），
+产物是 **debug 签名**，不是发布密钥，不能作为正式分发版本。检查器只如实报告签名者
+（debug / custom signer / unsigned / unverified），不猜测某个非 debug 证书“是不是发布密钥”；
+正式分发请用你自己的发布密钥重签并用 `--expected-signer 'CN=...'` 强制校验，
+步骤见 `docs/install.md` 第 1 节（重签会改变 APK 摘要，必须重生成 `SHA256SUMS`）。
+仓库不包含任何私钥；检查器会拒绝打包任何 `*.keystore/*.jks/*.p12/*.pepk` 或私钥/令牌材料。
 
 ## 状态与边界
 
@@ -91,7 +101,7 @@ python3 tools/check_package.py    # 失败即非零退出
 | --- | --- |
 | JVM 单测（core/bridge/app）、WebUI node 测试、打包测试 | 本地执行，见 `make test` 与 Task 9 报告 |
 | release APK、模块 ZIP、SHA256SUMS、打包检查 | 本地已验证 |
-| `app_process` 容器入口（BridgeMain/AgentCallCli/AudioWorkerMain）与 Kotlin/coroutines/Gson/core 运行库 | 结构级已验证（DEX 解析，等价 dexdump/javap 检查） |
+| `app_process` 容器入口（BridgeMain/AgentCallCli/AudioWorkerMain）与 Kotlin/coroutines/Gson/core 运行库 | 结构级已验证（自研 DEX 解析：只校验类描述符与方法名存在，不校验方法原型/字节码语义） |
 | 真机 Google 电话原功能、真实来电、≥3 轮双向对话 | **未验证** |
 | 音频 downlink/uplink、麦克风隔离、真实 Google 电话 | **未验证**（无设备证据，不宣称可用） |
 | 人工接管、故障终止、锁屏/重启握手 | **未验证** |
@@ -100,8 +110,9 @@ python3 tools/check_package.py    # 失败即非零退出
 | 双卡、VoWiFi、蓝牙 | **未验证**，未测组合不启用 |
 
 多 DEX 说明：`app_process` 的 `PathClassLoader` 只从 classpath JAR 根部的 `classes.dex` 加载类。
-打包任务会收进 release APK 的**所有** `classes*.dex`，但检查器要求全部必需入口/运行类必须在
-`classes.dex` 内，否则打包失败——当前 release 恰好只有一个 `classes.dex`。
+打包任务会收进 **bridge release APK** 的**所有** `classes*.dex` 并写入 manifest，但检查器要求
+全部必需入口/运行类必须在 `classes.dex` 内，否则打包失败——当前 bridge release 恰好只有一个
+`classes.dex`。
 未来若必须拆 dex，需要重新设计容器加载方式，而不是默认多 dex 可用。
 
 更细的本地/真机证据见 `docs/verification.md`、`docs/device-validation.md`；安装与回退步骤见

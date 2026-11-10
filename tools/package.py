@@ -6,11 +6,14 @@ ZIP is rendered from the APK versionName/versionCode, so the module, the ZIP fil
 name and the APK cannot drift apart; a hand-edited module.prop that disagrees is
 a packaging failure, not something to paper over.
 
-The bridge runtime container is the AGP release APK's own dex set, copied entry
-by entry into bridge/build/outputs/agentcall/agentcall-bridge.jar by
-:bridge:packageRuntime.  Packaging re-verifies that every APK classesN.dex made
-it into the container and that the runtime entry points survive with their
-stable JVM names.
+The bridge runtime container is the AGP *bridge* release APK's own dex set,
+copied entry by entry into bridge/build/outputs/agentcall/agentcall-bridge.jar
+by :bridge:packageRuntime, which also emits agentcall-bridge.dex-manifest.json
+(name + SHA-256 + size per dex, plus the source APK digest).  Packaging verifies
+the container against that manifest, cross-checks it against the bridge APK when
+one is present, and verifies the runtime entry points survive with their stable
+JVM names.  The app APK is never a coverage input: it is a different artifact,
+so using it was vacuous for single-dex builds and wrong for multidex ones.
 
 Signing: the release APK produced by AGP is unsigned, so the local Android debug
 keystore ($HOME/.android/debug.keystore) is used.  No private key is ever copied
@@ -20,6 +23,7 @@ by tools/check_package.py.
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import stat
@@ -37,8 +41,20 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODULE_DIR = REPO_ROOT / "module"
 DEFAULT_APK = REPO_ROOT / "app" / "build" / "outputs" / "apk" / "release" / "app-release-unsigned.apk"
 DEFAULT_BRIDGE_JAR = REPO_ROOT / "bridge" / "build" / "outputs" / "agentcall" / "agentcall-bridge.jar"
+DEFAULT_BRIDGE_MANIFEST = (
+    REPO_ROOT / "bridge" / "build" / "outputs" / "agentcall" / "agentcall-bridge.dex-manifest.json")
+DEFAULT_BRIDGE_APK_DIR = REPO_ROOT / "bridge" / "build" / "outputs" / "apk" / "release"
 DEFAULT_DIST_DIR = REPO_ROOT / "dist"
 DEFAULT_KEYSTORE = Path.home() / ".android" / "debug.keystore"
+
+# The applicationId the packaged APK must carry (plan-context global constraint).
+EXPECTED_APPLICATION_ID = "org.krvyft.agentcall"
+# Manifest emitted by :bridge:packageRuntime next to the runtime container.  It
+# is the attestation that the container was produced from the bridge release
+# APK; packaging and the checker validate the container against it and never
+# against the app APK (a different artifact with a different dex set).
+DEX_MANIFEST_ENTRY = "bridge/agentcall-bridge.dex-manifest.json"
+DEX_MANIFEST_SCHEMA = 1
 
 # Fixed DOS timestamp for deterministic archives (1980-01-01T00:00:00).
 ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
@@ -349,20 +365,171 @@ def verify_container(jar_path):
     return problems
 
 
-def verify_dex_coverage(apk_path, jar_path):
-    """Every dex entry the release APK contains must reach the container."""
+def _dex_entries_with_bytes(path):
+    entries = _zip_dex_entries(path)
+    return sorted(entries.items(), key=lambda item: dex_sort_key(item[0]))
+
+
+def write_dex_manifest(container_path, manifest_path, source_apk_path=None):
+    """Write the JSON dex manifest for a container (tests + tooling).
+
+    :bridge:packageRuntime emits the same schema from the bridge release APK;
+    this writer exists so the format is defined next to its reader and can be
+    exercised hermetically.
+    """
+    manifest = {
+        "schema": DEX_MANIFEST_SCHEMA,
+        "dex": [
+            {
+                "name": name,
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "size": len(data),
+            }
+            for name, data in _dex_entries_with_bytes(container_path)
+        ],
+    }
+    if source_apk_path is not None:
+        source = Path(source_apk_path)
+        manifest["sourceApk"] = {
+            "name": source.name,
+            "sha256": _sha256(source),
+        }
+    manifest_path = Path(manifest_path)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return manifest_path
+
+
+def read_dex_manifest(manifest_path):
+    """Parse and validate a dex manifest; PackagingError when unusable."""
+    manifest_path = Path(manifest_path)
+    try:
+        text = manifest_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PackagingError("cannot read dex manifest " + str(manifest_path) + ": " + str(exc))
+    try:
+        manifest = json.loads(text)
+    except ValueError as exc:
+        raise PackagingError("dex manifest " + str(manifest_path) + " is not JSON: " + str(exc))
+    if not isinstance(manifest, dict):
+        raise PackagingError("dex manifest " + str(manifest_path) + " is not an object")
+    if manifest.get("schema") != DEX_MANIFEST_SCHEMA:
+        raise PackagingError(
+            "dex manifest " + str(manifest_path) + " has unsupported schema "
+            + repr(manifest.get("schema")))
+    entries = manifest.get("dex")
+    if not isinstance(entries, list) or not entries:
+        raise PackagingError("dex manifest " + str(manifest_path) + " declares no dex entries")
+    seen = set()
+    normalized = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise PackagingError("dex manifest " + str(manifest_path) + " has a non-object entry")
+        name = entry.get("name")
+        digest = entry.get("sha256")
+        size = entry.get("size")
+        if not isinstance(name, str) or not DEX_NAME.match(name):
+            raise PackagingError(
+                "dex manifest " + str(manifest_path) + " has a bad entry name " + repr(name))
+        if name in seen:
+            raise PackagingError(
+                "dex manifest " + str(manifest_path) + " repeats entry " + name)
+        seen.add(name)
+        if not isinstance(digest, str) or not re.match(r"^[0-9a-f]{64}$", digest):
+            raise PackagingError(
+                "dex manifest " + str(manifest_path) + " has a bad sha256 for " + name)
+        if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+            raise PackagingError(
+                "dex manifest " + str(manifest_path) + " has a bad size for " + name)
+        normalized.append({"name": name, "sha256": digest, "size": size})
+    normalized.sort(key=lambda entry: dex_sort_key(entry["name"]))
+    result = {"schema": DEX_MANIFEST_SCHEMA, "dex": normalized}
+    source = manifest.get("sourceApk")
+    if source is not None:
+        if (not isinstance(source, dict) or not isinstance(source.get("name"), str)
+                or not isinstance(source.get("sha256"), str)
+                or not re.match(r"^[0-9a-f]{64}$", source["sha256"])):
+            raise PackagingError(
+                "dex manifest " + str(manifest_path) + " has a bad sourceApk record")
+        result["sourceApk"] = {"name": source["name"], "sha256": source["sha256"]}
+    return result
+
+
+def verify_dex_coverage(container_path, manifest_path):
+    """The container must be exactly the dex set the bridge manifest attests.
+
+    The app APK is intentionally not an input: it is a different artifact with
+    its own dex layout, so comparing against it is vacuous when both are single
+    dex and wrong when the app becomes multidex.
+    """
     problems = []
     try:
-        apk_dex = list_dex_entries(apk_path)
-        jar_dex = list_dex_entries(jar_path)
+        manifest = read_dex_manifest(manifest_path)
+        container = dict(_zip_dex_entries(container_path))
     except PackagingError as exc:
         return [str(exc)]
-    if not apk_dex:
-        return ["release APK " + str(apk_path) + " has no classes*.dex entries"]
-    for name in apk_dex:
-        if name not in jar_dex:
-            problems.append("container is missing APK dex entry " + name)
+    declared = {entry["name"]: entry for entry in manifest["dex"]}
+    if "classes.dex" not in declared:
+        problems.append("dex manifest " + str(manifest_path) + " declares no classes.dex")
+    for entry in manifest["dex"]:
+        name = entry["name"]
+        data = container.get(name)
+        if data is None:
+            problems.append("container is missing dex entry " + name + " declared by the manifest")
+            continue
+        digest = hashlib.sha256(data).hexdigest()
+        if digest != entry["sha256"] or len(data) != entry["size"]:
+            problems.append(
+                "container dex " + name + " does not match the manifest (sha256 " + digest
+                + ", manifest " + entry["sha256"] + ")")
+    for name in sorted(container, key=dex_sort_key):
+        if name not in declared:
+            problems.append(
+                "container dex " + name + " is not declared by the manifest "
+                "(the container was not produced from the bridge APK)")
     return problems
+
+
+def verify_bridge_apk(manifest_path, apk_path):
+    """Cross-check the manifest against the bridge APK it claims to describe."""
+    try:
+        manifest = read_dex_manifest(manifest_path)
+        apk_dex = dict(_zip_dex_entries(apk_path))
+    except PackagingError as exc:
+        return [str(exc)]
+    problems = []
+    declared = {entry["name"]: entry for entry in manifest["dex"]}
+    for name, data in sorted(apk_dex.items(), key=lambda item: dex_sort_key(item[0])):
+        if name not in declared:
+            problems.append(
+                "dex manifest does not describe " + name + " from " + Path(apk_path).name)
+            continue
+        digest = hashlib.sha256(data).hexdigest()
+        if digest != declared[name]["sha256"]:
+            problems.append(
+                "dex manifest sha256 for " + name + " does not match "
+                + Path(apk_path).name)
+    for name in declared:
+        if name not in apk_dex:
+            problems.append(
+                "dex manifest declares " + name + " but " + Path(apk_path).name
+                + " has no such entry")
+    source = manifest.get("sourceApk")
+    if source is not None and source["sha256"] != _sha256(Path(apk_path)):
+        problems.append(
+            "dex manifest source APK sha256 does not match " + Path(apk_path).name
+            + " (the manifest was produced from a different bridge APK)")
+    return problems
+
+
+def detect_bridge_apk(directory=None):
+    """Return the single bridge release APK, or None when the dir is absent/ambiguous."""
+    directory = Path(directory) if directory else DEFAULT_BRIDGE_APK_DIR
+    if not directory.is_dir():
+        return None
+    apks = sorted(path for path in directory.glob("*.apk") if path.is_file())
+    return apks[0] if len(apks) == 1 else None
 
 
 # ---------------------------------------------------------------------------
@@ -472,7 +639,8 @@ def _sdk_dir():
     return None
 
 
-def _version_key(name):
+def version_sort_key(name):
+    """Comparable key for dotted/dashed version strings."""
     parts = []
     for part in re.split(r"[.-]", name):
         parts.append((0, int(part)) if part.isdigit() else (1, part))
@@ -489,14 +657,15 @@ def find_build_tools(sdk_dir=None):
         raise PackagingError("Android SDK has no build-tools directory: " + str(build_tools))
     candidates = sorted(
         (path for path in build_tools.iterdir() if path.is_dir()),
-        key=lambda path: _version_key(path.name), reverse=True)
+        key=lambda path: version_sort_key(path.name), reverse=True)
     for candidate in candidates:
         if all((candidate / tool).is_file() for tool in ("aapt2", "apksigner", "zipalign")):
             return candidate
     raise PackagingError("no Android build-tools with aapt2/apksigner/zipalign under " + str(build_tools))
 
 
-def read_apk_version(apk_path, build_tools=None):
+def read_apk_badging(apk_path, build_tools=None):
+    """Read package name and version from an APK via the SDK aapt2."""
     apk_path = Path(apk_path)
     if not apk_path.is_file():
         raise PackagingError("release APK is missing: " + str(apk_path))
@@ -512,7 +681,21 @@ def read_apk_version(apk_path, build_tools=None):
     name_match = re.search(r"versionName='([^']*)'", completed.stdout)
     if not code_match or not name_match:
         raise PackagingError("release APK has no versionCode/versionName: " + str(apk_path))
-    return Version(name_match.group(1), int(code_match.group(1)))
+    package_match = re.search(r"^package: name='([^']+)'", completed.stdout, re.MULTILINE)
+    if not package_match:
+        raise PackagingError("release APK has no package name: " + str(apk_path))
+    return {
+        "package": package_match.group(1),
+        "version": Version(name_match.group(1), int(code_match.group(1))),
+    }
+
+
+def read_apk_version(apk_path, build_tools=None):
+    return read_apk_badging(apk_path, build_tools=build_tools)["version"]
+
+
+def read_apk_package_name(apk_path, build_tools=None):
+    return read_apk_badging(apk_path, build_tools=build_tools)["package"]
 
 
 def sign_apk(apk_path, out_path, keystore=None, alias=None, build_tools=None):
@@ -538,6 +721,10 @@ def sign_apk(apk_path, out_path, keystore=None, alias=None, build_tools=None):
             "--ks", str(keystore_path),
             "--ks-pass", "pass:android",
             "--key-pass", "pass:android",
+            # v4 .idsig side files are not part of the release deliverable (they
+            # are adb-incremental-install helper files); leaving them in dist/
+            # produces an unlisted, untracked artifact.
+            "--v4-signing-enabled", "false",
         ]
         if alias:
             command.extend(["--ks-key-alias", alias])
@@ -545,9 +732,11 @@ def sign_apk(apk_path, out_path, keystore=None, alias=None, build_tools=None):
         signed = subprocess.run(command, capture_output=True, text=True, check=False)
         if signed.returncode != 0:
             raise PackagingError("apksigner failed: " + signed.stderr.strip())
+    Path(str(out_path) + ".idsig").unlink(missing_ok=True)
+    out_path.chmod(0o644)
     if keystore_path.name == "debug.keystore":
-        return "debug keystore (local, not a release key)"
-    return "local keystore " + keystore_path.name + " (not a release key)"
+        return "debug keystore (CN=Android Debug) - local debug key"
+    return "local keystore " + keystore_path.name + " - verify it is your release key"
 
 
 # ---------------------------------------------------------------------------
@@ -572,6 +761,8 @@ def _write_zip(entries, out_path):
                 info.compress_type = zipfile.ZIP_DEFLATED
                 archive.writestr(info, data)
         temporary.replace(out_path)
+        # NamedTemporaryFile creates 0600; release artifacts must be readable.
+        out_path.chmod(0o644)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
@@ -602,14 +793,24 @@ def package_artifact(
         module_dir=None,
         apk_path=None,
         bridge_jar=None,
+        bridge_manifest=None,
+        bridge_apk=None,
         dist_dir=None,
         keystore=None,
         signer=None,
         version_reader=None):
-    """Assemble the signed APK, the deterministic module ZIP and SHA256SUMS."""
+    """Assemble the signed APK, the deterministic module ZIP and SHA256SUMS.
+
+    bridge_apk: the bridge release APK the container manifest must describe.
+    None (default) auto-detects the single APK under
+    bridge/build/outputs/apk/release; when none is found the cross-check is
+    skipped (the manifest/container comparison above still applies).
+    """
     module_dir = Path(module_dir) if module_dir else DEFAULT_MODULE_DIR
     apk_path = Path(apk_path) if apk_path else DEFAULT_APK
     bridge_jar = Path(bridge_jar) if bridge_jar else DEFAULT_BRIDGE_JAR
+    bridge_manifest = (
+        Path(bridge_manifest) if bridge_manifest else DEFAULT_BRIDGE_MANIFEST)
     dist_dir = Path(dist_dir) if dist_dir else DEFAULT_DIST_DIR
     reader = version_reader if version_reader else read_apk_version
 
@@ -617,6 +818,16 @@ def package_artifact(
         raise PackagingError("release APK is missing: " + str(apk_path))
     if not bridge_jar.is_file():
         raise PackagingError("bridge runtime container is missing: " + str(bridge_jar))
+    if not bridge_manifest.is_file():
+        raise PackagingError(
+            "bridge dex manifest is missing: " + str(bridge_manifest)
+            + " (run :bridge:packageRuntime)")
+    if bridge_apk is None:
+        bridge_apk = detect_bridge_apk()
+    else:
+        bridge_apk = Path(bridge_apk)
+        if not bridge_apk.is_file():
+            raise PackagingError("bridge release APK is missing: " + str(bridge_apk))
 
     module_files = collect_module_files(module_dir)
     version = reader(apk_path)
@@ -629,14 +840,18 @@ def package_artifact(
             "module.prop version " + source_version.name + " (" + str(source_version.code)
             + ") does not match app versionName " + version.name + " (" + str(version.code) + ")")
 
-    problems = verify_dex_coverage(apk_path, bridge_jar)
+    problems = verify_dex_coverage(bridge_jar, bridge_manifest)
     problems.extend(verify_container(bridge_jar))
+    if bridge_apk is not None:
+        problems.extend(verify_bridge_apk(bridge_manifest, bridge_apk))
     if problems:
         raise PackagingError("bridge runtime container is not packageable:\n- " + "\n- ".join(problems))
 
     jar_bytes = bridge_jar.read_bytes()
+    manifest_bytes = bridge_manifest.read_bytes()
     scanned = [(relative, path.read_bytes()) for relative, path in module_files.items()]
     scanned.append(("bridge/agentcall-bridge.jar", jar_bytes))
+    scanned.append((DEX_MANIFEST_ENTRY, manifest_bytes))
     secret_problems = scan_for_secrets(scanned)
     if secret_problems:
         raise PackagingError("secret material must not be packaged:\n- " + "\n- ".join(secret_problems))
@@ -647,6 +862,7 @@ def package_artifact(
         data = rendered_prop.encode("utf-8") if relative == "module.prop" else path.read_bytes()
         entries.append((relative, data, _entry_mode(relative)))
     entries.append(("bridge/agentcall-bridge.jar", jar_bytes, 0o644))
+    entries.append((DEX_MANIFEST_ENTRY, manifest_bytes, 0o644))
 
     dist_dir.mkdir(parents=True, exist_ok=True)
     apk_out = dist_dir / ("agentcall-" + version.name + ".apk")
@@ -656,6 +872,7 @@ def package_artifact(
         signing = signer(apk_path, apk_out)
     if not apk_out.is_file() or apk_out.stat().st_size == 0:
         raise PackagingError("signer produced no APK at " + str(apk_out))
+    apk_out.chmod(0o644)
 
     zip_out = dist_dir / ("agentcall-" + version.name + ".zip")
     _write_zip(entries, zip_out)
@@ -679,6 +896,11 @@ def main(argv=None):
     parser.add_argument("--module", type=Path, default=DEFAULT_MODULE_DIR)
     parser.add_argument("--apk", type=Path, default=DEFAULT_APK)
     parser.add_argument("--bridge-jar", type=Path, default=DEFAULT_BRIDGE_JAR)
+    parser.add_argument("--bridge-manifest", type=Path, default=DEFAULT_BRIDGE_MANIFEST,
+                        help="dex manifest emitted by :bridge:packageRuntime")
+    parser.add_argument("--bridge-apk", type=Path, default=None,
+                        help="bridge release APK the manifest must describe "
+                             "(default: auto-detect under bridge/build/outputs/apk/release)")
     parser.add_argument("--dist", type=Path, default=DEFAULT_DIST_DIR)
     parser.add_argument("--keystore", type=Path, default=None,
                         help="local debug keystore (default: $HOME/.android/debug.keystore)")
@@ -686,6 +908,7 @@ def main(argv=None):
     try:
         result = package_artifact(
             module_dir=args.module, apk_path=args.apk, bridge_jar=args.bridge_jar,
+            bridge_manifest=args.bridge_manifest, bridge_apk=args.bridge_apk,
             dist_dir=args.dist, keystore=args.keystore)
     except PackagingError as exc:
         print("packaging failed: " + str(exc), file=sys.stderr)
@@ -697,6 +920,7 @@ def main(argv=None):
           + " bytes)")
     print("version " + result.version.name + " (" + str(result.version.code)
           + "), signing: " + result.signing)
+    print("dex manifest embedded: " + DEX_MANIFEST_ENTRY)
     for line in result.sums_path.read_text(encoding="utf-8").splitlines():
         print("sha256 " + line)
     return 0

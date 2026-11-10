@@ -1,6 +1,7 @@
 import com.android.build.api.artifact.SingleArtifact
 import java.io.BufferedOutputStream
 import java.io.File
+import java.security.MessageDigest
 import java.time.LocalDateTime
 import java.util.TreeMap
 import java.util.zip.CRC32
@@ -73,6 +74,10 @@ dependencies {
  *
  * 输出是确定性的未压缩 JAR；ART 的 PathClassLoader 只从 classpath JAR 根部的
  * classes.dex 加载类，因此多 dex 时只用 classes.dex 能解析，其余 dex 作为证据保留。
+ *
+ * 同时写出 dex manifest（schema 1，JSON）：每个 classes*.dex 的 name/sha256/size
+ * 加来源 APK 的 name/sha256。打包与 check_package 只用这个 manifest 校验容器，
+ * 绝不用 app APK（那是另一个产物，dex 集合与容器无关）。
  */
 abstract class PackageRuntimeTask : DefaultTask() {
     @get:InputDirectory
@@ -80,6 +85,9 @@ abstract class PackageRuntimeTask : DefaultTask() {
 
     @get:OutputFile
     abstract val containerJar: RegularFileProperty
+
+    @get:OutputFile
+    abstract val dexManifest: RegularFileProperty
 
     @TaskAction
     fun packageRuntime() {
@@ -92,8 +100,9 @@ abstract class PackageRuntimeTask : DefaultTask() {
             throw GradleException(
                 "expected exactly one release APK in " + directory + ", found " + apks.map { it.name })
         }
-        val dexEntries = TreeMap<String, ByteArray>()
-        ZipFile(apks.single()).use { archive ->
+        val apk = apks.single()
+        val dexEntries = TreeMap<String, ByteArray>(DEX_ORDER)
+        ZipFile(apk).use { archive ->
             for (entry in archive.entries()) {
                 if (DEX_ENTRY.matches(entry.name)) {
                     dexEntries[entry.name] = archive.getInputStream(entry).use { it.readBytes() }
@@ -133,10 +142,37 @@ abstract class PackageRuntimeTask : DefaultTask() {
             temporary.copyTo(target, overwrite = true)
             temporary.delete()
         }
+
+        val manifestTarget = dexManifest.get().asFile
+        manifestTarget.parentFile.mkdirs()
+        val manifestTemporary = File(manifestTarget.parentFile, manifestTarget.name + ".tmp")
+        val manifest = StringBuilder()
+        manifest.append("{\n")
+        manifest.append("  \"schema\": 1,\n")
+        manifest.append("  \"sourceApk\": {\"name\": \"").append(apk.name)
+        manifest.append("\", \"sha256\": \"").append(sha256(apk.readBytes())).append("\"},\n")
+        manifest.append("  \"dex\": [\n")
+        dexEntries.entries.forEachIndexed { index, (name, bytes) ->
+            manifest.append("    {\"name\": \"").append(name)
+            manifest.append("\", \"sha256\": \"").append(sha256(bytes))
+            manifest.append("\", \"size\": ").append(bytes.size).append("}")
+            if (index < dexEntries.size - 1) manifest.append(",")
+            manifest.append("\n")
+        }
+        manifest.append("  ]\n}\n")
+        manifestTemporary.writeText(manifest.toString())
+        if (!manifestTemporary.renameTo(manifestTarget)) {
+            manifestTemporary.copyTo(manifestTarget, overwrite = true)
+            manifestTemporary.delete()
+        }
         logger.lifecycle(
             "packageRuntime: " + target + " (" + dexEntries.keys.joinToString() + ", "
-                + target.length() + " bytes)")
+                + target.length() + " bytes); dex manifest " + manifestTarget)
     }
+
+    private fun sha256(bytes: ByteArray): String =
+        MessageDigest.getInstance("SHA-256").digest(bytes)
+            .joinToString("") { byte -> "%02x".format(byte) }
 
     private fun indexOf(haystack: ByteArray, needle: ByteArray): Int {
         if (needle.isEmpty()) return 0
@@ -156,6 +192,17 @@ abstract class PackageRuntimeTask : DefaultTask() {
 
     private companion object {
         val DEX_ENTRY = Regex("^classes\\d*\\.dex$")
+        val DEX_ORDER: Comparator<String> = Comparator { left, right ->
+            val leftIndex = dexIndex(left)
+            val rightIndex = dexIndex(right)
+            if (leftIndex != rightIndex) leftIndex.compareTo(rightIndex) else left.compareTo(right)
+        }
+
+        fun dexIndex(name: String): Int {
+            val digits = name.removePrefix("classes").removeSuffix(".dex")
+            return if (digits.isEmpty()) 0 else digits.toInt()
+        }
+
         val REQUIRED_DESCRIPTORS = listOf(
             "Lorg/krvyft/agentcall/bridge/BridgeMain;",
             "Lorg/krvyft/agentcall/bridge/AgentCallCli;",
@@ -174,6 +221,8 @@ androidComponents {
             description = "Collect the release APK dex entries into the app_process runtime container"
             apkDirectory.set(releaseApk)
             containerJar.set(layout.buildDirectory.file("outputs/agentcall/agentcall-bridge.jar"))
+            dexManifest.set(layout.buildDirectory.file(
+                "outputs/agentcall/agentcall-bridge.dex-manifest.json"))
         }
     }
 }

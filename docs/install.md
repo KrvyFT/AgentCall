@@ -14,10 +14,34 @@
 | `dist/SHA256SUMS` | 两个产物的 SHA-256 |
 
 版本单一来源是 APK 的 `versionName/versionCode`；ZIP 内 `module.prop` 由它渲染，不一致时打包直接失败。
+ZIP 里的 `bridge/agentcall-bridge.dex-manifest.json` 记录容器每个 dex 的名称/SHA-256/大小与
+bridge APK 摘要；打包与检查器只按它校验 DEX 覆盖，不用 app APK。
 
-**签名**：APK 只使用本机 Android debug keystore 重签，是 **debug 签名**，不是发布密钥。
-不同签名的同名 APK 不能直接覆盖安装；正式分发前必须用你自己的发布密钥重新签名，
-并重新运行 `tools/check_package.py` 确认产物。
+先校验产物完整性（拿到 dist/ 后第一步）：
+
+```sh
+cd dist
+sha256sum -c SHA256SUMS
+```
+
+**签名**：默认用本机 Android debug keystore 重签，是 **debug 签名**，不是发布密钥。
+检查器只如实报告签名者（debug / custom signer / unsigned / unverified），不猜测非 debug 证书
+“是不是发布密钥”。不同签名的同名 APK 不能直接覆盖安装；正式分发前必须用你自己的发布密钥重签：
+
+```sh
+BT="$ANDROID_HOME/build-tools/36.0.0"   # 本机实际 build-tools 版本
+"$BT/zipalign" -p -f 4 app/build/outputs/apk/release/app-release-unsigned.apk /tmp/agentcall-aligned.apk
+"$BT/apksigner" sign --ks /path/to/release.jks --ks-key-alias <alias> \
+  --out dist/agentcall-<version>.apk /tmp/agentcall-aligned.apk
+# 重签改变了 APK 摘要，旧 SHA256SUMS 必然失效：在 dist/ 内重新生成
+cd dist
+sha256sum agentcall-<version>.apk agentcall-<version>.zip > SHA256SUMS
+cd ..
+python3 tools/check_package.py --dist dist --expected-signer 'CN=你的发布证书'
+```
+
+没有 SDK build-tools（无法验证签名）时检查器默认 **FAIL**；只有明确接受未验证签名才加
+`--allow-unverified-signing`（报告仍打印 warning）。
 
 前提（未验证 = 未在本仓库验证）：Android 16/17（`minSdk 36`，目标与唯一验证 ROM 为已知 API 37 Xperia）、
 已安装 KernelSU、已安装 LSPosed 或 Vector、已安装官方 Google 电话 `com.google.android.dialer`。
@@ -168,8 +192,9 @@ su -c /data/adb/modules/agentcall/bin/agentcallctl diagnose
 
 1. 关闭总开关并确认没有进行中的通话。
 2. KernelSU 管理器 → 模块 → 移除 AgentCall → 重启。
-   移除时 `uninstall.sh` 会做有界的会话交还/清理（root 私有目录、socket、PID），
-   不会改写 Google 电话角色或系统音频配置。
+   移除时 `uninstall.sh` 只能**请求**停止桥接进程，并做有界清理（root 私有目录、abstract socket、
+   PID 文件）；它**不能终止或交还正在进行的 AI 通话**（脚本头部已声明该边界），
+   如卸载时正在 AI 通话，请先在 Google 电话中手动结束。它不改写 Google 电话角色或系统音频配置。
 3. 卸载 AgentCall APK：设计上模块侧会关闭会话（**未验证**）；Google 电话保持默认拨号器与原行为。
 4. 如需彻底清理：确认 `/data/adb/agentcall` 已删除、WebUI 不再被管理器加载；
    残留的 Xposed 作用域记录在框架管理器中删除。
