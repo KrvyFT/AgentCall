@@ -128,7 +128,11 @@ internal class AndroidCallHandle(
 
     override fun removeCallback(callback: CallCallback) {
         callbacks.remove(callback)
-        if (callbacks.isEmpty()) onMain { unregisterTelecomCallbackIfNeeded() }
+        if (callbacks.isEmpty()) {
+            // 注册表可能在 Telecom 的回调分发中移除会话；unregister 必须排到当前分发之后，
+            // 否则可能在框架遍历回调表时修改它。
+            mainHandler.post { runCatching { unregisterTelecomCallbackIfNeeded() } }
+        }
     }
 
     /**
