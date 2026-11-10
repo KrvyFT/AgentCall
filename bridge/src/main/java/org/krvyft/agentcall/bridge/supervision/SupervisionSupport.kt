@@ -42,6 +42,8 @@ data class SupervisionPersistedState(
     val blockedReason: String?,
     val lastFault: String?,
     val updatedAtMs: Long,
+    /** 写入时的 boot_id；用来区分“同一开机内重启”与“重启过设备”，null 时退回 elapsedRealtime 比较。 */
+    val bootId: String? = null,
 )
 
 /** 状态存储端口；生产实现是 [SupervisionStateStore]，测试注入假实现。 */
@@ -135,6 +137,7 @@ class SupervisionStateStore(
             if (state.blockedReason == null) add("blockedReason", null) else addProperty("blockedReason", state.blockedReason)
             if (state.lastFault == null) add("lastFault", null) else addProperty("lastFault", state.lastFault)
             addProperty("updatedAtMs", state.updatedAtMs)
+            if (state.bootId == null) add("bootId", null) else addProperty("bootId", state.bootId)
         }
         atomicWrite(File(rootDirectory, FILE_NAME), json.toString().toByteArray(StandardCharsets.UTF_8))
     }
@@ -177,6 +180,7 @@ class SupervisionStateStore(
             blockedReason = optionalString(json, "blockedReason"),
             lastFault = optionalString(json, "lastFault"),
             updatedAtMs = long(json, "updatedAtMs"),
+            bootId = optionalString(json, "bootId"),
         )
     }
 
@@ -324,6 +328,7 @@ class SupervisorBootRecovery(
     private val stateStore: SupervisionStateStorePort,
     private val block: (String) -> Unit,
     private val clock: MonotonicClock,
+    private val bootId: () -> String? = { null },
 ) {
 
     suspend fun recover(): BootRecoveryOutcome {
@@ -334,9 +339,14 @@ class SupervisorBootRecovery(
         }
 
         // 同一开机内的监督进程重启可能仍有活着的 AI 通话：不能为了“修麦克风”而把
-        // 正在进行的 AI 通话解除隔离。检测方法：elapsedRealtime 未回退即同一开机。
+        // 正在进行的 AI 通话解除隔离。优先用 boot_id 精确判断；拿不到时退回
+        // “elapsedRealtime 未回退”的保守近似。
         val sameBootState = (loaded as? LoadResult.Loaded)?.state
-        val sameBoot = sameBootState != null && clock.nowMs() >= sameBootState.updatedAtMs
+        val currentBootId = bootId()
+        val sameBoot = sameBootState != null && when {
+            sameBootState.bootId != null && currentBootId != null -> sameBootState.bootId == currentBootId
+            else -> clock.nowMs() >= sameBootState.updatedAtMs
+        }
         if (sameBoot && sameBootState.ownedSession != null) {
             block(BLOCK_RESTART_WITH_OWNED_CALL)
             return BootRecoveryOutcome.BLOCKED
@@ -379,6 +389,7 @@ class SupervisorBootRecovery(
                     blockedReason = null,
                     lastFault = null,
                     updatedAtMs = clock.nowMs(),
+                    bootId = currentBootId,
                 ),
             )
         } catch (t: Throwable) {
@@ -465,6 +476,9 @@ interface SupervisionPlatform {
     fun authorization(): AutoAnswerAuthorization
 
     fun stateStore(): SupervisionStateStorePort
+
+    /** 当前 boot_id；读不到返回 null（启动恢复退回 elapsedRealtime 近似）。 */
+    fun bootId(): String? = null
 }
 
 /** 生产图：监督状态机 + 启动恢复 + 周期轮询。 */
@@ -493,8 +507,9 @@ object SupervisorProductionGraph {
             emergency = platform.emergency(),
             authorization = platform.authorization(),
             stateSink = { state -> store.save(state) },
+            bootId = platform::bootId,
         )
-        val recovery = SupervisorBootRecovery(audio, store, supervisor::block, clock)
+        val recovery = SupervisorBootRecovery(audio, store, supervisor::block, clock, platform::bootId)
         val loop = SupervisionLoop(
             poll = supervisor::poll,
             clock = clock,

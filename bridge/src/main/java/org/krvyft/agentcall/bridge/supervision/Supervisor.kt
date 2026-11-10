@@ -151,6 +151,7 @@ class Supervisor(
     val role: BridgeProcessRole = BridgeProcessRole.SUPERVISOR,
     private val callState: CallStateProbe = CallStateProbe { null },
     private val stateSink: (SupervisionPersistedState) -> Unit = {},
+    private val bootId: () -> String? = { null },
     maxRestarts: Int = RestartBudget.DEFAULT_MAX_RESTARTS,
     restartWindowMs: Long = RestartBudget.DEFAULT_WINDOW_MS,
 ) : Closeable {
@@ -759,6 +760,7 @@ class Supervisor(
                 blockedReason = blockedReason,
                 lastFault = lastFault,
                 updatedAtMs = clock.nowMs(),
+                bootId = bootId(),
             )
         }
         try {

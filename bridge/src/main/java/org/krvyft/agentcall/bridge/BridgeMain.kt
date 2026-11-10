@@ -8,6 +8,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.runBlocking
 import org.krvyft.agentcall.bridge.audio.AndroidAudioPlatform
+import org.krvyft.agentcall.bridge.audio.AndroidBootId
 import org.krvyft.agentcall.bridge.audio.LocalSocketAudioRoleTransport
 import org.krvyft.agentcall.bridge.audio.RemoteSupervisedAudio
 import org.krvyft.agentcall.bridge.config.CalibrationStore
@@ -261,6 +262,7 @@ internal object BridgeRuntime {
                 override fun emergency() = emergency
                 override fun authorization() = authorization
                 override fun stateStore() = stateStore
+                override fun bootId(): String? = AndroidBootId.current()
             },
         )
     }

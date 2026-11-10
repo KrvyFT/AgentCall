@@ -191,15 +191,53 @@ class SupervisorBootRecoveryTest {
                 blockedReason = null,
                 lastFault = null,
                 updatedAtMs = 1_000,
+                bootId = "boot-a",
             ),
         )
         var blocked: String? = null
-        val recovery = SupervisorBootRecovery(audio, store, { blocked = it }, SupportClock(5_000))
+        val recovery = SupervisorBootRecovery(
+            audio,
+            store,
+            { blocked = it },
+            SupportClock(5_000),
+            bootId = { "boot-a" },
+        )
 
         assertEquals(BootRecoveryOutcome.BLOCKED, recovery.recover())
         assertEquals("同一开机内重启不得解除可能仍活着的 AI 通话隔离", 0, audio.restoreCalls)
         assertEquals(SupervisorBootRecovery.BLOCK_RESTART_WITH_OWNED_CALL, blocked)
         assertTrue(audio.systemIsolated)
+    }
+
+    @Test
+    fun rebootWithPersistedOwnershipRestoresMicrophoneAndClearsStaleOwnership() = runBlocking {
+        val audio = SupportAudio().apply { systemIsolated = true }
+        val store = FakeStateStore(
+            SupervisionPersistedState(
+                phase = SupervisorPhase.ACTIVE,
+                ownedSession = SessionId("epoch-old", "dead-call"),
+                microphoneIsolated = true,
+                blockedReason = null,
+                lastFault = null,
+                updatedAtMs = 100_000,
+                bootId = "boot-a",
+            ),
+        )
+        var blocked: String? = null
+        val recovery = SupervisorBootRecovery(
+            audio,
+            store,
+            { blocked = it },
+            SupportClock(100),
+            bootId = { "boot-b" },
+        )
+
+        assertEquals(BootRecoveryOutcome.RESTORED, recovery.recover())
+        assertEquals(1, audio.restoreCalls)
+        assertNull(blocked)
+        assertNull("旧所有权绝不绑定新通话", store.load()!!.ownedSession)
+        assertEquals("boot-b", store.load()!!.bootId)
+        assertFalse(audio.systemIsolated)
     }
 
     @Test

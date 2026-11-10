@@ -356,7 +356,7 @@ $ flock /tmp/agentcall-gradle.lock ./gradlew :core:testDebugUnitTest :bridge:tes
 BUILD SUCCESSFUL
 ~~~
 
-- 结果统计（JUnit XML，修复轮 1 最终）：core 108 tests / 0 failures，bridge 151 tests / 0 failures。
+- 结果统计（JUnit XML，修复轮 1 最终）：core 108 tests / 0 failures，bridge 152 tests / 0 failures。
 - 四个必须测试均通过：`streamCreationDoesNotUnlockCalibration`、`environmentChangeInvalidatesEvidence`（core `CalibrationPolicyTest`）、`revokedLeaseCannotDisconnect`、`audioFailureKeepsMicrophoneIsolated`（bridge `SupervisorTest`）。
 - 修复轮 1 新增覆盖（全部 JVM）：角色生产图装配（`SupervisorProductionGraph` + 假平台）、周期轮询驱动、启动恢复与同一开机重启策略、状态原子持久化/损坏 fail closed、重启预算（监督端持有）、外来会话心跳（I1）、接听结果不明确的状态核验（I2）、迟到/重复 ACTIVE（I3）、迁移串行化（I4）、隔离读回（I7）、奇数字节 PCM 分类（M2）、每轮只终止一次（M4）、特权终止 fail closed（I6）、音频角色通道协议/代理/分派、生产路径真的创建流也不解锁校准（M5）。
 - 这些结果只覆盖 JVM 逻辑：PCM16/重采样、反射分类、租约/心跳/窗口顺序、校准策略与持久化 fail closed。它们**没有**覆盖真实 AudioRecord/AudioTrack、HAL、Telecom、SELinux、KernelSU app_process 或任何真实通话。
@@ -367,7 +367,7 @@ BUILD SUCCESSFUL
 - 设备侧 root/模块：本次 adb 会话无 `su`，无法安装/启动模块或执行 `agentcallctl`；需人工准备 root 环境。
 - 监督/音频工作进程：入口已接入。`service.sh` 启动 `BridgeMain`（控制面 + 监督角色 + 500 ms 轮询 + 状态持久化）与独立 `AudioWorkerMain`（PCM/隔离，root 私有 abstract socket），各自有限重启；但本机 adb 无 root，D06/D09/D11 的进程级注入**仍未执行**，SELinux 域、app_process 类加载、真实 AudioManager 反射均未验证。
 - 自动接听仍被两道 fail-closed 闸门关闭：校准证据未验证 + `UnverifiedCallIdentityVerifier` 不可用（`blocksAutoAnswer=true`）。因此真机上监督端当前不会拥有任何 AI 通话；D06/D09 需要先完成 D10 的身份核验与 D12 校准。
-- 监督端持久状态 `supervisor-state.json`、同一开机重启策略（有旧所有权时保持隔离并 BLOCKED）、重启预算与隔离读回均只有 JVM 证据；崩溃/重启时序与 `SystemClock.elapsedRealtime` 行为未在真机验证。
+- 监督端持久状态 `supervisor-state.json`（含 boot_id）、同一开机重启策略（有旧所有权时保持隔离并 BLOCKED）、重启预算与隔离读回均只有 JVM 证据；崩溃/重启时序与 `SystemClock.elapsedRealtime` 行为未在真机验证。
 - 特权 Telecom 精确终止：没有经过真机验证的身份来源；默认 `UnverifiedCallIdentityVerifier` 阻止自动接听，`ReflectiveTelecomTermination` 未在目标 ROM 验证。
 - 音频 HAL/受限方法：未在任何真机上确认三个 AOSP 受限方法可见、可调用、可创建对象，更未确认对端能听到注入。
 - 锁屏、重启、双 SIM、VoWiFi、蓝牙、通知权限、人工接管界面、麦克风隔离与 TTS 共存：均未在真机执行。
