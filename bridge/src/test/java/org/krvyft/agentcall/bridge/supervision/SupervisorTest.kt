@@ -1,5 +1,6 @@
 package org.krvyft.agentcall.bridge.supervision
 
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.runBlocking
@@ -13,8 +14,10 @@ import org.krvyft.agentcall.bridge.audio.AudioLeaseCheck
 import org.krvyft.agentcall.bridge.audio.AudioUnavailableException
 import org.krvyft.agentcall.bridge.audio.AudioWorker
 import org.krvyft.agentcall.bridge.audio.BridgeProcessRole
+import org.krvyft.agentcall.bridge.audio.IsolationProbe
 import org.krvyft.agentcall.bridge.audio.MicrophoneIsolation
 import org.krvyft.agentcall.bridge.audio.ProcessFaultDecision
+import org.krvyft.agentcall.bridge.audio.SupervisedAudio
 import org.krvyft.agentcall.core.model.AudioFormatSpec
 import org.krvyft.agentcall.core.model.CallCommand
 import org.krvyft.agentcall.core.model.CallState
@@ -49,6 +52,7 @@ class SupervisorTest {
         identityAvailable: Boolean = true,
         authorized: Boolean = true,
         stateSink: (SupervisionPersistedState) -> Unit = {},
+        initialOwnershipMayBeLive: Boolean = false,
     ) {
         val clock = FakeClock()
         val leases = LeaseRegistry()
@@ -77,6 +81,7 @@ class SupervisorTest {
             role = BridgeProcessRole.SUPERVISOR,
             stateSink = stateSink,
             callState = CallStateProbe { callState },
+            initialOwnershipMayBeLive = initialOwnershipMayBeLive,
         )
 
         fun heartbeat() {
@@ -372,7 +377,8 @@ class SupervisorTest {
      */
     @Test
     fun shutdownTerminatesThenRestoresThenClosesAfterConfirmedDisconnect() = runBlocking {
-        val f = Fixture()
+        val states = mutableListOf<SupervisionPersistedState>()
+        val f = Fixture(stateSink = { states += it })
         f.heartbeat()
         assertEquals(CommandResult.Accepted, f.supervisor.prepareAnswer(session))
         f.events.clear()
@@ -393,6 +399,7 @@ class SupervisorTest {
         )
         assertEquals(SupervisorPhase.ENDED, f.supervisor.snapshot().phase)
         assertFalse("关闭后监督角色不再处于 started", f.supervisor.isStarted())
+        assertNull("干净关闭必须把 shutdownCode 清成 null", states.last().shutdownCode)
     }
 
     /**
@@ -401,7 +408,8 @@ class SupervisorTest {
      */
     @Test
     fun shutdownKeepsIsolationAndReportsUnresolvedWhenDisconnectIsUnconfirmed() = runBlocking {
-        val f = Fixture()
+        val states = mutableListOf<SupervisionPersistedState>()
+        val f = Fixture(stateSink = { states += it })
         f.heartbeat()
         assertEquals(CommandResult.Accepted, f.supervisor.prepareAnswer(session))
         f.events.clear()
@@ -419,11 +427,19 @@ class SupervisorTest {
         assertEquals(SupervisorPhase.ENDED, f.supervisor.snapshot().phase)
         assertNull("关闭后内存所有权必须清空（粘性标记单独保护下一次启动）", f.supervisor.snapshot().ownedSession)
         assertEquals(Supervisor.SHUTDOWN_CALL_UNRESOLVED, f.supervisor.snapshot().lastFault)
+        assertEquals(
+            "关闭机器码必须写入持久状态，下一次启动仍可读",
+            Supervisor.SHUTDOWN_CALL_UNRESOLVED,
+            states.last().shutdownCode,
+        )
     }
 
-    /** Task 11D2a：没有拥有的会话时不得伪造终止/恢复，隔离读回保持原样。 */
+    /**
+     * Task 11E / I2：没有拥有的会话时仍必须尝试恢复**观测到的**隔离；不能把“没有会话”
+     * 当成“可以干净关闭”而把系统麦克风留在静音状态。
+     */
     @Test
-    fun shutdownWithoutOwnedSessionLeavesIsolationUntouched() = runBlocking {
+    fun shutdownWithoutOwnedSessionRestoresTheIsolationItCanSee() = runBlocking {
         val f = Fixture()
         f.worker.isolateMicrophone()
         assertTrue(f.worker.microphoneIsolated)
@@ -434,10 +450,82 @@ class SupervisorTest {
         assertNull(result.ownedSession)
         assertNull(result.termination)
         assertFalse(result.ownershipResolved)
-        assertTrue("没有拥有的会话时必须保持既有隔离事实", result.microphoneIsolated)
-        assertTrue(f.worker.microphoneIsolated)
+        assertFalse("恢复成功后关闭必须报告麦克风未隔离", result.microphoneIsolated)
+        assertFalse(f.worker.microphoneIsolated)
         assertTrue("没有拥有的会话时不得下发任何命令", f.calls.commands.isEmpty())
+        assertEquals(1, f.isolation.restoreCalls)
+    }
+
+    /**
+     * Task 11E / I2：恢复失败时关闭必须 clean=false，并带机器码；粘性所有权标记保留，
+     * 机器码同时写入持久状态（下一次启动可读）。
+     */
+    @Test
+    fun shutdownWithoutOwnedSessionReportsStillIsolatedWhenRestoreFails() = runBlocking {
+        val states = mutableListOf<SupervisionPersistedState>()
+        val f = Fixture(stateSink = { states += it }, initialOwnershipMayBeLive = true)
+        f.worker.isolateMicrophone()
+        f.isolation.failRestore = true
+
+        val result = f.supervisor.shutdown(deadlineMs = 100)
+
+        assertFalse("隔离仍保留时绝不能报干净关闭", result.clean)
+        assertEquals(Supervisor.SHUTDOWN_MICROPHONE_STILL_ISOLATED, result.code)
+        assertTrue(result.microphoneIsolated)
+        assertTrue(f.worker.microphoneIsolated)
+        assertEquals(1, f.isolation.restoreCalls)
+        assertTrue("粘性所有权标记必须保留", states.last().ownedCallMayBeLive)
+        assertEquals(Supervisor.SHUTDOWN_MICROPHONE_STILL_ISOLATED, states.last().shutdownCode)
+    }
+
+    /** 没有拥有的会话且系统读回已未隔离：恢复是 no-op，干净关闭。 */
+    @Test
+    fun shutdownWithoutOwnedSessionIsCleanWhenAlreadyUnmuted() = runBlocking {
+        val f = Fixture()
+
+        val result = f.supervisor.shutdown(deadlineMs = 100)
+
+        assertTrue(result.clean)
+        assertFalse(result.microphoneIsolated)
         assertEquals(0, f.isolation.restoreCalls)
+    }
+
+    /**
+     * Task 11E / I1：关闭预算必须显式，且 5 s 终止 + 6 s 恢复 + 最多一次不可中断的
+     * 5 s 角色通道往返要落在 CLI 的 shutdown 专用 20 s 超时内。
+     */
+    @Test
+    fun shutdownBudgetsAreExplicitAndFitInsideTheCliDeadline() {
+        assertEquals(5_000L, Supervisor.SHUTDOWN_TERMINATION_DEADLINE_MS)
+        assertEquals(6_000L, Supervisor.SHUTDOWN_RESTORE_BUDGET_MS)
+        val terminationMs = Supervisor.SHUTDOWN_TERMINATION_DEADLINE_MS
+        val restoreMs = Supervisor.SHUTDOWN_RESTORE_BUDGET_MS
+        val audioRoundTripMs = org.krvyft.agentcall.bridge.audio.AudioRoleProtocol.READ_TIMEOUT_MS
+        val cliShutdownMs = org.krvyft.agentcall.bridge.LocalSocketCliTransport.SHUTDOWN_TIMEOUT_MS
+        assertTrue(
+            "终止 + 恢复 + 一次不可中断往返必须小于 CLI 的 shutdown 超时",
+            terminationMs + restoreMs + audioRoundTripMs <= cliShutdownMs,
+        )
+    }
+
+    /**
+     * Task 11E / I1：整个恢复路径只有**一个**显式预算；工作进程慢/不可达时不能把
+     * 3 次 5 s 往返串起来（那会超过调用方超时）。
+     */
+    @Test
+    fun theRestorePathIsCappedByASingleBoundedBudget() = runBlocking {
+        val supervisor = supervisorWith(SlowAudio(probeDelayMs = 300), restoreBudgetMs = 50)
+        val startedAt = System.nanoTime()
+
+        val result = supervisor.shutdown(deadlineMs = 100)
+
+        val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000
+        assertEquals(Supervisor.SHUTDOWN_MICROPHONE_STILL_ISOLATED, result.code)
+        assertTrue(
+            "恢复尝试必须被单一预算截断，实际 " + elapsedMs + " ms",
+            elapsedMs < 1_000,
+        )
+        assertTrue(result.microphoneIsolated)
     }
 
     /** Task 11D2a：系统读回已经未隔离时，恢复必须是 no-op（不重复 restore）。 */
@@ -460,7 +548,8 @@ class SupervisorTest {
     /** Task 11D2a：恢复失败必须 BLOCKED + 明确机器码，不能报成功关闭。 */
     @Test
     fun shutdownRestoreFailureBlocksAndReportsExplicitCode() = runBlocking {
-        val f = Fixture()
+        val states = mutableListOf<SupervisionPersistedState>()
+        val f = Fixture(stateSink = { states += it })
         f.heartbeat()
         assertEquals(CommandResult.Accepted, f.supervisor.prepareAnswer(session))
         f.isolation.failRestore = true
@@ -475,6 +564,7 @@ class SupervisorTest {
         val snapshot = f.supervisor.snapshot()
         assertEquals(SupervisorPhase.BLOCKED, snapshot.phase)
         assertEquals(Supervisor.SHUTDOWN_RESTORE_FAILED, snapshot.blockedReason)
+        assertEquals(Supervisor.SHUTDOWN_RESTORE_FAILED, states.last().shutdownCode)
     }
 
     @Test
@@ -674,5 +764,44 @@ private class FakeTermination : PrivilegedTermination {
     override suspend fun disconnect(verified: VerifiedCallIdentity): CommandResult {
         calls += verified
         return CommandResult.Accepted
+    }
+}
+
+/** Task 11E / I1：可注入预算的监督端，用于证明恢复路径被单一预算截断。 */
+private fun supervisorWith(audio: SupervisedAudio, restoreBudgetMs: Long): Supervisor = Supervisor(
+    clock = FakeClock(),
+    audio = audio,
+    calls = FakeCallControl(),
+    emergency = EmergencyCallControl(FakePermission(true), FakeIdentity(true, null), FakeTermination()),
+    authorization = AutoAnswerAuthorization { true },
+    restoreBudgetMs = restoreBudgetMs,
+)
+
+/** 每次读回/恢复都很慢的音频端口：模拟工作进程不可达时的角色通道往返。 */
+private class SlowAudio(private val probeDelayMs: Long) : SupervisedAudio {
+    override val microphoneIsolated: Boolean = true
+
+    override suspend fun isolateMicrophone(): Boolean = true
+
+    override suspend fun verifyIsolation(): Boolean = true
+
+    override suspend fun probeIsolation(): IsolationProbe {
+        delay(probeDelayMs)
+        return IsolationProbe.Verified(true)
+    }
+
+    override suspend fun open(id: SessionId, format: AudioFormatSpec): AudioSession {
+        throw AudioUnavailableException(
+            code = "audio_downlink_unsupported",
+            failure = AudioFailureCode.UNSUPPORTED,
+            message = "test audio never opens",
+        )
+    }
+
+    override suspend fun stopKeepingIsolation() = Unit
+
+    override suspend fun restoreMicrophone(): Boolean {
+        delay(probeDelayMs)
+        return false
     }
 }

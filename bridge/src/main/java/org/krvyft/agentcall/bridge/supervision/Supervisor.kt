@@ -184,11 +184,17 @@ class Supervisor(
     initialOwnershipMayBeLive: Boolean = false,
     maxRestarts: Int = RestartBudget.DEFAULT_MAX_RESTARTS,
     restartWindowMs: Long = RestartBudget.DEFAULT_WINDOW_MS,
+    /**
+     * 恢复麦克风路径的单一总预算（Task 11E / I1）：一次读回 + 一次恢复 + 最多一次读回重试
+     * 全部包在这一个预算内，绝不让 3 次 5 s 的角色通道往返串联超过调用方超时。
+     */
+    private val restoreBudgetMs: Long = SHUTDOWN_RESTORE_BUDGET_MS,
 ) : Closeable {
 
     init {
         require(heartbeatTimeoutMs > 0L) { "heartbeatTimeoutMs must be positive" }
         require(handoffWindowMs > 0L) { "handoffWindowMs must be positive" }
+        require(restoreBudgetMs > 0L) { "restoreBudgetMs must be positive" }
     }
 
     private data class StateView(
@@ -209,6 +215,16 @@ class Supervisor(
     private var handoffDeadlineMs: Long? = null
     private var blockedReason: String? = null
     private var lastFault: String? = null
+
+    /**
+     * Task 11E / I3：优雅关闭一旦开始，音频故障处理必须被忽略（关闭正在收尾，进程即将
+     * 退出）；关闭的恢复/收束在 [transitions] 内完成，因此“先故障后关闭”的故障会完整
+     * 执行，“先关闭后故障”的故障只会看到该标记并空操作。绝不允许 restore 之后又被覆盖。
+     */
+    private var shuttingDown: Boolean = false
+
+    /** 最近一次优雅关闭的机器码；随每份持久状态写入，下一次启动可读（Task 11E minor）。 */
+    private var closingCode: String? = null
 
     /**
      * 最近一次由 [onCallDisconnected] 确认断开的会话。
@@ -523,6 +539,8 @@ class Supervisor(
         transitions.withLock { onAudioFailureLocked(id, code) }
 
     private suspend fun onAudioFailureLocked(id: SessionId, code: String): List<SupervisorAction> {
+        // I3：关闭已开始（或已恢复）后到达/排队的音频故障不得再停音频、改阶段或隔离。
+        if (synchronized(stateMonitor) { shuttingDown }) return emptyList()
         if (synchronized(stateMonitor) { ownedSession } != id) return emptyList()
         val actions = mutableListOf<SupervisorAction>()
         // I7：读回系统状态，不用缓存布尔值。
@@ -977,30 +995,32 @@ class Supervisor(
      *
      * 期限 [deadlineMs]（默认 [SHUTDOWN_TERMINATION_DEADLINE_MS]）覆盖“终止命令 + 等待
      * 断开事实”。期限内无法确认时保持隔离、以 [SHUTDOWN_CALL_UNRESOLVED] 失败关闭；
-     * 恢复失败时进入 BLOCKED 并上报 [SHUTDOWN_RESTORE_FAILED]。崩溃/SIGKILL 不经过这里，
-     * 隔离可能保留，只能由下一次启动恢复。
+     * 恢复失败时进入 BLOCKED 并上报 [SHUTDOWN_RESTORE_FAILED]。
+     *
+     * Task 11E 补充：
+     * - 恢复路径整体受 [restoreBudgetMs]（默认 [SHUTDOWN_RESTORE_BUDGET_MS]）约束；
+     * - 没有拥有的会话时仍会处理观测到的隔离，仍隔离则 clean=false +
+     *   [SHUTDOWN_MICROPHONE_STILL_ISOLATED]（I2）；
+     * - 关闭开始即置 [shuttingDown]，并与恢复一起由 [transitions] 串行化，音频故障
+     *   不能在恢复之后重新隔离（I3）。
+     *
+     * 崩溃/SIGKILL 不经过这里，隔离可能保留，只能由下一次启动恢复。
      */
     suspend fun shutdown(deadlineMs: Long = SHUTDOWN_TERMINATION_DEADLINE_MS): ShutdownResult {
         require(deadlineMs > 0L) { "deadlineMs must be positive" }
+        // I3：先关闭音频故障入口，再让终止/恢复在迁移锁内串行执行。
+        synchronized(stateMonitor) { shuttingDown = true }
         val id = synchronized(stateMonitor) { ownedSession }
-        if (id == null) {
-            // 没有拥有的通话：绝不下发终止，也不恢复麦克风（隔离状态原样保留）。
-            markClosed()
-            return ShutdownResult(
-                ownedSession = null,
-                termination = null,
-                ownershipResolved = false,
-                disconnected = false,
-                microphoneIsolated = audio.microphoneIsolated,
-                code = null,
-            )
-        }
+        if (id == null) return shutdownWithoutOwnedSession()
 
         var termination: TerminationOutcome? = null
-        val resolved = withTimeoutOrNull(deadlineMs) {
-            val result = terminateOwned(id, SHUTDOWN_REASON)
+        val terminated = transitions.withLock {
+            val result = terminateOwnedLocked(id, SHUTDOWN_REASON)
             termination = result.outcome
-            when (result.outcome) {
+            result.outcome
+        }
+        val resolved = withTimeoutOrNull(deadlineMs) {
+            when (terminated) {
                 // 租约已撤销 / 已不归本监督端：AI 不再拥有该通话，可以恢复麦克风。
                 TerminationOutcome.NOT_OWNED, TerminationOutcome.NO_LEASE -> true
                 // 命令被接受/终止失败都必须等到真实的断开事实，不能把“已下发”当成“已断开”。
@@ -1011,49 +1031,90 @@ class Supervisor(
         // 期限边界上可能刚好到达断开事实：有事实就按已解析处理（宁可恢复，不可误报未解决）。
         val resolvedNow = resolved || confirmedDisconnect(id)
         val disconnected = resolvedNow && confirmedDisconnect(id)
-        if (resolvedNow) {
-            val restored = restoreMicrophoneVerified()
-            if (restored) {
-                finishResolvedShutdown(disconnected)
-                return ShutdownResult(
+        return transitions.withLock {
+            if (!resolvedNow) {
+                // 期限已到仍无法确认：保持隔离、失败关闭；绝不能以干净关闭收尾。
+                // ownedSession 清空（进程即将退出）但粘性标记保持 true：下一次启动仍然 fail closed。
+                finishCallUnresolvedShutdown()
+                ShutdownResult(
                     ownedSession = id,
                     termination = termination,
-                    ownershipResolved = true,
-                    disconnected = disconnected,
-                    microphoneIsolated = false,
-                    code = null,
+                    ownershipResolved = false,
+                    disconnected = false,
+                    microphoneIsolated = audio.microphoneIsolated,
+                    code = SHUTDOWN_CALL_UNRESOLVED,
                 )
+            } else {
+                val restored = restoreMicrophoneVerified()
+                if (restored && !audio.microphoneIsolated) {
+                    finishResolvedShutdown(disconnected)
+                    ShutdownResult(
+                        ownedSession = id,
+                        termination = termination,
+                        ownershipResolved = true,
+                        disconnected = disconnected,
+                        microphoneIsolated = false,
+                        code = null,
+                    )
+                } else {
+                    // I2：恢复后仍隔离（或恢复失败）时绝不报干净关闭。
+                    finishRestoreFailedShutdown(disconnected)
+                    ShutdownResult(
+                        ownedSession = id,
+                        termination = termination,
+                        ownershipResolved = true,
+                        disconnected = disconnected,
+                        microphoneIsolated = true,
+                        code = SHUTDOWN_RESTORE_FAILED,
+                    )
+                }
             }
-            finishRestoreFailedShutdown(disconnected)
-            return ShutdownResult(
-                ownedSession = id,
-                termination = termination,
-                ownershipResolved = true,
-                disconnected = disconnected,
+        }
+    }
+
+    /**
+     * 没有拥有的会话（Task 11E / I2）：不下发终止命令，但仍必须处理**观测到的**隔离。
+     * 恢复成功 = 干净关闭；仍隔离 = clean=false + [SHUTDOWN_MICROPHONE_STILL_ISOLATED]。
+     * 粘性所有权标记原样保留，绝不因为“没有 ownedSession”就清掉。
+     */
+    private suspend fun shutdownWithoutOwnedSession(): ShutdownResult = transitions.withLock {
+        val restored = restoreMicrophoneVerified()
+        if (restored && !audio.microphoneIsolated) {
+            synchronized(stateMonitor) {
+                closingCode = null
+                ownedSession = null
+                handoffDeadlineMs = null
+                phase = SupervisorPhase.ENDED
+                started = false
+            }
+            persist()
+            ShutdownResult(
+                ownedSession = null,
+                termination = null,
+                ownershipResolved = false,
+                disconnected = false,
+                microphoneIsolated = false,
+                code = null,
+            )
+        } else {
+            synchronized(stateMonitor) {
+                closingCode = SHUTDOWN_MICROPHONE_STILL_ISOLATED
+                lastFault = SHUTDOWN_MICROPHONE_STILL_ISOLATED
+                ownedSession = null
+                handoffDeadlineMs = null
+                phase = SupervisorPhase.ENDED
+                started = false
+            }
+            persist()
+            ShutdownResult(
+                ownedSession = null,
+                termination = null,
+                ownershipResolved = false,
+                disconnected = false,
                 microphoneIsolated = true,
-                code = SHUTDOWN_RESTORE_FAILED,
+                code = SHUTDOWN_MICROPHONE_STILL_ISOLATED,
             )
         }
-
-        // 期限已到仍无法确认：保持隔离、失败关闭；绝不能以干净关闭收尾。
-        // ownedSession 清空（进程即将退出）但粘性标记保持 true：下一次启动仍然 fail closed。
-        synchronized(stateMonitor) {
-            lastFault = SHUTDOWN_CALL_UNRESOLVED
-            ownershipMayBeLive = true
-            ownedSession = null
-            handoffDeadlineMs = null
-            phase = SupervisorPhase.ENDED
-            started = false
-        }
-        persist()
-        return ShutdownResult(
-            ownedSession = id,
-            termination = termination,
-            ownershipResolved = false,
-            disconnected = false,
-            microphoneIsolated = audio.microphoneIsolated,
-            code = SHUTDOWN_CALL_UNRESOLVED,
-        )
     }
 
     /** 在关闭期限内等待真实断开事实（HOOK 快照、[onCallDisconnected]，或状态探针）。 */
@@ -1084,24 +1145,28 @@ class Supervisor(
      * 三态证据与 [reconcileRecoveryLocked] 同源：[IsolationProbe.Verified] 的读回是唯一
      * 硬证据；工作进程不可达时只有 restore 自身成功应答可作为证据，明确错误则失败关闭。
      */
-    private suspend fun restoreMicrophoneVerified(): Boolean {
+    private suspend fun restoreMicrophoneVerified(): Boolean = withTimeoutOrNull(restoreBudgetMs) {
         val before = probeIsolationSafe()
-        if (before is IsolationProbe.Verified && !before.isolated) return true
+        if (before is IsolationProbe.Verified && !before.isolated) return@withTimeoutOrNull true
         val restored = try {
             audio.restoreMicrophone()
         } catch (t: Throwable) {
             false
         }
-        return when (val after = probeIsolationSafe()) {
+        var after = probeIsolationSafe()
+        // 只允许一次读回重试；两次尝试与恢复本身都受同一个总预算约束。
+        if (after is IsolationProbe.Unverified) after = probeIsolationSafe()
+        when (after) {
             is IsolationProbe.Verified -> !after.isolated
             is IsolationProbe.WorkerError -> false
             is IsolationProbe.Unverified -> restored
         }
-    }
+    } ?: false
 
     /** 已确认非 AI 所有且麦克风已读回恢复：收束状态（确认断开才清除粘性标记）。 */
     private fun finishResolvedShutdown(confirmedDisconnected: Boolean) {
         synchronized(stateMonitor) {
+            closingCode = null
             ownedSession = null
             handoffDeadlineMs = null
             if (confirmedDisconnected) ownershipMayBeLive = false
@@ -1111,9 +1176,24 @@ class Supervisor(
         persist()
     }
 
+    /** 期限内无法确认断开：保持隔离、失败关闭，机器码写入持久状态。 */
+    private fun finishCallUnresolvedShutdown() {
+        synchronized(stateMonitor) {
+            closingCode = SHUTDOWN_CALL_UNRESOLVED
+            lastFault = SHUTDOWN_CALL_UNRESOLVED
+            ownershipMayBeLive = true
+            ownedSession = null
+            handoffDeadlineMs = null
+            phase = SupervisorPhase.ENDED
+            started = false
+        }
+        persist()
+    }
+
     /** 通话已不是 AI 的但麦克风恢复失败：BLOCKED + 明确机器码，等待下一次恢复重试。 */
     private fun finishRestoreFailedShutdown(confirmedDisconnected: Boolean) {
         synchronized(stateMonitor) {
+            closingCode = SHUTDOWN_RESTORE_FAILED
             ownedSession = null
             handoffDeadlineMs = null
             if (confirmedDisconnected) ownershipMayBeLive = false
@@ -1162,6 +1242,7 @@ class Supervisor(
                 updatedAtMs = clock.nowMs(),
                 bootId = bootId(),
                 ownedCallMayBeLive = ownershipMayBeLive,
+                shutdownCode = closingCode,
             )
         }
         try {
@@ -1221,6 +1302,18 @@ class Supervisor(
 
         /** 优雅关闭的终止 + 断开确认总期限（spec §8；模块停用不能无限等待）。 */
         const val SHUTDOWN_TERMINATION_DEADLINE_MS: Long = 5_000L
+
+        /**
+         * 恢复麦克风路径的单一总预算（Task 11E / I1）：一次读回 + 一次恢复 + 最多一次
+         * 读回重试全部包在这一个预算里，不再把 3 次 5 s 的角色通道往返串起来。
+         */
+        const val SHUTDOWN_RESTORE_BUDGET_MS: Long = 6_000L
+
+        /**
+         * I2：没有拥有的会话但恢复后仍隔离（恢复失败/工作进程不可达）时的机器码。
+         * 关闭必须 clean=false，绝不能把系统麦克风留在静音还报成功。
+         */
+        const val SHUTDOWN_MICROPHONE_STILL_ISOLATED: String = "shutdown_microphone_still_isolated"
 
         /** 关闭等待期间检查断开事实的间隔。 */
         internal const val SHUTDOWN_DISCONNECT_POLL_MS: Long = 50L

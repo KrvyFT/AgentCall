@@ -7,6 +7,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.krvyft.agentcall.bridge.ipc.ControlServer
 import org.krvyft.agentcall.core.model.RpcRequest
 import org.krvyft.agentcall.core.model.RpcResponse
 import org.krvyft.agentcall.core.protocol.RolePolicy
@@ -106,6 +107,81 @@ class AgentCallCliTest {
         assertEquals(AgentCallCli.EXIT_USAGE, exit)
         assertTrue(output.contains("\"code\":\"payload_invalid\""))
         assertFalse("含额外键的负载绝不能到达 bridge", called)
+    }
+
+    /**
+     * Task 11E / C1：calibrate 的传输层只做外层形状校验，必须允许可选的
+     * operatorAttestation 对象原样转交；语义（固定词表、root-only）由 bridge 判定。
+     */
+    @Test
+    fun calibrateAcceptsTheOptionalOperatorAttestationEnvelope() {
+        val seen = mutableListOf<RpcRequest>()
+        val transport = CliTransport { request: RpcRequest ->
+            seen += request
+            RpcResponse(id = request.id, payload = "{\"recorded\":true}")
+        }
+        val payload = """
+            {"steps":{"downlinkRecognized":true,"peerHeardSpeech":true,"microphoneIsolated":true,
+            "manualRestoreVerified":true,"processFailureVerified":true},
+            "operatorAttestation":{"transport":"CELLULAR","route":"EARPIECE","manualTestCompleted":true}}
+        """.trimIndent()
+
+        val (exit, output) = invoke(listOf("calibrate"), payload, transport)
+
+        assertEquals(AgentCallCli.EXIT_OK, exit)
+        assertEquals(1, seen.size)
+        assertEquals("负载必须原样转交", payload, seen[0].payload)
+        assertTrue(output.contains("\"recorded\":true"))
+    }
+
+    @Test
+    fun calibrateRejectsANonObjectOperatorAttestationBeforeCallingTheBridge() {
+        var called = false
+        val transport = CliTransport { request: RpcRequest ->
+            called = true
+            RpcResponse(id = request.id, payload = "{}")
+        }
+
+        val (exit, output) = invoke(
+            listOf("calibrate"),
+            "{\"steps\":{},\"operatorAttestation\":\"CELLULAR\"}",
+            transport,
+        )
+
+        assertEquals(AgentCallCli.EXIT_USAGE, exit)
+        assertTrue(output.contains("\"code\":\"payload_invalid\""))
+        assertFalse(called)
+    }
+
+    // ------------------------------------------------------------ shutdown 超时
+
+    /**
+     * Task 11E / I1：优雅关闭的监督端预算（5 s 终止 + 6 s 恢复 + 最多一次不可中断的
+     * 5 s 角色通道往返）必须落在 CLI 的 shutdown 专用超时内。其他方法保持 10 s。
+     */
+    @Test
+    fun shutdownUsesItsOwnLongerSocketTimeout() {
+        val shutdownTimeout = LocalSocketCliTransport.SHUTDOWN_TIMEOUT_MS
+        assertEquals(20_000, shutdownTimeout)
+        assertEquals(10_000, ControlServer.READ_TIMEOUT_MS)
+        assertEquals(
+            "shutdown 必须使用 20 s",
+            shutdownTimeout,
+            LocalSocketCliTransport.timeoutMsFor(RolePolicy.METHOD_SHUTDOWN, ControlServer.READ_TIMEOUT_MS),
+        )
+        for (method in listOf(
+            RolePolicy.METHOD_STATUS,
+            RolePolicy.METHOD_DIAGNOSE,
+            RolePolicy.METHOD_CALIBRATION_READ,
+            RolePolicy.METHOD_CALIBRATION_RECORD,
+            RolePolicy.METHOD_CONFIG_READ,
+        )) {
+            assertEquals(
+                "只有 shutdown 放宽超时：" + method,
+                ControlServer.READ_TIMEOUT_MS,
+                LocalSocketCliTransport.timeoutMsFor(method, ControlServer.READ_TIMEOUT_MS),
+            )
+        }
     }
 
     @Test

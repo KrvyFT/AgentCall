@@ -65,6 +65,9 @@ object AgentCallCli {
     private const val CALIBRATION_STEPS_KEY = "steps"
     private const val CALIBRATION_ENVIRONMENT_KEY = "expectedEnvironment"
 
+    /** root 操作员背书（Task 11E / C1）：外层只校验是对象，词表/root-only 由 bridge 判定。 */
+    private const val CALIBRATION_ATTESTATION_KEY = "operatorAttestation"
+
     @JvmStatic
     fun main(args: Array<String>) {
         val exitCode = try {
@@ -117,7 +120,8 @@ object AgentCallCli {
                     return failure(
                         stdout,
                         ERROR_PAYLOAD_INVALID,
-                        "stdin must be a calibration.record JSON object with steps and optional expectedEnvironment",
+                        "stdin must be a calibration.record JSON object with steps, optional expectedEnvironment " +
+                            "and optional operatorAttestation",
                         EXIT_USAGE,
                     )
                 }
@@ -174,20 +178,30 @@ object AgentCallCli {
     }
 
     /**
-     * calibrate 的外层形状校验（不是语义权威）：必须是 JSON 对象，键只能有 `steps` 与可选
-     * `expectedEnvironment`，两者都必须是对象。五项步骤是否齐全、环境是否未知/不一致
-     * 一律由 bridge 的 CLI_ROOT calibration.record handler 判定（唯一权威）。
+     * calibrate 的外层形状校验（不是语义权威）：必须是 JSON 对象，键只能有 `steps`、
+     * 可选的 `expectedEnvironment` 与可选的 `operatorAttestation`，三者都必须是对象。
+     * 五项步骤是否齐全、环境是否未知/不一致、背书词表/root-only 一律由 bridge 的
+     * CLI_ROOT calibration.record handler 判定（唯一权威）。
      */
     private fun isCalibrationRecordEnvelope(payload: String): Boolean {
         if (payload.isBlank()) return false
         val parsed = runCatching { JsonParser.parseString(payload) }.getOrNull() ?: return false
         if (!parsed.isJsonObject) return false
         val json = parsed.asJsonObject
-        if (!json.keySet().all { it == CALIBRATION_STEPS_KEY || it == CALIBRATION_ENVIRONMENT_KEY }) return false
+        if (!json.keySet().all {
+                it == CALIBRATION_STEPS_KEY ||
+                    it == CALIBRATION_ENVIRONMENT_KEY ||
+                    it == CALIBRATION_ATTESTATION_KEY
+            }
+        ) {
+            return false
+        }
         val steps = json.get(CALIBRATION_STEPS_KEY) ?: return false
         if (!steps.isJsonObject) return false
-        val expected = json.get(CALIBRATION_ENVIRONMENT_KEY) ?: return true
-        return expected.isJsonObject
+        val expected = json.get(CALIBRATION_ENVIRONMENT_KEY)
+        if (expected != null && !expected.isJsonObject) return false
+        val attestation = json.get(CALIBRATION_ATTESTATION_KEY)
+        return attestation == null || attestation.isJsonObject
     }
 
     private fun readBounded(stdin: InputStream): ByteArray? {
@@ -230,7 +244,8 @@ class LocalSocketCliTransport(
         val socket = LocalSocket()
         try {
             socket.connect(LocalSocketAddress(socketName, LocalSocketAddress.Namespace.ABSTRACT))
-            socket.setSoTimeout(timeoutMs)
+            // Task 11E / I1：shutdown 有独立的更长超时（监督端预算 5 s + 6 s + 一次 5 s 往返）。
+            socket.setSoTimeout(timeoutMsFor(request.method, timeoutMs))
             val output = socket.outputStream
             output.write(RpcCodec.encodeRequestFrame(request))
             output.flush()
@@ -248,5 +263,18 @@ class LocalSocketCliTransport(
                 // 关闭失败不影响命令结果。
             }
         }
+    }
+
+    companion object {
+        /**
+         * 优雅关闭专用读超时（Task 11E / I1）：监督端 5 s 终止 + 6 s 恢复 + 最多一次
+         * 不可中断的 5 s 角色通道往返（16 s）+ 余量。其他方法仍用
+         * [ControlServer.READ_TIMEOUT_MS]（10 s）。
+         */
+        const val SHUTDOWN_TIMEOUT_MS: Int = 20_000
+
+        /** 只有 shutdown 放宽到 [SHUTDOWN_TIMEOUT_MS]；其余方法保持配置值。 */
+        internal fun timeoutMsFor(method: String, configuredMs: Int = ControlServer.READ_TIMEOUT_MS): Int =
+            if (method == RolePolicy.METHOD_SHUTDOWN) maxOf(configuredMs, SHUTDOWN_TIMEOUT_MS) else configuredMs
     }
 }

@@ -54,6 +54,12 @@ data class SupervisionPersistedState(
      * 可能仍持有那通电话与麦克风隔离。只有确认非所有权才允许清除。
      */
     val ownedCallMayBeLive: Boolean = false,
+    /**
+     * 最近一次优雅关闭的机器码（Task 11E）：进程退出后内存里的值不可读，所以写进状态
+     * 文件，下一次启动由 [SupervisionGraph.previousShutdownCode] 读出供 status 报告。
+     * null = 干净关闭 / 没有关闭记录 / 读取失败。
+     */
+    val shutdownCode: String? = null,
 )
 
 /**
@@ -162,6 +168,7 @@ class SupervisionStateStore(
             addProperty("updatedAtMs", state.updatedAtMs)
             if (state.bootId == null) add("bootId", null) else addProperty("bootId", state.bootId)
             addProperty("ownedCallMayBeLive", state.ownedCallMayBeLive)
+            if (state.shutdownCode == null) add("shutdownCode", null) else addProperty("shutdownCode", state.shutdownCode)
         }
         atomicWrite(File(rootDirectory, FILE_NAME), json.toString().toByteArray(StandardCharsets.UTF_8))
     }
@@ -214,6 +221,7 @@ class SupervisionStateStore(
             updatedAtMs = long(json, "updatedAtMs"),
             bootId = optionalString(json, "bootId"),
             ownedCallMayBeLive = ownedCallMayBeLive,
+            shutdownCode = optionalString(json, "shutdownCode"),
         )
     }
 
@@ -288,8 +296,8 @@ class SupervisionStateStore(
     }
 
     companion object {
-        /** schema 2 增加独立的粘性所有权标记（ownedCallMayBeLive）。 */
-        const val SCHEMA_VERSION: Int = 2
+        /** schema 2 增加独立的粘性所有权标记（ownedCallMayBeLive）；schema 3 增加 shutdownCode。 */
+        const val SCHEMA_VERSION: Int = 3
 
         /** 从这一版 schema 起 ownedCallMayBeLive 是必填字段；更早的版本按保守值推断。 */
         private const val SCHEMA_OWNED_CALL_MAY_BE_LIVE: Double = 2.0
@@ -588,6 +596,11 @@ class SupervisionGraph(
     val supervisor: Supervisor,
     val recovery: SupervisorBootRecovery,
     val loop: SupervisionLoop,
+    /**
+     * 构建时从监督状态文件读出的上一次关闭机器码（Task 11E）：启动后的 status 可以报告
+     * 上一次进程为何没干净关闭。启动恢复随后会重写状态文件，所以必须在构建时读取。
+     */
+    val previousShutdownCode: String? = null,
 )
 
 /**
@@ -632,7 +645,17 @@ object SupervisorProductionGraph {
             clock = clock,
             beforePoll = beforePoll,
         )
-        return SupervisionGraph(supervisor, recovery, loop)
+        return SupervisionGraph(supervisor, recovery, loop, previousShutdownCode(store))
+    }
+
+    /**
+     * 上一个进程写入的关闭机器码；读不到/损坏时返回 null（status 只报 null，不猜）。
+     * 启动恢复在本方法之后运行，因此这里读到的是上一个进程的最终状态。
+     */
+    private fun previousShutdownCode(store: SupervisionStateStorePort): String? = try {
+        store.load()?.shutdownCode
+    } catch (t: Throwable) {
+        null
     }
 
     /**

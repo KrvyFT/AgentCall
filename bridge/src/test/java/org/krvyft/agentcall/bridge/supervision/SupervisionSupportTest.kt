@@ -89,6 +89,52 @@ class SupervisionStateStoreTest {
     }
 
     @Test
+    fun roundTripsThePersistedShutdownCode() {
+        val root = tempRoot()
+        try {
+            val store = SupervisionStateStore(root)
+            store.save(
+                state.copy(
+                    phase = SupervisorPhase.ENDED,
+                    ownedSession = null,
+                    shutdownCode = Supervisor.SHUTDOWN_MICROPHONE_STILL_ISOLATED,
+                ),
+            )
+
+            val loaded = SupervisionStateStore(root).load()
+
+            assertEquals(
+                "关机机器码必须跨进程可读（下一次启动的 status.shutdownCode）",
+                Supervisor.SHUTDOWN_MICROPHONE_STILL_ISOLATED,
+                loaded?.shutdownCode,
+            )
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun legacyStateWithoutShutdownCodeDecodesAsNull() {
+        val root = tempRoot()
+        try {
+            File(root, SupervisionStateStore.FILE_NAME).writeText(
+                "{\"schema\":2,\"phase\":\"ENDED\",\"ownedSession\":null," +
+                    "\"microphoneIsolated\":true,\"blockedReason\":null,\"lastFault\":null," +
+                    "\"updatedAtMs\":1,\"bootId\":null,\"ownedCallMayBeLive\":true}",
+                StandardCharsets.UTF_8,
+            )
+
+            val loaded = SupervisionStateStore(root).load()
+
+            assertNotNull(loaded)
+            assertNull("旧 schema 没有关机码时必须是 null，不能伪造", loaded!!.shutdownCode)
+            assertTrue("旧 schema 的粘性标记仍按保守值保留", loaded.ownedCallMayBeLive)
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
     fun missingStateIsNull() {
         val root = tempRoot()
         try {
@@ -462,6 +508,46 @@ class SupervisorProductionGraphTest {
             2,
             platform.audio.restoreCalls,
         )
+    }
+
+    /**
+     * Task 11E（minor）：status.shutdownCode 在进程退出后无法从内存读取，所以关闭机器码
+     * 写入监督状态文件；下一次构建生产图时读出来，供启动后的 status 报告。
+     */
+    @Test
+    fun graphExposesTheShutdownCodePersistedByThePreviousProcess() {
+        val store = FakeStateStore(
+            SupervisionPersistedState(
+                phase = SupervisorPhase.ENDED,
+                ownedSession = null,
+                microphoneIsolated = true,
+                blockedReason = null,
+                lastFault = Supervisor.SHUTDOWN_MICROPHONE_STILL_ISOLATED,
+                updatedAtMs = 1,
+                shutdownCode = Supervisor.SHUTDOWN_MICROPHONE_STILL_ISOLATED,
+            ),
+        )
+
+        val graph = SupervisorProductionGraph.build(
+            FakePlatform(
+                emergency = verifiedEmergency(),
+                authorization = AutoAnswerAuthorization { true },
+                store = store,
+            ),
+        )
+
+        assertEquals(
+            "下一次启动必须能读到上一次关闭的机器码",
+            Supervisor.SHUTDOWN_MICROPHONE_STILL_ISOLATED,
+            graph.previousShutdownCode,
+        )
+    }
+
+    @Test
+    fun graphHasNoPreviousShutdownCodeForAFreshStore() {
+        val graph = SupervisorProductionGraph.build(platform())
+
+        assertNull(graph.previousShutdownCode)
     }
 
     @Test
