@@ -124,6 +124,7 @@
     service_not_running: "service.sh 不在运行：本次开机内已没有重启循环，只能重启设备或重新启用模块。",
     module_disabled: "模块已被禁用或标记移除：不会重启桥接。",
     restart_unconfirmed: "桥接没有接受重启请求（可能已退出或不可达），本次没有重启；请刷新状态后再试。",
+    restart_refused: "桥接关闭未确认干净（可能仍隔离麦克风），已拒绝重启；请先手动结束通话并重启设备后再试。",
     restart_request_failed: "无法写入 root 私有重启请求，本次没有重启。",
   };
 

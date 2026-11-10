@@ -7,6 +7,9 @@
 # - restart 是模块侧控制动作（不是 AgentCallCli 命令）：写 root 私有重启请求标记，再执行
 #   固定 CLI shutdown 让桥接干净退出；service.sh 在本次开机的有限循环内消费标记并重新
 #   拉起桥接。它不接受参数，也不会把 restart 转发给 CLI。
+# - 关闭裁决必须可核验：只有 clean=true + shutdownCode=null + microphoneIsolated=false 才
+#   继续；clean=false、麦克风仍隔离（包括 pre-11E 的“无拥有会话但隔离仍为 true”）或裁决
+#   缺失都收回标记并返回 restart_refused（I2），绝不盲目重启。
 # - 配置写入只从 stdin 进入。本脚本从不接收、拼接或回显配置内容：密钥不可能出现在
 #   进程 argv、URL 或日志中。调用方（WebUI）把补丁 JSON 写入 root 私有文件后重定向 stdin：
 #     agentcallctl config-set < /data/adb/agentcall/inbox/config-set.json
@@ -95,6 +98,15 @@ fi
 mkdir -p "$DATA_ROOT" "$INBOX_DIR" "$LOG_DIR" 2>/dev/null
 chmod 0700 "$DATA_ROOT" "$INBOX_DIR" "$LOG_DIR" 2>/dev/null
 
+# 从固定 CLI 的单行 JSON 里取一个标量：只用于读取关闭裁决，不接受外部输入。
+json_scalar() {
+    printf '%s' "$1" | sed -n "s/.*\"$2\":\([^,}]*\).*/\1/p" | head -n 1
+}
+
+# 去掉 JSON 字符串值的引号；null/缺失原样保留，由调用方归一化成 unknown。
+json_text() {
+    printf '%s' "$1" | sed 's/^"//; s/"$//'
+}
 run_cli() {
     "$APP_PROCESS" -Djava.class.path="$BRIDGE_JAR" /system/bin --nice-name=agentcall-cli "$MAIN_CLASS" "$@"
 }
@@ -139,9 +151,33 @@ restart_bridge() {
         rm -f "$temporary" 2>/dev/null
         emit_error "restart_request_failed" "cannot publish the restart request under the root private data directory" 3
     fi
-    if ! run_cli shutdown > /dev/null 2>&1; then
-        rm -f "$RESTART_REQUEST_FILE" 2>/dev/null
+    # 关闭裁决必须可核验：只有 clean=true + shutdownCode=null + microphoneIsolated=false
+    # 才允许重启。pre-11E 的 no-owned-session 形状会返回 clean=true 但麦克风仍隔离，
+    # 因此不能只看退出码或 clean；裁决缺失同样 fail closed。拒绝时收回标记。
+    verdict_file="$DATA_ROOT/restart-shutdown.$$.json"
+    if ! run_cli shutdown > "$verdict_file" 2>/dev/null; then
+        rm -f "$RESTART_REQUEST_FILE" "$verdict_file" 2>/dev/null
         emit_error "restart_unconfirmed" "bridge did not accept the shutdown request; nothing was restarted" 3
+    fi
+    shutdown_result=$(cat "$verdict_file" 2>/dev/null)
+    rm -f "$verdict_file" 2>/dev/null
+    shutdown_clean=$(json_scalar "$shutdown_result" clean)
+    shutdown_code=$(json_text "$(json_scalar "$shutdown_result" shutdownCode)")
+    shutdown_isolated=$(json_scalar "$shutdown_result" microphoneIsolated)
+    case "$shutdown_clean" in
+        true|false) ;;
+        *) shutdown_clean= ;;
+    esac
+    case "$shutdown_isolated" in
+        true|false) ;;
+        *) shutdown_isolated= ;;
+    esac
+    if [ "$shutdown_clean" != "true" ] || [ "$shutdown_code" != "null" ] || [ "$shutdown_isolated" != "false" ]; then
+        rm -f "$RESTART_REQUEST_FILE" 2>/dev/null
+        if [ -z "$shutdown_clean" ] && [ -z "$shutdown_code" ] && [ -z "$shutdown_isolated" ]; then
+            emit_error "restart_refused" "bridge shutdown verdict is missing; restart refused: verdict_missing" 3
+        fi
+        emit_error "restart_refused" "bridge shutdown was not clean; restart refused: clean=${shutdown_clean:-unknown} shutdownCode=${shutdown_code:-unknown} microphoneIsolated=${shutdown_isolated:-unknown}" 3
     fi
     printf '{"restart":"requested"}\n'
     exit 0

@@ -1085,6 +1085,7 @@ test("agentcallctl：restart 是固定模块命令，写重启标记后只执行
   assert.match(ctl, /service_not_running/, "service.sh 未运行时必须给出机器可读错误");
   assert.match(ctl, /module_disabled/, "remove/disable 标记存在时必须拒绝重启");
   assert.match(ctl, /run_cli shutdown/, "只允许执行固定 CLI shutdown，绝不执行任意 shell");
+  assert.match(ctl, /restart_refused/, "关闭裁决不干净/仍隔离时必须拒绝重启并给出机器码");
   assert.equal(/run_cli restart/.test(ctl), false, "restart 不得转发给 AgentCallCli（它不是 RPC 命令）");
   assert.equal(/eval |sh -c|system\(/.test(ctl), false, "包装器不得新增任意 shell 路径");
   const restartAt = ctl.indexOf("restart_bridge");
@@ -1131,6 +1132,7 @@ function ctlHarness() {
       'if [ -n "$AGENTCALL_FAKE_ARGS_FILE" ]; then',
       '  printf "%s\\n" "$*" >> "$AGENTCALL_FAKE_ARGS_FILE"',
       "fi",
+      'if [ -n "$AGENTCALL_FAKE_STDOUT" ]; then printf "%s\\n" "$AGENTCALL_FAKE_STDOUT"; fi',
       'exit "${AGENTCALL_FAKE_CLI_EXIT:-0}"',
       "",
     ].join("\n"),
@@ -1184,13 +1186,94 @@ test("agentcallctl restart：写本服务 PID 的重启标记并只执行固定 
     service = startFakeService(harness);
     writeFileSync(harness.servicePidFile, String(service.pid) + "\n");
 
-    const result = runCtl(harness);
+    const result = runCtl(harness, {
+      AGENTCALL_FAKE_STDOUT: JSON.stringify({
+        stopping: true,
+        clean: true,
+        shutdownCode: null,
+        supervision: { clean: true, ownedSession: true, microphoneIsolated: false },
+      }),
+    });
     assert.equal(result.status, 0, "restart 必须成功：" + result.stdout + result.stderr);
     assert.equal(result.stdout.trim(), '{"restart":"requested"}', "成功只输出机器可读的请求结果");
     assert.equal(readFileSync(harness.restartRequestFile, "utf8").trim(), String(service.pid), "标记必须指向当前 service.sh");
     const args = readFileSync(harness.argsFile, "utf8").trim();
     assert.match(args, /AgentCallCli shutdown$/, "只允许固定 CLI shutdown：" + args);
     assert.equal(/ restart/.test(args), false, "restart 不得转发给 AgentCallCli");
+  } finally {
+    killQuietly(service);
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("agentcallctl restart：关闭裁决 clean=false 时拒绝重启、收回标记并返回 restart_refused", () => {
+  const harness = ctlHarness();
+  let service = null;
+  try {
+    service = startFakeService(harness);
+    writeFileSync(harness.servicePidFile, String(service.pid) + "\n");
+
+    const result = runCtl(harness, {
+      AGENTCALL_FAKE_STDOUT: JSON.stringify({
+        stopping: true,
+        clean: false,
+        shutdownCode: "shutdown_call_unresolved",
+        supervision: { clean: false, ownedSession: true, microphoneIsolated: true },
+      }),
+    });
+    assert.notEqual(result.status, 0, "不干净的关闭不得重启：" + result.stdout);
+    assert.equal(ctlErrorCode(result), "restart_refused");
+    const message = JSON.parse(result.stdout.trim()).error.message;
+    assert.match(message, /clean=false/, "必须给出裁决原因：" + message);
+    assert.match(message, /shutdown_call_unresolved/, "必须给出机器码：" + message);
+    assert.match(message, /microphoneIsolated=true/, "必须给出隔离读回：" + message);
+    assert.equal(existsSync(harness.restartRequestFile), false, "拒绝重启必须收回标记");
+    const args = readFileSync(harness.argsFile, "utf8").trim();
+    assert.match(args, /AgentCallCli shutdown$/, "仍只执行固定 shutdown");
+  } finally {
+    killQuietly(service);
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("agentcallctl restart：clean=true 但 microphoneIsolated=true（无拥有会话）也拒绝重启", () => {
+  const harness = ctlHarness();
+  let service = null;
+  try {
+    service = startFakeService(harness);
+    writeFileSync(harness.servicePidFile, String(service.pid) + "\n");
+
+    const result = runCtl(harness, {
+      AGENTCALL_FAKE_STDOUT: JSON.stringify({
+        stopping: true,
+        clean: true,
+        shutdownCode: null,
+        supervision: { clean: true, ownedSession: false, microphoneIsolated: true },
+      }),
+    });
+    assert.notEqual(result.status, 0, "麦克风仍隔离时不得重启：" + result.stdout);
+    assert.equal(ctlErrorCode(result), "restart_refused");
+    const message = JSON.parse(result.stdout.trim()).error.message;
+    assert.match(message, /microphoneIsolated=true/, "不能只看 clean：" + message);
+    assert.equal(existsSync(harness.restartRequestFile), false, "拒绝重启必须收回标记");
+  } finally {
+    killQuietly(service);
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("agentcallctl restart：缺少关闭裁决时也拒绝（fail closed，不猜测干净）", () => {
+  const harness = ctlHarness();
+  let service = null;
+  try {
+    service = startFakeService(harness);
+    writeFileSync(harness.servicePidFile, String(service.pid) + "\n");
+
+    const result = runCtl(harness, { AGENTCALL_FAKE_STDOUT: '{"stopping":true}' });
+    assert.notEqual(result.status, 0, "缺少裁决不得重启：" + result.stdout);
+    assert.equal(ctlErrorCode(result), "restart_refused");
+    assert.match(JSON.parse(result.stdout.trim()).error.message, /verdict_missing/, "必须点名缺失的裁决");
+    assert.equal(existsSync(harness.restartRequestFile), false, "拒绝重启必须收回标记");
   } finally {
     killQuietly(service);
     rmSync(harness.root, { recursive: true, force: true });

@@ -1153,6 +1153,14 @@
               return;
             }
             recordError(result.code, result.message || "");
+            if (result.code === "restart_refused") {
+              showBanner(
+                "err",
+                "重试服务被拒绝：桥接关闭未确认干净，麦克风可能仍被隔离；本次没有重启。请先手动结束通话并重启设备后再试。",
+                [{ label: "关闭", onClick: hideBanner }],
+              );
+              return;
+            }
             showBanner("err", "重试服务失败：" + (result.message || B.errorText(result.code)), [
               { label: "关闭", onClick: hideBanner },
             ]);

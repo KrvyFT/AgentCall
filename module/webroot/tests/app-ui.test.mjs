@@ -481,6 +481,33 @@ test("诊断页重试服务：真实桥接时只发固定 agentcallctl restart�
   assert.match(doc.getElementById("toast").textContent, /重启/);
 });
 
+test("诊断页重试服务：restart_refused 时显示未确认关闭/麦克风可能隔离，不宣称重启", async () => {
+  const holder = {};
+  const handlers = defaultHandlers(holder);
+  handlers.restart = () => ({
+    errno: 1,
+    stdout: JSON.stringify({
+      error: {
+        code: "restart_refused",
+        message: "bridge shutdown was not clean; restart refused: clean=false shutdownCode=shutdown_call_unresolved microphoneIsolated=true",
+      },
+    }),
+    stderr: "",
+  });
+  const fake = fakeManager({ handlers });
+  holder.current = fake;
+  const { doc } = await boot({ fake });
+
+  doc.getElementById("diag-retry-service").click();
+  doc.getElementById("banner-actions").children[0].click();
+  await tick(30);
+
+  const banner = doc.getElementById("banner-text").textContent;
+  assert.match(banner, /未确认关闭|麦克风可能仍被隔离/, "必须说明关闭未确认/麦克风可能隔离：" + banner);
+  assert.match(banner, /没有重启|本次没有重启/, "不得宣称已重启：" + banner);
+  assert.equal(/已请求重启/.test(doc.getElementById("toast").textContent), false, "拒绝时不得显示已请求重启");
+});
+
 test("诊断页重试服务：演示态（无真实桥接）保持禁用且点击不发命令", async () => {
   const { doc, app } = await boot({});
   const button = doc.getElementById("diag-retry-service");
