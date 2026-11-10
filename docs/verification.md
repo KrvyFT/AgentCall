@@ -65,7 +65,7 @@ major version 55 = Java 11 字节码，与 `compileOptions` 的 `VERSION_11` 一
 | `libs.kotlinx.coroutines.core` | `org.jetbrains.kotlinx:kotlinx-coroutines-core` | 1.9.0 | `:core` `api`（`AudioSession.downlink: Flow` 是公开契约，消费方需看到同一份协程类型） |
 | `libs.kotlinx.coroutines.test` | `kotlinx-coroutines-test` | 1.9.0 | 否（任务 2 起的虚拟时间测试用） |
 | `libs.libphonenumber` | `com.googlecode.libphonenumber:libphonenumber` | 9.0.43 | 否（任务 2 号码规范化） |
-| `libs.gson` | `com.google.code.gson:gson` | 2.11.0 | 否（任务 3 协议/配置编码） |
+| `libs.gson` | `com.google.code.gson:gson` | 2.11.0 | 是（任务 3：`:core` 协议/配置编码，`:bridge` 声明同一版本） |
 | `libs.okhttp` | `com.squareup.okhttp3:okhttp` | 4.12.0 | 否（任务 6 才加 usage） |
 | `libs.okhttp.mockwebserver` | `com.squareup.okhttp3:mockwebserver` | 4.12.0 | 否（任务 6 测试） |
 
@@ -379,6 +379,8 @@ $ grep -l -a -F 'Lcom/google/gson/Gson;' /tmp/bridge-dex/classes*.dex
   未验证；获取失败时实现选择退出（`package_manager_unavailable`），不降级信任。
 - `LocalSocket#getPeerCredentials` 返回真实 uid/pid、不同 UID 被拒绝、SELinux 可达性：
   仅写了 `BI/ipc/PeerCredentialsTest.kt`，本机无设备未执行。
+- 配对记录保存配对时从 PackageManager 解析的 AgentCall/Google 电话版本名（签名仍是授权锚点）；
+  该字段已写入配对 JSON，但真机配对与升级后的版本核对未验证。
 - 配对与 CLI 在真机上的 root 身份、WebView 桥（任务 8）未验证。
 - PCM 通道已实现独立 bind/限长/凭据校验，但本任务没有音频生产者，`:bridge` 运行容器未注入 sink；
   真正音频接入属任务 5。
