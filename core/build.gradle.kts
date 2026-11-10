@@ -31,5 +31,8 @@ dependencies {
     // app/bridge 需要在自己的编译类路径上看到同一份 coroutines，否则消费方能编译失败或解析到别的版本。
     api(libs.kotlinx.coroutines.core)
 
+    // spec §7：完整号码按可配置地区规范化，禁止自写号段/后缀近似匹配。
+    implementation(libs.libphonenumber)
+
     testImplementation(libs.junit)
 }
