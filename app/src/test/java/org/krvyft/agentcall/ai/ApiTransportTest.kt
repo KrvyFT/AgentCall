@@ -33,7 +33,6 @@ import org.junit.Test
 import org.krvyft.agentcall.core.model.ApiEndpoint
 import org.krvyft.agentcall.core.model.AudioFormatSpec
 import org.krvyft.agentcall.core.model.PcmAudio
-import org.krvyft.agentcall.core.port.MonotonicClock
 
 /**
  * 真实 TLS + MockWebServer 的 HTTP 失败路径测试：路径前缀、内容类型、8 MiB 上限、
@@ -141,7 +140,7 @@ class ApiTransportTest {
     }
 
     @Test
-    fun chatRejectsStreamingContentType() = runBlocking {
+    fun chatRejectsStreamingContentType() = runBlocking<Unit> {
         server.enqueue(
             MockResponse()
                 .setHeader("Content-Type", "text/event-stream")
@@ -154,7 +153,7 @@ class ApiTransportTest {
     }
 
     @Test
-    fun chatRejectsMalformedOrEmptyChoices() = runBlocking {
+    fun chatRejectsMalformedOrEmptyChoices() = runBlocking<Unit> {
         val client = ChatClient(transport(), ApiEndpoint(server.url("/v1/").toString(), "m"), "sk")
         server.enqueue(jsonResponse("{\"choices\":[]}"))
         expectFailure(MalformedResponseException::class.java) {
@@ -172,7 +171,8 @@ class ApiTransportTest {
 
     @Test
     fun synthesizePostsJsonAndDecodesWav() = runBlocking {
-        val wav = WavCodec.encode(PcmAudio(tone(250, 24_000), AudioFormatSpec(24_000)))
+        val pcm = tone(250, 24_000)
+        val wav = WavCodec.encode(PcmAudio(pcm, AudioFormatSpec(24_000)))
         server.enqueue(
             MockResponse()
                 .setHeader("Content-Type", "audio/wav")
@@ -189,7 +189,8 @@ class ApiTransportTest {
         val audio = client.synthesize("你好")
 
         assertEquals(24_000, audio.format.sampleRate)
-        assertArrayEquals(wav, audio.data)
+        // 客户端返回解码后的 PCM 载荷，不是 WAV 容器字节。
+        assertArrayEquals(pcm, audio.data)
         val recorded = server.takeRequest()
         assertEquals("/tts/v1/audio/speech", recorded.path)
         assertEquals("Bearer sk-tts", recorded.getHeader("Authorization"))
@@ -201,7 +202,7 @@ class ApiTransportTest {
     }
 
     @Test
-    fun synthesizeRejectsNonWavContentType() = runBlocking {
+    fun synthesizeRejectsNonWavContentType() = runBlocking<Unit> {
         server.enqueue(
             MockResponse()
                 .setHeader("Content-Type", "audio/mpeg")
@@ -212,7 +213,7 @@ class ApiTransportTest {
     }
 
     @Test
-    fun synthesizeRejectsMalformedWavBody() = runBlocking {
+    fun synthesizeRejectsMalformedWavBody() = runBlocking<Unit> {
         server.enqueue(
             MockResponse()
                 .setHeader("Content-Type", "audio/wav")
@@ -364,7 +365,7 @@ class ApiTransportTest {
     }
 
     @Test
-    fun declaredOversizedResponseIsRejected() = runBlocking {
+    fun declaredOversizedResponseIsRejected() = runBlocking<Unit> {
         val oversized = "x".repeat(ApiTransport.MAX_RESPONSE_BYTES + 1)
         server.enqueue(jsonResponse(oversized))
         val client = ChatClient(transport(), ApiEndpoint(server.url("/v1/").toString(), "m"), "sk")
@@ -374,7 +375,7 @@ class ApiTransportTest {
     }
 
     @Test
-    fun chunkedOversizedResponseIsRejectedWhileReading() = runBlocking {
+    fun chunkedOversizedResponseIsRejectedWhileReading() = runBlocking<Unit> {
         val transport = transport(maxResponseBytes = 1_024)
         val client = ChatClient(transport, ApiEndpoint(server.url("/v1/").toString(), "m"), "sk")
         server.enqueue(
@@ -397,7 +398,7 @@ class ApiTransportTest {
                 "sk",
                 "{}".toRequestBody("application/json".toMediaType()),
                 "application/json",
-                Deadline(MonotonicClock { 0L }.nowMs()),
+                Deadline(0L),
             )
         }
         assertEquals(0, server.requestCount)
@@ -469,11 +470,11 @@ class ApiTransportTest {
             .setBody(body)
 }
 
-internal suspend fun <T : Throwable> expectFailure(type: Class<T>, block: suspend () -> Unit): T {
+internal inline fun <T : Throwable> expectFailure(type: Class<T>, block: () -> Unit): T {
     try {
         block()
     } catch (t: Throwable) {
-        if (type.isInstance(t)) return type.cast(t)
+        if (type.isInstance(t)) return type.cast(t)!!
         throw AssertionError("expected " + type.simpleName + " but got " + t, t)
     }
     throw AssertionError("expected " + type.simpleName + " but nothing was thrown")

@@ -2,6 +2,7 @@ package org.krvyft.agentcall.ai
 
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -133,7 +134,7 @@ class ConversationEngineTest {
         assertEquals(300, speech.texts.single().length)
         audio.feedSegment()
         testScheduler.advanceUntilIdle()
-        assertEquals(300, chat.requests.last().last().content.length)
+        assertEquals(300, chat.requests.last()[2].content.length)
         job.cancel()
     }
 
@@ -234,11 +235,10 @@ class ConversationEngineTest {
     @Test
     fun alreadyPlayedAudioIsNeverReplayedWhenALaterStageFails() = runTest {
         val audio = FakeAudioSession()
-        val transcriber = FakeTranscriber().apply {
-            failures.add(ApiStatusException(500, "first failure"))
-            failures.add(ApiStatusException(500, "retry failure"))
-        }
-        val speech = FakeSpeech()
+        val transcriber = FakeTranscriber()
+        // 第一回合完整播放；第二回合在 TTS 阶段失败两次（不产生新的上行音频，
+        // 也绝不重播第一回合已播放过的语音）。
+        val speech = FakeSpeech().apply { failFromCall = 2 }
         audio.feedSegment()
         audio.feedSegment()
 
@@ -246,8 +246,8 @@ class ConversationEngineTest {
             engine(transcriber = transcriber, speech = speech).run(session, audio, config())
         }
 
-        assertEquals(1, speech.calls)
-        assertEquals(1, audio.writeCount)
+        assertEquals("one successful synthesis for the first turn plus one failed retry pair", 3, speech.calls)
+        assertEquals("already played audio is written once, never replayed", 1, audio.writeCount)
     }
 
     // ------------------------------------------------------------------ 取消与回声
@@ -390,6 +390,7 @@ class ConversationEngineTest {
     private class FakeSpeech : SpeechSynthesizer {
         var calls = 0
         var delayMs = 0L
+        var failFromCall = Int.MAX_VALUE
         val texts = mutableListOf<String>()
         val failures = ArrayDeque<Throwable>()
         var result = PcmAudio(tone(50), AudioFormatSpec(16_000))
@@ -398,6 +399,7 @@ class ConversationEngineTest {
             calls += 1
             texts += text
             failures.removeFirstOrNull()?.let { throw it }
+            if (calls >= failFromCall) throw ApiStatusException(500, "later TTS failure")
             if (delayMs > 0L) delay(delayMs)
             return result
         }
@@ -418,6 +420,10 @@ class ConversationEngineTest {
         override suspend fun stop() {
             stopCount += 1
         }
+    }
+
+    private fun FakeAudioSession.feedSegment() {
+        chunked(tone(1_000) + silence(800)).forEach { chunks.trySend(it) }
     }
 }
 
@@ -504,6 +510,3 @@ private fun chunked(bytes: ByteArray, chunkMs: Int = 10, sampleRate: Int = 16_00
     return out
 }
 
-private fun FakeAudioSession.feedSegment() {
-    chunked(tone(1_000) + silence(800)).forEach { chunks.trySend(it) }
-}

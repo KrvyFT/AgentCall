@@ -213,10 +213,10 @@ internal fun riffWithExtraChunk(
     extraPayload: ByteArray,
     data: ByteArray,
 ): ByteArray {
-    var body = chunk("fmt ", fmt) + chunk(extraId, extraPayload) + chunk("data", data)
-    if (extraPayload.size % 2 == 1) {
-        body += byteArrayOf(0)
-    }
+    // RIFF 要求奇数长度 chunk 之后紧跟一个填充字节；填充必须在 data 之前，
+    // 否则 data chunk 不再是字对齐的，测试文件本身就会破坏 RIFF 布局。
+    val pad = if (extraPayload.size % 2 == 1) byteArrayOf(0) else ByteArray(0)
+    val body = chunk("fmt ", fmt) + chunk(extraId, extraPayload) + pad + chunk("data", data)
     return buildRiff(4 + body.size, body)
 }
 
