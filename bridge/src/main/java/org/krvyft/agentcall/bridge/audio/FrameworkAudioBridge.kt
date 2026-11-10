@@ -14,6 +14,8 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.isActive
@@ -82,6 +84,18 @@ interface CallAudioFramework {
 
         /** 返回实际写入的样本数；负值/0 表示失败。 */
         fun write(samples: ShortArray, offset: Int, count: Int): Int
+
+        /**
+         * 已真正播放（渲染）的帧数，语义同 AudioTrack.getPlaybackHeadPosition：
+         * 自播放器创建/flush/stop 后单调递增，flush/stop 会把它归零，取值按 32 位无符号。
+         *
+         * [FrameworkAudioSession.writeUplink] 只用它判断“播放完成”；把 write 返回
+         * 当成“已播放”会破坏 core AudioBridge.kt:27-38 的播放完成契约。
+         */
+        fun playedFrames(): Int
+
+        /** 播放器当前是否处于播放态；暂停或被外部停止时播放头不会前进。 */
+        fun isPlaying(): Boolean
 
         fun close()
     }
@@ -248,6 +262,18 @@ class AndroidCallAudioFramework(
         override fun write(samples: ShortArray, offset: Int, count: Int): Int =
             track.write(samples, offset, count)
 
+        override fun playedFrames(): Int = try {
+            track.playbackHeadPosition
+        } catch (t: Throwable) {
+            -1
+        }
+
+        override fun isPlaying(): Boolean = try {
+            track.playState == AudioTrack.PLAYSTATE_PLAYING
+        } catch (t: Throwable) {
+            false
+        }
+
         override fun close() {
             runCatching { track.stop() }
             runCatching { track.release() }
@@ -264,7 +290,14 @@ class AndroidCallAudioFramework(
 class FrameworkAudioBridge(
     private val framework: CallAudioFramework = AndroidCallAudioFramework(),
     private val dispatcher: CoroutineDispatcher = Dispatchers.IO,
+    private val playbackPollMs: Long = DEFAULT_PLAYBACK_POLL_MS,
+    private val playbackStallTimeoutMs: Long = DEFAULT_PLAYBACK_STALL_TIMEOUT_MS,
 ) : AudioBridge {
+
+    init {
+        require(playbackPollMs > 0L) { "playbackPollMs must be positive" }
+        require(playbackStallTimeoutMs > 0L) { "playbackStallTimeoutMs must be positive" }
+    }
 
     /** 只探测、不创建对象/不申请权限。 */
     fun probe(): AudioCapability {
@@ -352,7 +385,15 @@ class FrameworkAudioBridge(
             )
         }
 
-        return FrameworkAudioSession(id, format, downlink, uplink, dispatcher)
+        return FrameworkAudioSession(
+            id,
+            format,
+            downlink,
+            uplink,
+            dispatcher,
+            playbackPollMs,
+            playbackStallTimeoutMs,
+        )
     }
 
     private fun requireSupportedFormat(format: AudioFormatSpec) {
@@ -367,6 +408,14 @@ class FrameworkAudioBridge(
             )
         }
     }
+
+    companion object {
+        /** 播放头轮询间隔：决定“播放完成/取消”被观察到的最大延迟。 */
+        const val DEFAULT_PLAYBACK_POLL_MS: Long = 20L
+
+        /** 播放器暂停/停止且播放头不前进的容忍时长；超过即按播放中断失败，绝不无限挂起。 */
+        const val DEFAULT_PLAYBACK_STALL_TIMEOUT_MS: Long = 2_000L
+    }
 }
 
 /** 一次真实双向音频会话：下行来自通话提取录音，上行写入通话注入播放器。 */
@@ -376,6 +425,8 @@ private class FrameworkAudioSession(
     private val downlinkHandle: CallAudioFramework.Downlink,
     private val uplinkHandle: CallAudioFramework.Uplink,
     private val dispatcher: CoroutineDispatcher,
+    private val playbackPollMs: Long,
+    private val playbackStallTimeoutMs: Long,
 ) : AudioSession {
 
     private val chunks = Channel<PcmChunk>(CHANNEL_CAPACITY)
@@ -386,6 +437,9 @@ private class FrameworkAudioSession(
     private val uplinkResampler = Resampler(outputFormat.sampleRate, uplinkHandle.sampleRate)
     private val uplinkChannels: Int = uplinkHandle.channels
     private val uplinkLock = Mutex()
+
+    /** 本次会话已写入注入播放器的累计帧数；播放头必须追平它才算播放完成。 */
+    private var writtenFrames: Long = 0L
     private val readJob: Job = scope.launch { readDownlink() }
 
     override val downlink: Flow<PcmChunk> = chunks.receiveAsFlow()
@@ -440,11 +494,21 @@ private class FrameworkAudioSession(
         closeHandles()
     }
 
+    /**
+     * 写入上行并**挂起直到这些帧真的播放完毕**（core AudioBridge.kt:27-38）。
+     *
+     * 实现要点：
+     * - 写入按帧分片，每片前检查协程取消/会话停止：阻塞的 AudioTrack.write 最多拖住
+     *   一片（约 10 ms），取消不会等到一整段音频写进播放缓冲才被观察；
+     * - 写完之后继续轮询播放头，直到它追平本会话已写入的帧数；绝不把 write 返回
+     *   当成“已播放”；
+     * - 播放头回退（flush/stop 归零）视为排队音频被丢弃 → 明确失败，绝不返回“完成”；
+     * - 播放器暂停/停止且播放头不前进超过 [playbackStallTimeoutMs] → 明确失败，
+     *   既有界又不会把“暂停”误判成“播完”。
+     */
     override suspend fun writeUplink(audio: PcmAudio) {
         uplinkLock.withLock {
-            if (stopped.get()) {
-                throw AudioUnavailableException("audio_stopped", AudioFailureCode.STOPPED, "audio session is stopped")
-            }
+            if (stopped.get()) throw stoppedException()
             if (audio.format != outputFormat) {
                 throw AudioUnavailableException(
                     "audio_format_invalid",
@@ -455,7 +519,7 @@ private class FrameworkAudioSession(
             val samples = pcm16Samples(audio.data)
             val deviceSamples = uplinkResampler.resampleSamples(samples)
             withContext(dispatcher) {
-                writeUplinkFrames(deviceSamples)
+                writeAndAwaitPlayback(deviceSamples)
             }
         }
     }
@@ -464,7 +528,7 @@ private class FrameworkAudioSession(
      * 内部流固定单声道；若注入播放器是立体声，必须按帧复制到所有声道，否则
      * 直接写单声道样本会被当成交错帧播放（时长减半、声道错位）。
      */
-    private fun writeUplinkFrames(monoSamples: ShortArray) {
+    private suspend fun writeAndAwaitPlayback(monoSamples: ShortArray) {
         val channels = uplinkChannels
         val interleaved = if (channels == 1) {
             monoSamples
@@ -473,16 +537,21 @@ private class FrameworkAudioSession(
                 monoSamples[index / channels]
             }
         }
+        val framesThisCall = (interleaved.size / channels).toLong()
+        // 外部 flush 会把播放头归零：以当前播放头重新计数（旧音频已被丢弃），否则永远追不平。
+        val headBefore = readPlayhead()
+        if (headBefore >= 0L && headBefore < writtenFrames) {
+            writtenFrames = headBefore
+        }
+        val targetFrames = writtenFrames + framesThisCall
+        val sliceSamples = maxOf(channels, WRITE_SLICE_FRAMES * channels)
+
         var offset = 0
         while (offset < interleaved.size) {
-            if (stopped.get()) {
-                throw AudioUnavailableException(
-                    "audio_stopped",
-                    AudioFailureCode.STOPPED,
-                    "audio session is stopped",
-                )
-            }
-            val written = uplinkHandle.write(interleaved, offset, interleaved.size - offset)
+            if (stopped.get()) throw stoppedException()
+            currentCoroutineContext().ensureActive()
+            val requested = minOf(sliceSamples, interleaved.size - offset)
+            val written = uplinkHandle.write(interleaved, offset, requested)
             if (written <= 0) {
                 throw AudioUnavailableException(
                     "audio_uplink_failed",
@@ -499,8 +568,70 @@ private class FrameworkAudioSession(
                 )
             }
             offset += written
+            writtenFrames += (written / channels).toLong()
+        }
+        awaitPlayback(targetFrames)
+    }
+
+    /** 轮询播放头直到本次写入的帧全部渲染完成；取消/停止/暂停都在这里被观察。 */
+    private suspend fun awaitPlayback(targetFrames: Long) {
+        val maxStalledPolls = maxOf(1L, playbackStallTimeoutMs / playbackPollMs)
+        var lastHead = -1L
+        var stalledPolls = 0L
+        while (true) {
+            if (stopped.get()) throw stoppedException()
+            currentCoroutineContext().ensureActive()
+            val head = readPlayhead()
+            if (head < 0L) {
+                throw AudioUnavailableException(
+                    "audio_uplink_failed",
+                    AudioFailureCode.UPLINK_FAILED,
+                    "playback head is unavailable",
+                )
+            }
+            if (head >= targetFrames) return
+            if (lastHead >= 0L && head < lastHead) {
+                // flush/stop 把播放头归零：本次排队音频已被丢弃，不是“播放完成”。
+                throw AudioUnavailableException(
+                    "audio_playback_flushed",
+                    AudioFailureCode.STOPPED,
+                    "playback head was reset before the injected audio finished",
+                )
+            }
+            if (!uplinkHandle.isPlaying()) {
+                stalledPolls++
+                if (stalledPolls >= maxStalledPolls) {
+                    throw AudioUnavailableException(
+                        "audio_playback_stalled",
+                        AudioFailureCode.STOPPED,
+                        "playback is paused/stopped before the injected audio finished",
+                    )
+                }
+            } else {
+                stalledPolls = 0L
+            }
+            lastHead = head
+            delay(playbackPollMs)
         }
     }
+
+    /** AudioTrack 的播放头是 32 位无符号帧计数；不可读返回 -1。 */
+    private fun readPlayhead(): Long {
+        val raw = try {
+            uplinkHandle.playedFrames()
+        } catch (t: Throwable) {
+            -1
+        }
+        if (raw < 0) return -1L
+        return raw.toLong() and UNSIGNED_INT_MASK
+    }
+
+    private fun stoppedException(): AudioUnavailableException =
+        AudioUnavailableException(
+            "audio_stopped",
+            AudioFailureCode.STOPPED,
+            "audio session is stopped",
+        )
 
     override suspend fun stop() {
         if (!stopped.compareAndSet(false, true)) return
@@ -548,6 +679,11 @@ private class FrameworkAudioSession(
 
         /** 每次读取的帧数（mono 等价 40 ms @48 kHz）。 */
         const val READ_FRAMES: Int = 1_920
+
+        /** 每次注入写入的帧数：约 10 ms @48 kHz。分片让阻塞写无法吞掉协程取消。 */
+        const val WRITE_SLICE_FRAMES: Int = 480
+
+        const val UNSIGNED_INT_MASK: Long = 0xFFFF_FFFFL
     }
 }
 

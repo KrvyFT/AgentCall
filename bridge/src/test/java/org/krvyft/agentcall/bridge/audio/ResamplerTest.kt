@@ -1,7 +1,11 @@
 package org.krvyft.agentcall.bridge.audio
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertArrayEquals
@@ -372,6 +376,167 @@ class FrameworkAudioBridgeTest {
         audio.stop()
     }
 
+    /**
+     * 播放完成契约（core AudioBridge.kt:27-38）：writeUplink 必须等到注入的音频**真正
+     * 播放结束**才返回。假播放器把“写入”和“播放头前进”分开，证明实现等的是播放头，
+     * 而不是 AudioTrack.write 已把数据塞进播放缓冲。
+     */
+    @Test
+    fun writeUplinkReturnsOnlyAfterTheTrackReportsCompletedPlayback() = runBlocking {
+        val downlink = FakeDownlink(sampleRate = 16_000, channels = 1)
+        val uplink = FakeUplink(sampleRate = 16_000, channels = 1, completesPlaybackImmediately = false)
+        val bridge = FrameworkAudioBridge(framework(downlink = downlink, uplink = uplink), playbackPollMs = 5)
+        val audio = bridge.open(session, format)
+        val samples = samplesOf(1, 2, 3)
+        val job = async(Dispatchers.Default) {
+            audio.writeUplink(PcmAudio(pcm16Bytes(samples), format))
+        }
+        try {
+            delay(150)
+            assertEquals("上行样本必须已经写入注入播放器", 3, uplink.writtenFrames)
+            assertFalse(
+                "播放头未到写入帧数前 writeUplink 不得返回，否则引擎的 300 ms 窗口覆盖不了回声",
+                job.isCompleted,
+            )
+
+            uplink.headFrames = 3
+            withTimeout(2_000) { job.await() }
+            assertTrue(job.isCompleted)
+        } finally {
+            job.cancel()
+            audio.stop()
+        }
+    }
+
+    /** 取消必须在若干次轮询内返回，而不是等整段音频“播完”或一次阻塞写返回。 */
+    @Test
+    fun writeUplinkCancellationStopsThePlaybackWait() = runBlocking {
+        val uplink = FakeUplink(sampleRate = 16_000, channels = 1, completesPlaybackImmediately = false)
+        val bridge = FrameworkAudioBridge(framework(uplink = uplink), playbackPollMs = 5)
+        val audio = bridge.open(session, format)
+        val job = launch(Dispatchers.Default) {
+            audio.writeUplink(PcmAudio(pcm16Bytes(samplesOf(1, 2, 3)), format))
+        }
+        try {
+            delay(150)
+            assertFalse("播放尚未完成时写入必须保持挂起", job.isCompleted)
+
+            val startedAt = System.nanoTime()
+            withTimeout(2_000) { job.cancelAndJoin() }
+            val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000
+
+            assertTrue(job.isCancelled)
+            assertTrue("取消后必须在一个轮询周期内返回（实际 " + elapsedMs + " ms）", elapsedMs < 1_000)
+        } finally {
+            job.cancel()
+            audio.stop()
+        }
+    }
+
+    /** 暂停/被外部停止时播放头不会前进：不能永远挂起，也不能当成“播放完成”。 */
+    @Test
+    fun pausedOrStoppedPlaybackIsNeverTreatedAsCompleted() = runBlocking {
+        val uplink = FakeUplink(sampleRate = 16_000, channels = 1, completesPlaybackImmediately = false)
+            .apply { playing = false }
+        val bridge = FrameworkAudioBridge(
+            framework(uplink = uplink),
+            playbackPollMs = 5,
+            playbackStallTimeoutMs = 100,
+        )
+        val audio = bridge.open(session, format)
+        try {
+            audio.writeUplink(PcmAudio(pcm16Bytes(samplesOf(1, 2, 3)), format))
+            fail("暂停/停止的播放器不得被当成“已播放完成”")
+        } catch (expected: AudioUnavailableException) {
+            assertEquals("audio_playback_stalled", expected.code)
+            assertEquals(AudioFailureCode.STOPPED, expected.failure)
+        } finally {
+            audio.stop()
+        }
+    }
+
+    /** 播放头必须追平本次写入的**全部**帧（分片写入也一样），少一帧都不算播放完成。 */
+    @Test
+    fun writeUplinkWaitsForEveryWrittenFrame() = runBlocking {
+        val uplink = FakeUplink(sampleRate = 16_000, channels = 1, completesPlaybackImmediately = false)
+        val bridge = FrameworkAudioBridge(framework(uplink = uplink), playbackPollMs = 5)
+        val audio = bridge.open(session, format)
+        val frames = ShortArray(1_000) { 1 }
+        val job = async(Dispatchers.Default) {
+            audio.writeUplink(PcmAudio(pcm16Bytes(frames), format))
+        }
+        try {
+            delay(100)
+            assertEquals("全部帧必须都已写入注入播放器", 1_000, uplink.writtenFrames)
+            assertFalse(job.isCompleted)
+
+            uplink.headFrames = 999
+            delay(50)
+            assertFalse("少一帧都不算播放完成", job.isCompleted)
+
+            uplink.headFrames = 1_000
+            withTimeout(2_000) { job.await() }
+            assertTrue(job.isCompleted)
+        } finally {
+            job.cancel()
+            audio.stop()
+        }
+    }
+
+    /** flush/stop 把播放头归零：排队音频已被丢弃，必须明确失败而不是当成“播完”。 */
+    @Test
+    fun flushedPlaybackIsNeverTreatedAsCompleted() = runBlocking {
+        val uplink = FakeUplink(sampleRate = 16_000, channels = 1, completesPlaybackImmediately = false)
+        val bridge = FrameworkAudioBridge(framework(uplink = uplink), playbackPollMs = 5)
+        val audio = bridge.open(session, format)
+        val job = async(Dispatchers.Default) {
+            try {
+                audio.writeUplink(PcmAudio(pcm16Bytes(samplesOf(1, 2, 3)), format))
+                null
+            } catch (error: AudioUnavailableException) {
+                error
+            }
+        }
+        try {
+            delay(100)
+            assertFalse(job.isCompleted)
+            uplink.headFrames = 1
+            delay(100)
+            uplink.headFrames = 0
+            val failure = withTimeout(2_000) { job.await() }
+            assertEquals("audio_playback_flushed", failure?.code)
+            assertEquals(AudioFailureCode.STOPPED, failure?.failure)
+        } finally {
+            job.cancel()
+            audio.stop()
+        }
+    }
+
+    /** 会话停止必须打断播放等待，而不是让它卡在“播放头不再前进”。 */
+    @Test
+    fun stopDuringPlaybackInterruptsTheWait() = runBlocking {
+        val uplink = FakeUplink(sampleRate = 16_000, channels = 1, completesPlaybackImmediately = false)
+        val bridge = FrameworkAudioBridge(framework(uplink = uplink), playbackPollMs = 5)
+        val audio = bridge.open(session, format)
+        val job = async(Dispatchers.Default) {
+            try {
+                audio.writeUplink(PcmAudio(pcm16Bytes(samplesOf(1, 2, 3)), format))
+                null
+            } catch (error: AudioUnavailableException) {
+                error
+            }
+        }
+        try {
+            delay(100)
+            assertFalse(job.isCompleted)
+            audio.stop()
+            val failure = withTimeout(2_000) { job.await() }
+            assertEquals("audio_stopped", failure?.code)
+        } finally {
+            job.cancel()
+        }
+    }
+
     @Test
     fun stopIsIdempotentAndNeverRestoresMicrophone() = runBlocking {
         val downlink = FakeDownlink()
@@ -386,6 +551,15 @@ class FrameworkAudioBridgeTest {
     }
 
     private fun samplesOf(vararg values: Int): ShortArray = ShortArray(values.size) { values[it].toShort() }
+
+    private fun pcm16Bytes(samples: ShortArray): ByteArray {
+        val bytes = ByteArray(samples.size * 2)
+        for (index in samples.indices) {
+            bytes[2 * index] = (samples[index].toInt() and 0xFF).toByte()
+            bytes[2 * index + 1] = ((samples[index].toInt() shr 8) and 0xFF).toByte()
+        }
+        return bytes
+    }
 
     private class FakeFramework(
         private val visible: Set<String>,
@@ -431,17 +605,38 @@ class FrameworkAudioBridgeTest {
         }
     }
 
+    /**
+     * 假注入播放器：把“已写入”与“已播放”分开建模（真实 AudioTrack 的
+     * getPlaybackHeadPosition 语义）。[completesPlaybackImmediately] 为真时写入即视为
+     * 播放完成（既有用例的快速路径）；为假时必须由测试手动推进 [headFrames]。
+     */
     private class FakeUplink(
         override val sampleRate: Int = 16_000,
         override val channels: Int = 1,
+        private val completesPlaybackImmediately: Boolean = true,
     ) : CallAudioFramework.Uplink {
         var closed = false
         val written = ArrayList<Short>()
 
+        @Volatile
+        var playing: Boolean = true
+
+        @Volatile
+        var headFrames: Int = 0
+
+        @Volatile
+        var writtenFrames: Int = 0
+
         override fun write(samples: ShortArray, offset: Int, count: Int): Int {
             for (i in 0 until count) written.add(samples[offset + i])
+            writtenFrames += count / channels
+            if (completesPlaybackImmediately) headFrames = writtenFrames
             return count
         }
+
+        override fun playedFrames(): Int = headFrames
+
+        override fun isPlaying(): Boolean = playing
 
         override fun close() {
             closed = true

@@ -68,6 +68,14 @@ interface SupervisedAudio {
 
     /** 在断开/接管确认之后恢复麦克风。仍持有活动流时返回 false。 */
     suspend fun restoreMicrophone(): Boolean
+
+    /**
+     * 取走一条待上报的音频工作进程故障（角色通道不可达/响应非法）。
+     *
+     * 这是监督端重启预算的生产来源：故障发生在音频工作进程，预算必须记在监督端，
+     * 每条事件只上报一次。进程内实现（[AudioWorker] 自身）没有可上报的跨进程故障。
+     */
+    fun takeProcessFault(): String? = null
 }
 
 /**

@@ -273,6 +273,11 @@ class RemoteSupervisedAudioTest {
         } catch (expected: AudioUnavailableException) {
             assertEquals("audio_worker_unreachable", expected.code)
         }
+
+        // 最小缺陷：传输失败必须作为“工作进程故障”事件上报，让监督端的重启预算
+        // 有真实生产来源；每条事件只上报一次。
+        assertEquals("audio_worker_unreachable", audio.takeProcessFault())
+        assertNull("故障事件不得重复计入重启预算", audio.takeProcessFault())
     }
 
     @Test

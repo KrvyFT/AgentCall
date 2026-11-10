@@ -290,8 +290,21 @@ class RemoteSupervisedAudio(
     @Volatile
     private var isolated = false
 
+    /**
+     * 待上报的音频工作进程故障（只有一条：一次监督轮询内的同一种不可达会被合并成
+     * 一条事件，避免一个瞬时通道故障把重启预算瞬间打满）。取走即清空。
+     */
+    @Volatile
+    private var pendingFault: String? = null
+
     override val microphoneIsolated: Boolean
         get() = isolated
+
+    override fun takeProcessFault(): String? {
+        val fault = pendingFault
+        pendingFault = null
+        return fault
+    }
 
     override suspend fun isolateMicrophone(): Boolean {
         val response = call(AudioRoleRequest.Isolate) ?: return false
@@ -333,10 +346,17 @@ class RemoteSupervisedAudio(
         return RemoteControlSession(transport)
     }
 
-    private suspend fun call(request: AudioRoleRequest): AudioRoleResponse? = try {
-        AudioRoleCodec.decodeResponse(transport.exchange(AudioRoleCodec.encodeRequest(request)))
-    } catch (t: Throwable) {
-        null
+    private suspend fun call(request: AudioRoleRequest): AudioRoleResponse? {
+        val line = try {
+            transport.exchange(AudioRoleCodec.encodeRequest(request))
+        } catch (t: Throwable) {
+            // 传输失败就是工作进程故障事件：交给监督端重启预算，绝不静默重试。
+            pendingFault = (t as? AudioRoleLinkException)?.code ?: ERROR_UNREACHABLE
+            return null
+        }
+        val response = AudioRoleCodec.decodeResponse(line)
+        if (response == null) pendingFault = ERROR_INVALID_RESPONSE
+        return response
     }
 
     /** 监督端不使用 PCM 数据；停止请求转发给工作进程。 */
@@ -362,6 +382,9 @@ class RemoteSupervisedAudio(
 
     companion object {
         const val ERROR_UNREACHABLE: String = "audio_worker_unreachable"
+
+        /** 工作进程回了无法解析的行：同样按进程故障计入重启预算。 */
+        const val ERROR_INVALID_RESPONSE: String = "audio_worker_invalid_response"
     }
 }
 

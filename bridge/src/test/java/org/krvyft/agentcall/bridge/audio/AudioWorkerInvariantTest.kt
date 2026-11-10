@@ -129,7 +129,16 @@ class AudioWorkerInvariantTest {
             override val sampleRate: Int = 16_000
             override val channels: Int = 1
 
-            override fun write(samples: ShortArray, offset: Int, count: Int): Int = count
+            private var written = 0
+
+            override fun write(samples: ShortArray, offset: Int, count: Int): Int {
+                written += count
+                return count
+            }
+
+            override fun playedFrames(): Int = written
+
+            override fun isPlaying(): Boolean = true
 
             override fun close() = Unit
         }
