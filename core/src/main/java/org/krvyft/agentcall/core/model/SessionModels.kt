@@ -53,8 +53,28 @@ sealed interface SessionEvent {
     /** APK 服务 READY 握手结果变化；未 READY 不得自动接听。 */
     data class ReadyChanged(val ready: Boolean) : SessionEvent
 
-    /** 人工接管或路由变化导致的交还。 */
-    data class Takeover(val reason: TakeoverReason) : SessionEvent
+    /**
+     * 人工接管或路由变化导致的交还（Task 7B3 FIX ROUND 1）。
+     *
+     * [sessionId] 是这条交还事实**属于哪一通电话**：事件流（HOOK/监督端）观察到的交还必须
+     * 携带它，否则上一通/别的 callId 的 handback 会被作用到“当前会话”上，撤销并恢复一通
+     * 无关的电话。null 表示本地发起、天然只针对当前会话（通知/UI 的用户接管）。
+     * reducer 必须忽略 sessionId 与自身不同的事件。
+     */
+    data class Takeover(
+        val reason: TakeoverReason,
+        val sessionId: SessionId? = null,
+    ) : SessionEvent
+
+    /**
+     * 会话所属的通话已经不在了（Task 7B3 FIX ROUND 1）。
+     *
+     * 事实来源是监督端的 `call_disconnected`：HOOK 失联/故障时可能永远没有一条完整的
+     * DISCONNECTED 快照可观察，而会话不能因此停在 ACTIVE_AI/HANDOFF 直到 180 s 上限。
+     * 它只表达“这通电话结束了”，**不携带也不补**任何快照字段。reducer 只处理 sessionId
+     * 与自身一致的事件：结束/handed back 时不发挂断（电话已经没了），仍释放租约与隔离。
+     */
+    data class SessionEnded(val sessionId: SessionId) : SessionEvent
 
     /** 某个对端心跳中断。 */
     data class PeerLost(val role: PeerRole) : SessionEvent

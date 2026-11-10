@@ -79,7 +79,14 @@ class SessionReducer(
         is SessionEvent.StateChanged -> onStateChanged(event.snapshot, nowMs)
         SessionEvent.Tick -> onTick(nowMs)
         is SessionEvent.ReadyChanged -> onReadyChanged(event.ready, nowMs)
-        is SessionEvent.Takeover -> onTakeover()
+        // 交还事实必须属于本会话：上一通/别的 callId 的 handback 不得撤销当前通话。
+        is SessionEvent.Takeover -> if (event.sessionId != null && event.sessionId != id) {
+            emptyList()
+        } else {
+            onTakeover()
+        }
+        // 通话已经不存在：释放所有权/租约/隔离，但绝不发挂断（电话已经没了）。
+        is SessionEvent.SessionEnded -> if (event.sessionId != id) emptyList() else onSessionEnded()
         is SessionEvent.PeerLost -> {
             lostPeers += event.role
             onPeerLost()
@@ -265,6 +272,15 @@ class SessionReducer(
         state = SessionState.ENDED
         return effects
     }
+
+    /**
+     * 会话所属的通话已经不在了（[SessionEvent.SessionEnded]）：按既有断开路径结束本会话。
+     *
+     * 与 [onDisconnected] 完全复用（停音频 → 撤销租约 → 恢复麦克风 → ENDED），因为两者的
+     * 事实都是“这通电话没了”；区别只在于 SessionEnded 没有完整的 DISCONNECTED 快照可用，
+     * 所以它绝不伪造快照，也绝不产生挂断命令。
+     */
+    private fun onSessionEnded(): List<SessionEffect> = onDisconnected()
 
     private fun onTakeover(): List<SessionEffect> {
         if (state == SessionState.IDLE || state == SessionState.ENDED || state == SessionState.ENDING) {

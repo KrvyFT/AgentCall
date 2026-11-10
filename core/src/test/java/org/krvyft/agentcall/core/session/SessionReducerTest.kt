@@ -750,4 +750,89 @@ class SessionReducerTest {
         assertTrue("READY loss after ENDED must be a no-op, got " + afterEnded, afterEnded.isEmpty())
         assertEquals(SessionState.ENDED, ended.state)
     }
+
+    // ------------------------------------------------------------------ 事件会话绑定（7B3 FIX ROUND 1）
+
+    /**
+     * [SessionEvent.Takeover] 现在携带产生它的 [SessionId]：别的/上一通电话的交还事实绝不能
+     * 撤销当前会话（旧实现让协调器把任何 handback 作用到“当前会话”）。
+     */
+    @Test
+    fun takeoverForAnotherSessionIsIgnoredButTheOwnedSessionStillHandsBack() {
+        val reducer = activeReducer(activeAt = 3_000)
+
+        val foreign = reducer.reduce(
+            SessionEvent.Takeover(TakeoverReason.UNKNOWN, Fixtures.sessionId(callId = "call-b")),
+            4_000,
+        )
+
+        assertTrue("a handback for another call must be a no-op, got " + foreign, foreign.isEmpty())
+        assertEquals(SessionState.ACTIVE_AI, reducer.state)
+
+        val mine = reducer.reduce(SessionEvent.Takeover(TakeoverReason.UNKNOWN, id), 4_000)
+
+        assertTrue(mine.contains(SessionEffect.StopConversation))
+        assertTrue(mine.contains(SessionEffect.RevokeLease(id)))
+        assertTrue(mine.contains(SessionEffect.RestoreMicrophone(id)))
+        assertTrue("a handback must never hang up", mine.none { it is SessionEffect.SendCommand })
+        assertEquals(SessionState.HANDOFF, reducer.state)
+    }
+
+    /** 请求没有携带会话（本地用户接管）时仍作用于本会话，保持既有行为。 */
+    @Test
+    fun takeoverWithoutASessionStillHandsBackTheOwnedCall() {
+        val reducer = activeReducer(activeAt = 3_000)
+
+        val effects = reducer.reduce(SessionEvent.Takeover(TakeoverReason.USER_REQUESTED), 4_000)
+
+        assertTrue(effects.contains(SessionEffect.RevokeLease(id)))
+        assertEquals(SessionState.HANDOFF, reducer.state)
+    }
+
+    /**
+     * [SessionEvent.SessionEnded] 是“通话已经不存在”的事实（HOOK 失联/监督端确认断开）：
+     * 释放所有权、租约与隔离，但**绝不**下发挂断（电话已经没了）。
+     */
+    @Test
+    fun sessionEndedForTheOwnedSessionReleasesEverythingWithoutHangup() {
+        val reducer = activeReducer(activeAt = 3_000)
+
+        val effects = reducer.reduce(SessionEvent.SessionEnded(id), 5_000)
+
+        assertEquals(SessionState.ENDED, reducer.state)
+        assertTrue(effects.contains(SessionEffect.StopConversation))
+        assertTrue(effects.contains(SessionEffect.RevokeLease(id)))
+        assertTrue(effects.contains(SessionEffect.RestoreMicrophone(id)))
+        assertFalse("the call is already gone: no Hangup may be sent", effects.hasHangup())
+        // 结束之后不得再有任何命令（180 s 上限/倒计时都失效）。
+        assertTrue(reducer.reduce(SessionEvent.Tick, 600_000).none { it is SessionEffect.SendCommand })
+    }
+
+    @Test
+    fun sessionEndedForAnotherSessionIsIgnored() {
+        val reducer = activeReducer(activeAt = 3_000)
+
+        val effects = reducer.reduce(
+            SessionEvent.SessionEnded(Fixtures.sessionId(callId = "call-b")),
+            5_000,
+        )
+
+        assertTrue("a SessionEnded for another call must be a no-op, got " + effects, effects.isEmpty())
+        assertEquals(SessionState.ACTIVE_AI, reducer.state)
+        // 本会话仍然归 AI：其它会话的结束事实不改变它的 180 s 上限。
+        assertTrue(reducer.reduce(SessionEvent.Tick, 183_000).hasHangup())
+    }
+
+    @Test
+    fun sessionEndedDuringPreparationCancelsTheAnswerWithoutHangup() {
+        val reducer = startedReducer()
+
+        val effects = reducer.reduce(SessionEvent.SessionEnded(id), 1_000)
+
+        assertEquals(SessionState.ENDED, reducer.state)
+        assertTrue(effects.contains(SessionEffect.RevokeLease(id)))
+        assertTrue(effects.contains(SessionEffect.RestoreMicrophone(id)))
+        assertFalse(effects.hasHangup())
+        assertFalse("no answer may be issued after the call ended", reducer.reduce(SessionEvent.Tick, 3_000).hasCommand(CallCommand.Answer))
+    }
 }
