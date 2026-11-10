@@ -20,8 +20,11 @@
 #   audio-worker.pid。停止路径必须先结束子 shell 监督循环，再按 PID 文件结束真正的
 #   app_process：只杀子 shell 会把 app_process 变成孤儿，继续持有 abstract socket 与
 #   麦克风隔离，下一次模块启动会 bind 失败直到重启设备。
-# - 停止一律是有界的 TERM → 等待 → KILL → 再等待 → 读回核验；干净退出、显式停止、
-#   错误退出三条路径都执行同一套回收。
+# - 停止顺序是硬契约（任务 11D2b）：先向桥接发出固定 CLI shutdown，并在有界时间内等它
+#   优雅退出（它会终止/交还拥有的通话（若有）、读回恢复麦克风；音频工作进程必须仍然存活），
+#   再停音频工作进程，最后才把仍未退出的进程做有界 TERM → 等待 → KILL → 再等待 →
+#   读回核验。干净退出、显式停止、错误退出三条路径都执行同一套回收。
+# - 顺序不能颠倒：先杀音频工作进程会让桥接的恢复请求不可达，麦克风会保持全局静音。
 # - 启动时先回收上一次实例留下的音频工作进程（幂等），并按 cmdline 核验 PID 身份，
 #   避免 PID 复用误杀无关进程。
 
@@ -43,6 +46,20 @@ APP_PROCESS=${AGENTCALL_APP_PROCESS:-/system/bin/app_process}
 GETPROP=${AGENTCALL_GETPROP:-getprop}
 CONTROL_SOCKET=@org.krvyft.agentcall.control
 AUDIO_SOCKET=@org.krvyft.agentcall.audio-role
+CLI_MAIN_CLASS=org.krvyft.agentcall.bridge.AgentCallCli
+# 优雅关闭等待：先等固定 CLI 返回（桥接在响应前完成终止/交还 + 麦克风读回），
+# 再等桥接进程退出。两个上限都独立有界，避免停止路径被不响应的进程拖住。
+GRACEFUL_SHUTDOWN_WAIT_SECONDS=15
+BRIDGE_EXIT_WAIT_SECONDS=5
+case "${AGENTCALL_GRACEFUL_SHUTDOWN_WAIT_SECONDS:-}" in
+    ''|*[!0-9]*) ;;
+    *) GRACEFUL_SHUTDOWN_WAIT_SECONDS=$AGENTCALL_GRACEFUL_SHUTDOWN_WAIT_SECONDS ;;
+esac
+case "${AGENTCALL_BRIDGE_EXIT_WAIT_SECONDS:-}" in
+    ''|*[!0-9]*) ;;
+    *) BRIDGE_EXIT_WAIT_SECONDS=$AGENTCALL_BRIDGE_EXIT_WAIT_SECONDS ;;
+esac
+SHUTDOWN_RESULT_FILE=$DATA_ROOT/shutdown.result
 # 本脚本自己的 PID（agentcallctl restart 据此确认“重启请求有接收者”）；请求标记里保存
 # 同一个 PID，跨实例/跨开机的过期标记不会被新实例消费。
 SERVICE_PID_FILE=$DATA_ROOT/service.pid
@@ -248,15 +265,83 @@ stop_audio_worker() {
     rm -f "$AUDIO_PID_FILE" 2>/dev/null
 }
 
+# 从固定 CLI 的单行 JSON 里取一个标量：只用于把关闭结果写进机器可读日志，
+# 不是通用 JSON 解析器。键名由本脚本固定传入，不接受外部输入。
+json_scalar() {
+    printf '%s' "$1" | sed -n "s/.*\"$2\":\\([^,}]*\\).*/\\1/p" | head -n 1
+}
+
+# 优雅关闭桥接（任务 11D2b 的硬顺序）：
+# 1. 只在桥接确实由本实例拉起且 cmdline 核验通过时执行，绝不猜测 PID；
+# 2. 用固定 CLI（AgentCallCli shutdown，无参数、不执行任意 shell）请求关闭；
+#    桥接在返回响应前会终止/交还拥有的通话并读回恢复麦克风——此时音频工作进程必须活着；
+# 3. CLI 与桥接进程的等待都独立有界；超时只记录机器码并返回失败，由调用方继续有界回收。
+request_bridge_graceful_shutdown() {
+    if [ -z "$bridge_pid" ] || ! pid_alive "$bridge_pid"; then
+        log_line "bridge_shutdown_skipped reason=not_running"
+        return 0
+    fi
+    if ! is_bridge_pid "$bridge_pid"; then
+        log_line "bridge_shutdown_skipped reason=identity_mismatch pid=$bridge_pid"
+        return 1
+    fi
+    log_line "bridge_shutdown_request pid=$bridge_pid"
+    rm -f "$SHUTDOWN_RESULT_FILE" 2>/dev/null
+    "$APP_PROCESS" -Djava.class.path="$BRIDGE_JAR" /system/bin --nice-name=agentcall-cli "$CLI_MAIN_CLASS" shutdown > "$SHUTDOWN_RESULT_FILE" 2>/dev/null &
+    cli_pid=$!
+    waited=0
+    while pid_alive "$cli_pid" && [ "$waited" -lt "$GRACEFUL_SHUTDOWN_WAIT_SECONDS" ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if pid_alive "$cli_pid"; then
+        log_line "bridge_shutdown_cli_timeout pid=$cli_pid waited=${waited}s"
+        kill -TERM "$cli_pid" 2>/dev/null
+        waited=0
+        while pid_alive "$cli_pid" && [ "$waited" -lt "$KILL_WAIT_SECONDS" ]; do
+            sleep 1
+            waited=$((waited + 1))
+        done
+        if pid_alive "$cli_pid"; then
+            kill -KILL "$cli_pid" 2>/dev/null
+        fi
+        reap_child "$cli_pid"
+        rm -f "$SHUTDOWN_RESULT_FILE" 2>/dev/null
+        return 1
+    fi
+    reap_child "$cli_pid"
+    result=$(cat "$SHUTDOWN_RESULT_FILE" 2>/dev/null)
+    clean=$(json_scalar "$result" clean)
+    code=$(json_scalar "$result" shutdownCode)
+    log_line "bridge_shutdown_result clean=${clean:-unknown} shutdownCode=${code:-unknown}"
+    rm -f "$SHUTDOWN_RESULT_FILE" 2>/dev/null
+    waited=0
+    while pid_alive "$bridge_pid" && [ "$waited" -lt "$BRIDGE_EXIT_WAIT_SECONDS" ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if pid_alive "$bridge_pid"; then
+        log_line "bridge_shutdown_unconfirmed pid=$bridge_pid waited=${waited}s"
+        return 1
+    fi
+    log_line "bridge_shutdown_confirmed pid=$bridge_pid waited=${waited}s"
+    return 0
+}
+
 shutdown_children() {
+    # 硬顺序：桥接优雅关闭（恢复麦克风需要音频工作进程存活）→ 停音频工作进程 →
+    # 对仍未退出的进程做有界 TERM→KILL。任何一步失败都不能颠倒后面的顺序。
+    request_bridge_graceful_shutdown
     stop_audio_worker_supervisor
     stop_audio_worker
     if [ -n "$bridge_pid" ] && pid_alive "$bridge_pid"; then
         terminate_pid "$bridge_pid" "$STOP_GRACE_SECONDS" bridge
+    fi
+    if [ -n "$bridge_pid" ]; then
         reap_child "$bridge_pid"
     fi
     bridge_pid=
-    rm -f "$PID_FILE" "$AUDIO_PID_FILE" "$SERVICE_PID_FILE" 2>/dev/null
+    rm -f "$PID_FILE" "$AUDIO_PID_FILE" "$SERVICE_PID_FILE" "$SHUTDOWN_RESULT_FILE" 2>/dev/null
 }
 
 on_stop() {

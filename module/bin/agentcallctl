@@ -2,7 +2,8 @@
 # AgentCall 固定命令包装器（spec §6.4 / 任务 8；任务 11B 新增 restart）。
 #
 # 设计边界：
-# - 只转发固定六条命令给 org.krvyft.agentcall.bridge.AgentCallCli，没有任意 RPC、没有任意 shell。
+# - 只转发固定七条命令给 org.krvyft.agentcall.bridge.AgentCallCli，没有任意 RPC、没有任意 shell。
+#   calibrate 与 config-set 同一纪律：负载只从 stdin 进入，argv 出现任何负载都拒绝。
 # - restart 是模块侧控制动作（不是 AgentCallCli 命令）：写 root 私有重启请求标记，再执行
 #   固定 CLI shutdown 让桥接干净退出；service.sh 在本次开机的有限循环内消费标记并重新
 #   拉起桥接。它不接受参数，也不会把 restart 转发给 CLI。
@@ -52,14 +53,14 @@ emit_error() {
 }
 
 if [ "$#" -lt 1 ]; then
-    emit_error "usage_invalid" "usage: status | config-get | config-set (JSON on stdin) | pair [packageName] | diagnose | shutdown | restart" 2
+    emit_error "usage_invalid" "usage: status | config-get | config-set (JSON on stdin) | pair [packageName] | diagnose | shutdown | calibrate (JSON on stdin) | restart" 2
 fi
 
 COMMAND=$1
 case "$COMMAND" in
-    status|config-get|config-set|diagnose|shutdown|restart)
+    status|config-get|config-set|diagnose|shutdown|calibrate|restart)
         if [ "$#" -ne 1 ]; then
-            emit_error "usage_invalid" "$COMMAND takes no arguments; config-set reads JSON from stdin" 2
+            emit_error "usage_invalid" "$COMMAND takes no arguments; config-set and calibrate read JSON from stdin" 2
         fi
         ;;
     pair)
@@ -74,7 +75,7 @@ case "$COMMAND" in
         fi
         ;;
     *)
-        emit_error "usage_invalid" "unknown command; allowed: status config-get config-set pair diagnose shutdown restart" 2
+        emit_error "usage_invalid" "unknown command; allowed: status config-get config-set pair diagnose shutdown calibrate restart" 2
         ;;
 esac
 
@@ -147,6 +148,12 @@ restart_bridge() {
 }
 
 case "$COMMAND" in
+    calibrate)
+        # calibrate 与 config-set 同一纪律：负载只从调用方的 stdin 重定向继承，
+        # 经过本脚本时不读、不拼、不回显；argv 额外参数已在命令表校验中拒绝。
+        run_cli calibrate
+        exit $?
+        ;;
     config-set)
         # stdin 只来自调用方的重定向；内容不经过任何 shell 拼接或回显。
         run_cli config-set

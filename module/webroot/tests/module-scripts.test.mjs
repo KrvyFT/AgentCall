@@ -96,7 +96,7 @@ test("uninstall.sh：先尝试停止桥接（CLI 或 PID 回退），再清理�
   assert.equal(/chmod|set_perm/.test(uninstall), false, "卸载脚本不修改模块/webroot 权限");
 });
 
-test("uninstall.sh 诚实性：桥接已实现会话/租约，但 shutdown 尚未接入终止/交还，并区分 socket 与 CLI 可执行性", () => {
+test("uninstall.sh 诚实性：桥接已实现会话/租约与优雅关闭，但只在桥接可确认时才能终止/交还", () => {
   const uninstall = read("uninstall.sh");
   // 桥接已经实现会话/租约（session.request/command/heartbeat/events/handover），
   // 不得再复述“没有会话/租约、session.request 为 method_not_implemented”的旧结论。
@@ -104,9 +104,13 @@ test("uninstall.sh 诚实性：桥接已实现会话/租约，但 shutdown 尚�
   assert.match(uninstall, /session\.(request|command|heartbeat|events|handover)/, "必须点名桥接已有的会话方法");
   assert.equal(/(没有|无)[^。\n]{0,40}(会话|租约)/.test(uninstall), false, "不得再宣称桥接没有会话/租约");
   assert.equal(/method_not_implemented/.test(uninstall), false, "不得再把 session.request 说成 method_not_implemented");
-  // 能力边界仍然存在：shutdown/卸载尚未接入终止或交还，不得反过来夸大已有能力。
-  assert.match(uninstall, /(无法|不能)[\s\S]{0,60}(终止|交还)[\s\S]{0,60}(通话|AI)/, "必须明确无法终止/交还正在进行的通话");
-  assert.match(uninstall, /(尚未|未)[\s\S]{0,60}(接入|支持)[\s\S]{0,60}(终止|交还|交接)/, "必须说明终止/交还路径尚未接入");
+  // 11D2a 已把终止/交还接入优雅关闭：卸载必须先请求固定 CLI shutdown，再停音频工作进程。
+  assert.match(uninstall, /"\$CTL" shutdown/, "必须执行固定 CLI shutdown，不得跳过优雅关闭");
+  assert.match(uninstall, /(优雅关闭|优雅停止)/, "必须说明优雅关闭路径");
+  assert.match(uninstall, /shutdown_call_unresolved/, "必须点名未确认关闭的机器码");
+  // 但桥接不响应/已退出时，脚本仍无法终止或交还，也不得反过来夸大能力。
+  assert.match(uninstall, /(无法|不能)[\s\S]{0,80}(终止|交还)[\s\S]{0,80}(通话|AI)/, "必须明确无法终止/交还正在进行的通话");
+  assert.match(uninstall, /未确认[\s\S]{0,40}(终止|交还)/, "未确认时不得宣称已终止/交还");
   assert.equal(/交还\/终止其托管的 AI 会话/.test(uninstall), false, "不得复述虚假的交还契约");
   assert.match(uninstall, /socket_present/, "必须单独探测 abstract socket 是否存在");
   assert.match(uninstall, /ctl_usable/, "必须单独判断固定 CLI 是否可执行");
@@ -221,6 +225,9 @@ function serviceEnv(harness, extra = {}) {
     AGENTCALL_GETPROP: harness.getprop,
     AGENTCALL_DATA_ROOT: harness.dataRoot,
     AGENTCALL_UNIX_LIST: harness.unixList,
+    // 新停止顺序会先执行固定 CLI shutdown；默认把两个优雅等待调短，避免旧用例超时。
+    AGENTCALL_GRACEFUL_SHUTDOWN_WAIT_SECONDS: "5",
+    AGENTCALL_BRIDGE_EXIT_WAIT_SECONDS: "2",
     ...extra,
   };
 }
@@ -251,12 +258,20 @@ function serviceHarness() {
     [
       "#!/bin/sh",
       'case "$*" in',
+      "  *AgentCallCli*)",
+      '    if [ -n "${AGENTCALL_FAKE_SHUTDOWN_TRIGGER:-}" ]; then : > "$AGENTCALL_FAKE_SHUTDOWN_TRIGGER"; fi',
+      '    if [ -n "${AGENTCALL_FAKE_SHUTDOWN_JSON:-}" ]; then printf "%s\\n" "$AGENTCALL_FAKE_SHUTDOWN_JSON"; fi',
+      '    exit "${AGENTCALL_FAKE_CLI_EXIT:-0}"',
+      "    ;;",
       "  *BridgeMain*)",
       '    if [ "${AGENTCALL_FAKE_BRIDGE_NO_SOCKET:-0}" != "1" ] && [ -n "${AGENTCALL_UNIX_LIST:-}" ]; then',
       '      printf \'@org.krvyft.agentcall.control\\n\' >> "$AGENTCALL_UNIX_LIST"',
       "    fi",
       '    if [ "${AGENTCALL_FAKE_BRIDGE_STAY:-0}" = "1" ]; then',
       "      while :; do",
+      '        if [ -n "${AGENTCALL_FAKE_SHUTDOWN_TRIGGER:-}" ] && [ -f "$AGENTCALL_FAKE_SHUTDOWN_TRIGGER" ]; then',
+      "          exit 0",
+      "        fi",
       '        if [ -n "${AGENTCALL_FAKE_BRIDGE_RESTART_TRIGGER:-}" ] && [ -f "$AGENTCALL_FAKE_BRIDGE_RESTART_TRIGGER" ]; then',
       '          rm -f "$AGENTCALL_FAKE_BRIDGE_RESTART_TRIGGER"',
       "          exit 0",
