@@ -9,7 +9,13 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.runBlocking
 import org.krvyft.agentcall.bridge.audio.AndroidAudioPlatform
 import org.krvyft.agentcall.bridge.audio.AndroidBootId
+import org.krvyft.agentcall.bridge.audio.AudioPcmRelay
 import org.krvyft.agentcall.bridge.audio.LocalSocketAudioRoleTransport
+import org.krvyft.agentcall.bridge.audio.LocalSocketPcmWorkerLink
+import org.krvyft.agentcall.bridge.audio.PcmLaneCodec
+import org.krvyft.agentcall.bridge.audio.PcmOpenResult
+import org.krvyft.agentcall.bridge.audio.PcmSessionOwner
+import org.krvyft.agentcall.bridge.audio.PcmWorkerLinkFactory
 import org.krvyft.agentcall.bridge.audio.RemoteSupervisedAudio
 import org.krvyft.agentcall.bridge.config.CalibrationStore
 import org.krvyft.agentcall.bridge.config.ConfigErrorCode
@@ -166,6 +172,13 @@ internal object BridgeRuntime {
         val shutdown = CountDownLatch(1)
         var server: ControlServer? = null
         val supervisionRpc = SupervisorRpcPort(supervision.supervisor, inbox)
+        // APP ↔ bridge ↔ audio worker 的 PCM 中继：会话归属只看监督端快照的 ownedSession，
+        // worker 链路是独立的 root 私有 socket（绝不与 AudioRole 生命周期通道混用）。
+        val pcmRelay = AudioPcmRelay(
+            owner = PcmSessionOwner { id -> supervision.supervisor.snapshot().ownedSession == id },
+            workerLinks = PcmWorkerLinkFactory { LocalSocketPcmWorkerLink().also { it.connect() } },
+            clock = AndroidAudioPlatform.clock(),
+        )
         val dispatcher = ControlDispatcher(
             store = store,
             packages = packages,
@@ -181,12 +194,16 @@ internal object BridgeRuntime {
                 if (current == null) 0 to 0L else current.activeConnectionCount to current.rejectedConnectionCount
             },
             dialerDefaultRole = dialerDefaultRole,
+            audioPcm = pcmRelay,
         )
 
-        // PCM 通道由 ControlServer 独立 bind；音频工作角色负责真实 PCM 生产/消费
-        // （AudioWorkerMain）。在 APP 音频代理接入前，本容器不注入 sink，也不对外宣称
-        // 一个只会丢帧的音频通道。
-        val controlServer = ControlServer(verifier = verifier, handler = dispatcher)
+        // PCM 通道由 ControlServer 独立 bind（PCM lane）；音频工作角色负责真实 PCM
+        // 生产/消费（AudioWorkerMain 的 AudioWorkerPcmSocketServer）。
+        val controlServer = ControlServer(
+            verifier = verifier,
+            handler = dispatcher,
+            pcmSession = pcmRelay,
+        )
         server = controlServer
         try {
             controlServer.start()
@@ -206,6 +223,7 @@ internal object BridgeRuntime {
                         supervision.supervisor.shutdown()
                         supervision.supervisor.close()
                     }
+                    pcmRelay.close()
                     controlServer.close()
                 },
                 "agentcall-bridge-shutdown",
@@ -231,6 +249,7 @@ internal object BridgeRuntime {
                 supervision.supervisor.shutdown()
                 supervision.supervisor.close()
             }
+            pcmRelay.close()
             controlServer.close()
         }
         return 0
@@ -347,6 +366,11 @@ internal class ControlDispatcher(
     private val hookInbox: HookCallInbox = HookCallInbox(),
     /** 默认拨号器探测：默认 fail closed 为未知，生产装配注入 Android 实现。 */
     private val dialerDefaultRole: () -> DialerDefaultRole = { DialerDefaultRole.UNKNOWN },
+    /**
+     * APP 音频通道的中继。默认 null = 未接线（audio.channel 明确返回
+     * method_not_implemented，绝不假装成功）；生产装配由 BridgeRuntime 注入。
+     */
+    private val audioPcm: AudioPcmRelay? = null,
 ) : RpcHandler {
 
     /**
@@ -383,8 +407,7 @@ internal class ControlDispatcher(
             RolePolicy.METHOD_HOOK_HEARTBEAT,
             -> hookCommandLines(request)
             RolePolicy.METHOD_CALL_COMMAND_RESULT -> hookCommandResult(request)
-            RolePolicy.METHOD_AUDIO_CHANNEL ->
-                failure(request, "method_not_implemented", "APP audio lane is wired by Task 7")
+            RolePolicy.METHOD_AUDIO_CHANNEL -> audioChannel(request, peer)
             else -> failure(request, "method_not_implemented", "method is not in the fixed command table")
         }
     } catch (error: ConfigStoreException) {
@@ -466,11 +489,48 @@ internal class ControlDispatcher(
         return ok(request, encodeCommandResult(result))
     }
 
+    /**
+     * audio.channel：APP 为某一 SessionId 申请 PCM lane 绑定（Task 7A2）。
+     *
+     * 只做“登记 + 授权判定”，不碰音频：真正建立链路要求 APP 随后连接 PCM socket 并
+     * 在握手里重复同一 SessionId/格式。会话必须由监督端当前持有，且同一个 APP 身份
+     * 才能接入；响应只含公开字段（socket 名/格式），不含号码或密钥。
+     */
+    private fun audioChannel(request: RpcRequest, peer: PeerIdentity): RpcResponse {
+        val session = request.sessionId
+            ?: return failure(request, ERROR_SESSION_REQUIRED, "audio.channel must carry a session id")
+        if (!HookCommandRouter.isWireSafeSession(session)) {
+            return failure(request, ERROR_SESSION_REQUIRED, "session id is invalid")
+        }
+        val relay = audioPcm
+            ?: return failure(request, "method_not_implemented", "APP audio lane is not wired")
+        val format = PcmLaneCodec.decodeFormatRequest(request.payload.toByteArray(Charsets.UTF_8))
+            ?: return failure(
+                request,
+                ERROR_PAYLOAD_INVALID,
+                "audio.channel payload must be {\"format\":{\"sampleRate\",\"channels\",\"encoding\"}}",
+            )
+        return when (val result = relay.open(session, peer, format)) {
+            is PcmOpenResult.Opened -> {
+                val json = JsonObject()
+                json.addProperty("opened", true)
+                json.addProperty("socket", result.socketName)
+                json.add("format", PcmLaneCodec.encodeFormatJson(result.format))
+                ok(request, json.toString())
+            }
+            is PcmOpenResult.Rejected -> failure(request, result.code, result.message)
+        }
+    }
+
     /** handover：APP 报告人工接管；监督端先撤销所有权再恢复麦克风。 */
     private fun handover(request: RpcRequest): RpcResponse {
         val session = request.sessionId
             ?: return failure(request, "payload_invalid", "handover must carry a session id")
         val outcome = runBlocking { supervision.onManualTakeover(session) }
+        // 所有权已撤销（确认交还/恢复失败）就不能再保留 APP 的音频中继：关连接、丢队列。
+        if (outcome is TakeoverOutcome.Confirmed || outcome is TakeoverOutcome.RestoreFailed) {
+            audioPcm?.release(session)
+        }
         val json = JsonObject()
         json.addProperty("sessionMatched", outcome != TakeoverOutcome.NotOwned)
         when (outcome) {

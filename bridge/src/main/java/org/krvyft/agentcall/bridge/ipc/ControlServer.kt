@@ -8,6 +8,9 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import org.krvyft.agentcall.bridge.audio.PcmLaneCodec
+import org.krvyft.agentcall.bridge.audio.PcmLaneRead
+import org.krvyft.agentcall.bridge.audio.PcmSessionHandler
 import org.krvyft.agentcall.core.model.PeerIdentity
 import org.krvyft.agentcall.core.model.PeerRole
 import org.krvyft.agentcall.core.model.RpcError
@@ -37,8 +40,9 @@ fun interface PcmSink {
  * 特权运行容器的 abstract Unix socket 服务端（spec §6.4）。
  *
  * - **两条通道**：控制通道（[DEFAULT_CONTROL_SOCKET]，JSON 控制帧，最大 64 KiB）与
- *   PCM 通道（[DEFAULT_PCM_SOCKET]，原始 PCM 帧，最大 32 KiB）分开 bind；PCM 只在
- *   注入 [PcmSink] 时启用。两个通道都先用内核凭据核验对端。
+ *   PCM 通道（[DEFAULT_PCM_SOCKET]，PCM lane 帧，最大 32 KiB）分开 bind；PCM 只在
+ *   注入 [PcmSink]（单向丢帧诊断）或 [PcmSessionHandler]（双向会话中继，
+ *   Task 7A2 的生产路径）时启用。两个通道都先用内核凭据核验对端。
  * - **有界资源**：控制通道最多 [MAX_CONNECTIONS] 条连接、[MAX_QUEUE_DEPTH] 个排队
  *   请求；PCM 通道有独立执行器与独立连接信号量，每条 PCM 连接独占一个线程且上限为
  *   [maxPcmConnections]（默认 [MAX_PCM_CONNECTIONS]）。PCM 是长生命周期读取循环，
@@ -54,6 +58,7 @@ class ControlServer(
     private val verifier: PeerVerifier,
     private val handler: RpcHandler,
     private val pcmSink: PcmSink? = null,
+    private val pcmSession: PcmSessionHandler? = null,
     private val maxConnections: Int = MAX_CONNECTIONS,
     private val maxQueueDepth: Int = MAX_QUEUE_DEPTH,
     private val readTimeoutMs: Int = READ_TIMEOUT_MS,
@@ -98,8 +103,7 @@ class ControlServer(
             val control = LocalServerSocket(socketName)
             controlServerSocket = control
             controlAcceptThread = daemonThread("agentcall-control-accept") { acceptLoop(control, isPcm = false) }
-            val pcm = pcmSink
-            if (pcm != null) {
+            if (pcmSink != null || pcmSession != null) {
                 val pcmSocket = LocalServerSocket(pcmSocketName)
                 pcmServerSocket = pcmSocket
                 pcmAcceptThread = daemonThread("agentcall-pcm-accept") { acceptLoop(pcmSocket, isPcm = true) }
@@ -216,6 +220,22 @@ class ControlServer(
             socket.setSoTimeout(readTimeoutMs)
             val identity = verifiedIdentity(socket) ?: return
             if (identity.role != PeerRole.APP) return
+            val sessionHandler = pcmSession
+            if (sessionHandler != null) {
+                // 首帧是会话打开握手（有界读取）；之后是长生命周期音频流，
+                // 读取不再有 soTimeout：结束由会话停止/监督端 close/对端关闭驱动。
+                val input = socket.inputStream
+                val handshake = when (val read = PcmLaneCodec.readFrame(input)) {
+                    is PcmLaneRead.Frame -> read.frame
+                    // 连握手都不合法：直接关闭，不猜语义、不写任何可能被误解的响应。
+                    else -> return
+                }
+                socket.setSoTimeout(0)
+                sessionHandler.serve(identity, handshake, input, socket.outputStream) {
+                    closeQuietly(socket)
+                }
+                return
+            }
             val sink = pcmSink ?: return
             val input = socket.inputStream
             while (!closed.get()) {

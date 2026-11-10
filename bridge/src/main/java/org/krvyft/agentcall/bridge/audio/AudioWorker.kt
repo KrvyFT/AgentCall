@@ -224,6 +224,19 @@ class AudioWorker(
         return confirmed
     }
 
+    /**
+     * 当前已打开且属于 [id] 的音频会话 + 权威格式；未打开或不属于该会话返回 null。
+     *
+     * 音频工作进程的 PCM 服务只凭这个句柄取真实下行/上行：它绝不新开第二路音频，
+     * 也不会把另一个会话的流当成本会话。
+     */
+    fun activeAudio(id: SessionId): PcmOpenedAudio? = synchronized(lock) {
+        val session = activeSession ?: return null
+        val currentFormat = format ?: return null
+        if (state != AudioPathState.OPEN || sessionId != id) return null
+        PcmOpenedAudio(session, currentFormat)
+    }
+
     fun snapshot(): AudioStateSnapshot = synchronized(lock) {
         AudioStateSnapshot(
             role = role,

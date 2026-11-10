@@ -37,19 +37,34 @@ internal object AudioWorkerRuntime {
         worker.start()
         val dispatcher = AudioWorkerDispatcher(worker, lease)
         val server = AudioWorkerSocketServer(dispatcher)
+        // PCM lane 与生命周期通道分开 bind：音频是长生命周期双向流，绝不混进角色 JSON 通道。
+        val pcmService = AudioPcmSessionService(
+            sessions = PcmAudioSessionSource { id -> worker.activeAudio(id) },
+            lease = lease,
+        )
+        val pcmServer = AudioWorkerPcmSocketServer(pcmService)
         try {
             server.start()
         } catch (io: java.io.IOException) {
             System.err.println("{\"error\":{\"code\":\"audio_role_socket_bind_failed\",\"message\":\"" + io.javaClass.simpleName + "\"}}")
             return 1
         }
+        try {
+            pcmServer.start()
+        } catch (io: java.io.IOException) {
+            System.err.println("{\"error\":{\"code\":\"audio_pcm_socket_bind_failed\",\"message\":\"" + io.javaClass.simpleName + "\"}}")
+            server.close()
+            return 1
+        }
         System.out.println(
-            "{\"state\":\"ready\",\"role\":\"AUDIO_WORKER\",\"socket\":\"" + AudioRoleProtocol.SOCKET_NAME + "\"}",
+            "{\"state\":\"ready\",\"role\":\"AUDIO_WORKER\",\"socket\":\"" + AudioRoleProtocol.SOCKET_NAME +
+                "\",\"pcmSocket\":\"" + AudioPcmProtocol.SOCKET_NAME + "\"}",
         )
         val shutdown = CountDownLatch(1)
         Runtime.getRuntime().addShutdownHook(
             Thread(
                 {
+                    pcmServer.close()
                     server.close()
                     runBlocking { worker.stopKeepingIsolation() }
                     worker.close()
