@@ -257,8 +257,10 @@ class ConfigStoreTest {
         val record = PairingRecord(
             appPackage = "org.krvyft.agentcall",
             appSignatureSha256 = "a".repeat(64),
+            appVersionName = "1.0",
             dialerPackage = "com.google.android.dialer",
             dialerSignatureSha256 = "b".repeat(64),
+            dialerVersionName = "100.0",
             pairedAtMs = nowMs,
         )
         store.writePairing(record)

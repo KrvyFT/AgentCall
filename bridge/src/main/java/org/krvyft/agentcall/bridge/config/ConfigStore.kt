@@ -56,13 +56,18 @@ class ConfigStoreException(
 /**
  * 配对时记录并核验的对端身份（root CLI 首次配对时写入）。
  *
- * 只有记录里的包名+签名摘要能成为 APP/HOOK 身份；普通请求不能自注册信任。
+ * 包名、签名摘要与版本都由 bridge 进程在配对时从 PackageManager 重新解析，
+ * 不接受消息自述。签名摘要是后续授权锚点；版本只作为配对时的证据记录，
+ * Google 电话升级后仍需按 spec §9 重新探测能力（不需要重新配对）。
+ * 普通请求不能自注册信任。
  */
 data class PairingRecord(
     val appPackage: String,
     val appSignatureSha256: String,
+    val appVersionName: String,
     val dialerPackage: String,
     val dialerSignatureSha256: String,
+    val dialerVersionName: String,
     val pairedAtMs: Long,
 )
 
@@ -73,7 +78,7 @@ data class PairingRecord(
  *   一次性替换；revision 与内容一起落盘，CAS 不会读到半份配置。
  * - CAS：[update] 的 expectedRevision 必须等于磁盘 revision，否则抛
  *   [ConfigErrorCode.STALE_REVISION] 且不写任何字节。
- * - schema 迁移：读到旧 schema 先写 config.schema-&lt;旧&gt;.json.bak 备份再重写；
+ * - schema 迁移：读到旧 schema 先写 config.schema-旧.json.bak 备份再重写；
  *   读到更新的 schema 直接失败，不降级覆盖。
  * - root 私有：目录 0700、文件 0600；密钥只在内存与主副本里，脱敏导出只给
  *   CONFIGURED/MISSING。
@@ -165,7 +170,15 @@ class ConfigStore(
         ) {
             throw ConfigStoreException(ConfigErrorCode.CORRUPT, "pairing record is incomplete")
         }
-        PairingRecord(appPackage, appSignature, dialerPackage, dialerSignature, pairedAt)
+        PairingRecord(
+            appPackage = appPackage,
+            appSignatureSha256 = appSignature,
+            appVersionName = stringOrNull(json, "appVersionName") ?: UNKNOWN_VERSION,
+            dialerPackage = dialerPackage,
+            dialerSignatureSha256 = dialerSignature,
+            dialerVersionName = stringOrNull(json, "dialerVersionName") ?: UNKNOWN_VERSION,
+            pairedAtMs = pairedAt,
+        )
     }
 
     /** 写入配对记录（调用方必须已确认 root CLI 身份）。 */
@@ -173,15 +186,19 @@ class ConfigStore(
         if (!isValidPackageName(record.appPackage) ||
             !isValidPackageName(record.dialerPackage) ||
             !isValidSignature(record.appSignatureSha256) ||
-            !isValidSignature(record.dialerSignatureSha256)
+            !isValidSignature(record.dialerSignatureSha256) ||
+            !isValidVersion(record.appVersionName) ||
+            !isValidVersion(record.dialerVersionName)
         ) {
             throw ConfigStoreException(ConfigErrorCode.PAIRING_INVALID, "pairing record fields are invalid")
         }
         val json = JsonObject()
         json.addProperty("appPackage", record.appPackage)
         json.addProperty("appSignatureSha256", record.appSignatureSha256)
+        json.addProperty("appVersionName", record.appVersionName)
         json.addProperty("dialerPackage", record.dialerPackage)
         json.addProperty("dialerSignatureSha256", record.dialerSignatureSha256)
+        json.addProperty("dialerVersionName", record.dialerVersionName)
         json.addProperty("pairedAtMs", record.pairedAtMs)
         atomicWrite(File(rootDirectory, PAIRING_FILE_NAME), json.toString().toByteArray(StandardCharsets.UTF_8))
     }
@@ -190,14 +207,18 @@ class ConfigStore(
     fun pair(
         appPackage: String,
         appSignatureSha256: String,
+        appVersionName: String,
         dialerPackage: String,
         dialerSignatureSha256: String,
+        dialerVersionName: String,
     ): PairingRecord {
         val record = PairingRecord(
             appPackage = appPackage,
             appSignatureSha256 = appSignatureSha256,
+            appVersionName = appVersionName,
             dialerPackage = dialerPackage,
             dialerSignatureSha256 = dialerSignatureSha256,
+            dialerVersionName = dialerVersionName,
             pairedAtMs = clockMs(),
         )
         writePairing(record)
@@ -403,6 +424,9 @@ class ConfigStore(
 
     private fun isValidSignature(value: String): Boolean = SIGNATURE_PATTERN.matches(value)
 
+    private fun isValidVersion(value: String): Boolean =
+        value.isNotEmpty() && value.length <= 128 && value.none { it.isISOControl() }
+
     private fun stringOrNull(json: JsonObject, name: String): String? {
         val element = json.get(name) ?: return null
         if (!element.isJsonPrimitive || !element.asJsonPrimitive.isString) return null
@@ -426,6 +450,9 @@ class ConfigStore(
 
         /** 生产主副本目录。 */
         const val DEFAULT_ROOT: String = "/data/adb/agentcall"
+
+        /** 无法解析版本名时的显式占位，不伪装成真实版本。 */
+        const val UNKNOWN_VERSION: String = "UNKNOWN"
 
         private val PACKAGE_PATTERN = Regex("[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)+")
         private val SIGNATURE_PATTERN = Regex("[0-9a-fA-F]{64}")

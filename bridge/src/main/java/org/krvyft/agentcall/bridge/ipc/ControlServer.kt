@@ -118,12 +118,22 @@ class ControlServer(
         }
     }
 
+    /**
+     * 停止接受新连接，并给已提交的请求一个很短的有界刷新窗口（例如 shutdown 响应），
+     * 之后强制关闭残留连接与线程。重复调用安全。
+     */
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
         closeQuietly(controlServerSocket)
         closeQuietly(pcmServerSocket)
         controlServerSocket = null
         pcmServerSocket = null
+        workers.shutdown()
+        try {
+            workers.awaitTermination(CLOSE_GRACE_MS, TimeUnit.MILLISECONDS)
+        } catch (interrupted: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
         for (socket in openSockets) {
             closeQuietly(socket)
         }
@@ -335,5 +345,8 @@ class ControlServer(
         const val ERROR_INTERNAL: String = "internal_error"
 
         private const val ACCEPT_RETRY_DELAY_MS: Long = 100L
+
+        /** 关闭前等待已提交请求写回响应的上限（本地 socket，不需要长等待）。 */
+        private const val CLOSE_GRACE_MS: Long = 500L
     }
 }

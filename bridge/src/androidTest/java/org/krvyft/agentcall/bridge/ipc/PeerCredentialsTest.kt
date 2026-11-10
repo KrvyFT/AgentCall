@@ -69,8 +69,10 @@ class PeerCredentialsTest {
         val record = PairingRecord(
             appPackage = context.packageName,
             appSignatureSha256 = ownSignature!!,
+            appVersionName = "1.0",
             dialerPackage = PeerVerifier.DIALER_PACKAGE,
             dialerSignatureSha256 = "0".repeat(64),
+            dialerVersionName = "UNKNOWN",
             pairedAtMs = 0L,
         )
         val verifier = PeerVerifier(packages) { record }
@@ -97,8 +99,10 @@ class PeerCredentialsTest {
         val record = PairingRecord(
             appPackage = "org.example.not.installed",
             appSignatureSha256 = ownSignature!!,
+            appVersionName = "1.0",
             dialerPackage = PeerVerifier.DIALER_PACKAGE,
             dialerSignatureSha256 = "0".repeat(64),
+            dialerVersionName = "UNKNOWN",
             pairedAtMs = 0L,
         )
         val verifier = PeerVerifier(packages) { record }

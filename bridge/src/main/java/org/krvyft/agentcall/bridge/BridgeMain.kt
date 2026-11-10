@@ -229,14 +229,18 @@ internal class ControlDispatcher(
         val record = store.pair(
             appPackage = packageName,
             appSignatureSha256 = appSignature,
+            appVersionName = packages.versionName(packageName) ?: ConfigStore.UNKNOWN_VERSION,
             dialerPackage = PeerVerifier.DIALER_PACKAGE,
             dialerSignatureSha256 = dialerSignature,
+            dialerVersionName = packages.versionName(PeerVerifier.DIALER_PACKAGE) ?: ConfigStore.UNKNOWN_VERSION,
         )
         val json = JsonObject()
         json.addProperty("appPackage", record.appPackage)
         json.addProperty("appSignatureSha256", record.appSignatureSha256)
+        json.addProperty("appVersionName", record.appVersionName)
         json.addProperty("dialerPackage", record.dialerPackage)
         json.addProperty("dialerSignatureSha256", record.dialerSignatureSha256)
+        json.addProperty("dialerVersionName", record.dialerVersionName)
         json.addProperty("pairedAtMs", record.pairedAtMs)
         return ok(request, json.toString())
     }
