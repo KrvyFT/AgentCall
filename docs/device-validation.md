@@ -356,9 +356,9 @@ $ flock /tmp/agentcall-gradle.lock ./gradlew :core:testDebugUnitTest :bridge:tes
 BUILD SUCCESSFUL
 ~~~
 
-- 结果统计（JUnit XML，修复轮 1 最终）：core 108 tests / 0 failures，bridge 158 tests / 0 failures。
+- 结果统计（JUnit XML，修复轮 1 最终）：core 108 tests / 0 failures，bridge 161 tests / 0 failures。
 - 四个必须测试均通过：`streamCreationDoesNotUnlockCalibration`、`environmentChangeInvalidatesEvidence`（core `CalibrationPolicyTest`）、`revokedLeaseCannotDisconnect`、`audioFailureKeepsMicrophoneIsolated`（bridge `SupervisorTest`）。
-- 修复轮 1 新增覆盖（全部 JVM）：角色生产图装配（`SupervisorProductionGraph` + 假平台）、周期轮询驱动、启动恢复与同一开机重启策略、状态原子持久化/损坏 fail closed、重启预算（监督端持有）、外来会话心跳（I1）、接听结果不明确的状态核验（I2）、迟到/重复 ACTIVE（I3）、迁移串行化（I4）、隔离读回（I7）、奇数字节 PCM 分类（M2）、每轮只终止一次（M4）、特权终止 fail closed（I6）、音频角色通道协议/代理/分派、生产路径真的创建流也不解锁校准（M5）、控制面 `session.request`/`handover`/`hook.snapshot`/心跳/命令结果到监督端口的真实接线。
+- 修复轮 1 新增覆盖（全部 JVM）：角色生产图装配（`SupervisorProductionGraph` + 假平台）、周期轮询驱动、启动恢复与同一开机重启策略、状态原子持久化/损坏 fail closed、重启预算（监督端持有）、外来会话心跳（I1）、接听结果不明确的状态核验（I2）、迟到/重复 ACTIVE（I3）、迁移串行化（I4）、隔离读回（I7）、奇数字节 PCM 分类（M2）、每轮只终止一次（M4）、特权终止 fail closed（I6）、音频角色通道协议/代理/分派、生产路径真的创建流也不解锁校准（M5）、控制面 `session.request`/`handover`/`hook.snapshot`/心跳/命令结果到监督端口的真实接线，以及两个 app_process 入口与 service.sh 编排的存在性。
 - 这些结果只覆盖 JVM 逻辑：PCM16/重采样、反射分类、租约/心跳/窗口顺序、校准策略与持久化 fail closed。它们**没有**覆盖真实 AudioRecord/AudioTrack、HAL、Telecom、SELinux、KernelSU app_process 或任何真实通话。
 
 ## 8. 当前未验证/阻塞清单
