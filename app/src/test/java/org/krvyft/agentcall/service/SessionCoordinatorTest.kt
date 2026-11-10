@@ -911,6 +911,43 @@ class SessionCoordinatorTest {
         }
     }
 
+    /**
+     * N3（7B3 FIX ROUND 2）：`handback_confirmed` 是**监督端已确认撤销**，必须报 CONFIRMED，
+     * 不能沿用本地撤销的 NOT_OWNED（那会渲染成“监督端本不持有该会话”，与事实相反）。
+     */
+    @Test
+    fun aSupervisorConfirmedHandbackIsReportedAsConfirmedNotNotOwned() = runTest {
+        val events = mutableListOf<String>()
+        val observer = RecordingObserver(events)
+        val revoker = FakeRevoker(events)
+        val coordinator = coordinator(
+            FakeCallControl(), FakeAudioBridge(events), FakeConversation(events), revoker, observer,
+        )
+        coordinator.start()
+        try {
+            activeAi(coordinator)
+
+            coordinator.onSupervisorHandback(sessionA, SupervisorHandback.CONFIRMED)
+            advance(100)
+
+            assertTrue("the supervisor already revoked it", revoker.revoked.isEmpty())
+            assertEquals(SessionState.HANDOFF, coordinator.state)
+            assertEquals(
+                "a confirmed supervisor handback must never be reported as not_owned, got " + observer.outcomes,
+                listOf(RevokeOutcome.CONFIRMED),
+                observer.outcomes,
+            )
+            val report = HandbackJournal.record(sessionA, observer.outcomes.single())
+            assertEquals(HandbackJournal.CONFIRMED, report.code)
+            assertEquals(
+                HandbackJournal.CONFIRMED,
+                (HandbackJournal.outcomeFor(AgentCallStatus(activeSession = sessionA, lastHandback = report), sessionA)
+                    as HandbackOutcome.HandedBack).report.code,
+            )
+        } finally {
+            coordinator.close()
+        }
+    }
     @Test
     fun aSupervisorHandbackForAnotherSessionIsIgnored() = runTest {
         val events = mutableListOf<String>()

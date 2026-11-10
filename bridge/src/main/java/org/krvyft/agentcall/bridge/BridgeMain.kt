@@ -75,6 +75,15 @@ import org.krvyft.agentcall.core.port.MonotonicClock
  */
 internal object BridgeInfo {
     val VERSION: String = BuildConfig.VERSION_NAME
+
+    /**
+     * 本桥接进程的随机身份（每进程生成一次）。
+     *
+     * **这是 APP 的重启信标**（7B3 FIX ROUND 2）：uptimeMs 是墙钟差，系统时间回拨会让它
+     * 变负（客户端判负载非法而停摆）或变小（误判重启而重放旧 handback）。进程 id 与时间
+     * 无关：同一进程恒定，重启必然换新值。不要用它做任何访问控制/配对判断。
+     */
+    val PROCESS_ID: String = java.util.UUID.randomUUID().toString()
 }
 
 /**
@@ -403,6 +412,12 @@ internal class ControlDispatcher(
     private val shutdown: CountDownLatch,
     private val supervision: SupervisionRpcPort = SupervisionRpcPort(),
     private val startedAtMs: Long = System.currentTimeMillis(),
+    /**
+     * 本进程的重启信标（每进程随机 id，见 [BridgeInfo.PROCESS_ID]）。
+     *
+     * 只用于让 APP 发现“桥接换进程了”；不是会话身份，也不参与鉴权。
+     */
+    private val processId: String = BridgeInfo.PROCESS_ID,
     private val connectionStats: () -> Pair<Int, Long> = { 0 to 0L },
     private val hookCommands: HookCommandRouter = HookCommandRouter(),
     /**
@@ -784,7 +799,9 @@ internal class ControlDispatcher(
         json.addProperty("revision", redacted.config.revision)
         json.addProperty("enabled", redacted.config.enabled)
         json.addProperty("paired", pairing != null)
+        // uptimeMs 只作展示（WebUI 用）；重启检测只认每进程随机的 processId。
         json.addProperty("uptimeMs", System.currentTimeMillis() - startedAtMs)
+        json.addProperty("processId", processId)
         json.addProperty("activeConnections", active)
         json.addProperty("rejectedConnections", rejected)
         json.addProperty("supervisionPhase", state?.phase)

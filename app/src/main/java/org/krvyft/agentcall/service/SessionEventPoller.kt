@@ -25,16 +25,19 @@ import org.krvyft.agentcall.ipc.SessionEventSource
 import org.krvyft.agentcall.ipc.SessionWireEvent
 
 /**
- * 事件游标持久化（Task 7B3 FIX ROUND 1）。
+ * 事件游标持久化（Task 7B3 FIX ROUND 1，FIX ROUND 2 换成进程 id）。
  *
  * 服务重启后游标归零会把桥接环里**已经发生过**的旧事件（尤其是 handback/断开事实）重新
- * 投递一遍。这里保存“最近一次已投递的 seq + 当时桥接的 uptime”，重启时从它继续；如果桥接
- * 在此期间也重启了（uptime 回退），轮询器仍会清空基线重新同步。
+ * 投递一遍。这里保存“最近一次已投递的 seq + 当时桥接的进程 id”，重启时从它继续；如果桥接
+ * 在此期间也重启了（processId 变了），轮询器仍会清空基线重新同步。
+ *
+ * 用**每进程随机 id**而不是 uptime：墙钟回拨会让 uptime 变负（客户端判负载非法）或变小
+ * （把同一进程误判成重启 → 重放 handback）。
  */
 data class SessionEventCursor(
     val seq: Long,
-    /** 写入时观测到的桥接 uptime（ms）；null = 当时没有重启信标。 */
-    val uptimeMs: Long?,
+    /** 写入时观测到的桥接进程 id；null = 当时没有可信的代次信标。 */
+    val processId: String?,
 )
 
 interface SessionEventCursorStore {
@@ -75,11 +78,12 @@ enum class SupervisorHandback {
  * 映射成 [SessionEvent] 并串行投递给 [SessionCoordinator.onEvent]。
  *
  * 安全不变量：
- * - **桥接进程代次感知**（FIX ROUND 1 的 CRITICAL）：桥接重启后事件环与 seq 从头开始。
- *   仅靠 `cursor_ahead` 只能覆盖“旧游标 > 新 latest”；“旧游标 ≤ 新 latest”时客户端看到
- *   的是干净批次，前 lastSeq 条事件（通常包含新来电的 RINGING）会被当成重复静默丢弃。
- *   因此每次轮询前用 [SessionEpochSource]（status.uptimeMs）检查 uptime 是否回退；回退即
- *   **先清空基线（游标归零）再读**，并把清空后的游标持久化。客户端用 0 重读标出的
+ * - **桥接进程代次感知**（FIX ROUND 1 的 CRITICAL，ROUND 2 换成每进程 id）：桥接重启后
+ *   事件环与 seq 从头开始。仅靠 `cursor_ahead` 只能覆盖“旧游标 > 新 latest”；“旧游标 ≤
+ *   新 latest”时客户端看到的是干净批次，前 lastSeq 条事件（通常包含新来电的 RINGING）会被
+ *   当成重复静默丢弃。因此每次轮询前用 [SessionEpochSource]（status.processId）检查 id
+ *   是否**变化**；变化即**先清空基线（游标归零）再读**，并把清空后的游标持久化。id 不可用
+ *   时按代次未知 fail closed（不重置、不把“没变”当成事实）。客户端用 0 重读标出的
  *   [EventsBatch.reset] 走同一条清空路径。
  * - **严格按 seq 去重**：同一批次重放/游标回退都不会把一通电话处理两次（同一代次内）；
  * - **传输失败有界退避**（[backoffBaseMs] 倍增到 [backoffMaxMs]），机器码经 [onError]
@@ -109,7 +113,7 @@ class SessionEventPoller(
     private val backoffMaxMs: Long = BACKOFF_MAX_MS,
     private val onError: (String) -> Unit = {},
     private val logger: (String) -> Unit = {},
-    /** 桥接重启信标（生产是 [BridgeClient]）；null = 没有信标，只能依赖 cursor_ahead。 */
+    /** 桥接进程代次信标（生产是 [BridgeClient]）；null = 没有信标，只能依赖 cursor_ahead。 */
     private val epochSource: SessionEpochSource? = null,
     /** 跨服务重启的游标持久化（生产是 SharedPreferences）。 */
     private val cursorStore: SessionEventCursorStore = NoSessionEventCursorStore,
@@ -128,12 +132,12 @@ class SessionEventPoller(
         publish(SessionEvent.Takeover(TakeoverReason.UNKNOWN, id))
     },
     /**
-     * 桥接进程代次变化（uptime 回退 = 新进程）后的本地收尾（Task 7B3 FOLLOW-UP）。
+     * 桥接进程代次变化（processId 变了 = 新进程）后的本地收尾（Task 7B3 FOLLOW-UP）。
      *
      * 旧进程所属会话的 `call_disconnected` 可能随进程一起消失；轮询器只报告“代次变了”，
      * 由协调器把它变成一次**本地** SessionEnded（不挂断、不伪造 DISCONNECTED 快照），
      * 从而允许新代次的响铃被接受。协调器没有会话时自然什么都不做。
-     * 每次代次变化只报告一次（uptime 已更新，后续轮询不再判定为重启）。
+     * 每次代次变化只报告一次（id 已更新，后续轮询不再判定为重启）。
      */
     private val onBridgeRestarted: () -> Unit = {},
 ) {
@@ -154,9 +158,9 @@ class SessionEventPoller(
     var lastSeq: Long = restored?.seq ?: initialCursor
         private set
 
-    /** 最近一次观测到的桥接 uptime（重启信标）；null = 还没有观测到。 */
+    /** 最近一次观测到的桥接进程 id（代次信标）；null = 还没有可信观测。 */
     @Volatile
-    private var lastUptimeMs: Long? = restored?.uptimeMs
+    private var lastProcessId: String? = restored?.processId
 
     /** 从持久化存储恢复的游标（诊断用）；null = 本次是按初始游标开始的。 */
     val restoredCursor: Long? get() = restored?.seq
@@ -193,7 +197,7 @@ class SessionEventPoller(
     /** 桥接报告的事件环丢弃总数（单调递增；只是诊断，不是错误）。 */
     val droppedEventCount: Long get() = droppedCounter.get()
 
-    /** 因桥接重启（uptime 回退）或客户端标出的 reset 而清空基线的次数。 */
+    /** 因桥接重启（processId 变化）或客户端标出的 reset 而清空基线的次数。 */
     val baselineResetCount: Long get() = resetCounter.get()
 
     /** 因结构非法而被跳过的事件数（一条坏事件不拒绝整批）。 */
@@ -236,77 +240,122 @@ class SessionEventPoller(
         job = null
     }
 
+    /**
+     * 轮询 Job 的唯一入口。
+     *
+     * **整轮都被守卫**（FIX ROUND 2 / N5）：此前只包住映射/投递，`cursorStore.write` 或
+     * `onRecovered()` 抛异常会让 Job 静默结束；`job` 又永远不为 null，`start()` 再也拉不起来。
+     * 现在任何非取消异常都上报固定机器码并继续轮询；Job 退出时清空自己，允许重新 start()。
+     */
     private suspend fun runLoop() {
-        while (!stopped && currentCoroutineContext().isActive) {
-            // 先确认桥接进程代次：uptime 回退 = 新进程，旧游标对新事件环没有意义。
-            val restarted = probeBridgeRestart()
-            if (restarted == null) {
-                // 信标不可用：不能安全地把“没有事件”当成事实，按传输失败退避（fail closed）。
-                if (stopped || !currentCoroutineContext().isActive) return
-                delay(nextBackoff())
-                continue
-            }
-            if (restarted) {
-                // 代次变化：旧进程的断开事实可能永远不会到达。先让协调器本地结束它仍拥有的
-                // 旧会话（否则新来电按“只有 IDLE/ENDED 才可替换”一直被忽略），再清空基线重读。
-                // 回调先于本轮投递，保证“结束旧会话”排在“新代次的 RINGING”之前。
-                reportBridgeRestart()
-                if (lastSeq != 0L) {
-                    clearBaseline("session_events_epoch_reset")
+        val self = currentCoroutineContext()[Job]
+        try {
+            while (!stopped && currentCoroutineContext().isActive) {
+                try {
+                    iterate()
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (failure: Throwable) {
+                    // 轮询以外的一步（游标持久化/诊断回调）失败：绝不能杀死循环。
+                    reportLoopFailure()
+                    delay(nextBackoff())
                 }
             }
-            pollCounter.incrementAndGet()
-            val result = try {
-                // 独立于事件源的每轮上限：即使注入的传输自身不设超时，轮询也不能被一次
-                // 挂起的请求无限期占住（生产 BridgeClient 的控制请求本就有更短的预算）。
-                withTimeoutOrNull(pollTimeoutMs) { source.pollEvents(lastSeq) }
-                    ?: BridgeRead.Unavailable(ERROR_POLL_TIMEOUT)
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (failure: Throwable) {
-                // 传输实现抛异常与“不可用”等价：只上报机器码，绝不当成没有新事件。
-                BridgeRead.Unavailable(ERROR_POLL_FAILED)
-            }
-            // stop() 与取消之间返回的结果绝不能再投递：服务停止后不允许任何自动接听输入。
+        } finally {
+            clearLoopJob(self)
+        }
+    }
+
+    /** 一轮：代次探测 → 事件轮询 → 投递/退避。
+     *
+     * 从 [runLoop] 抽出来，让“整轮”可以被同一个异常守卫包住（见上）。
+     */
+    private suspend fun iterate() {
+        // 先确认桥接进程代次：processId 变化 = 新进程，旧游标对新事件环没有意义。
+        val restarted = probeBridgeRestart()
+        if (restarted == null) {
+            // 信标不可用/代次未知：不能安全地把“没有事件”当成事实，按传输失败退避（fail closed）。
             if (stopped || !currentCoroutineContext().isActive) return
-            when (result) {
-                is BridgeRead.Available -> {
-                    failureCounter.set(0)
-                    lastErrorCode = null
-                    val clean = deliverOrReport(result.value)
-                    if (clean && !stopped) {
-                        // 一次干净的成功轮询：清除诊断残留（失败码/不完整事件都不会残留）。
-                        onRecovered()
-                    }
+            delay(nextBackoff())
+            return
+        }
+        if (restarted) {
+            // 代次变化：旧进程的断开事实可能永远不会到达。先让协调器本地结束它仍拥有的
+            // 旧会话（否则新来电按“只有 IDLE/ENDED 才可替换”一直被忽略），再清空基线重读。
+            // 回调先于本轮投递，保证“结束旧会话”排在“新代次的 RINGING”之前。
+            reportBridgeRestart()
+            if (lastSeq != 0L) {
+                clearBaseline("session_events_epoch_reset")
+            }
+        }
+        pollCounter.incrementAndGet()
+        val result = try {
+            // 独立于事件源的每轮上限：即使注入的传输自身不设超时，轮询也不能被一次
+            // 挂起的请求无限期占住（生产 BridgeClient 的控制请求本就有更短的预算）。
+            withTimeoutOrNull(pollTimeoutMs) { source.pollEvents(lastSeq) }
+                ?: BridgeRead.Unavailable(ERROR_POLL_TIMEOUT)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Throwable) {
+            // 传输实现抛异常与“不可用”等价：只上报机器码，绝不当成没有新事件。
+            BridgeRead.Unavailable(ERROR_POLL_FAILED)
+        }
+        // stop() 与取消之间返回的结果绝不能再投递：服务停止后不允许任何自动接听输入。
+        if (stopped || !currentCoroutineContext().isActive) return
+        when (result) {
+            is BridgeRead.Available -> {
+                failureCounter.set(0)
+                lastErrorCode = null
+                val clean = deliverOrReport(result.value)
+                if (clean && !stopped) {
+                    // 一次干净的成功轮询：清除诊断残留（失败码/不完整事件都不会残留）。
+                    onRecovered()
+                }
+                delay(pollIntervalMs)
+            }
+            is BridgeRead.Unavailable -> {
+                // 兜底：事件源直接报 cursor_ahead（客户端已把它变成 reset 批次；
+                // 这里仍按“来自另一个进程”处理，绝不进入退避）。
+                if (result.code == ERROR_CURSOR_AHEAD) {
+                    if (lastSeq != 0L) clearBaseline("session_events_cursor_reset")
                     delay(pollIntervalMs)
+                    return
                 }
-                is BridgeRead.Unavailable -> {
-                    // 兜底：事件源直接报 cursor_ahead（客户端已把它变成 reset 批次；
-                    // 这里仍按“来自另一个进程”处理，绝不进入退避）。
-                    if (result.code == ERROR_CURSOR_AHEAD) {
-                        if (lastSeq != 0L) clearBaseline("session_events_cursor_reset")
-                        delay(pollIntervalMs)
-                        continue
-                    }
-                    val failures = failureCounter.incrementAndGet()
-                    lastErrorCode = result.code
-                    onError(result.code)
-                    logger("session_events_poll_failed code=" + result.code)
-                    delay(backoffMs(failures))
-                }
+                val failures = failureCounter.incrementAndGet()
+                lastErrorCode = result.code
+                onError(result.code)
+                logger("session_events_poll_failed code=" + result.code)
+                delay(backoffMs(failures))
             }
         }
     }
 
+    /** 上报一次“轮询循环自身失败”；诊断回调再抛也不能逃出守卫。 */
+    private fun reportLoopFailure() {
+        runCatching { reportDiagnostic(ERROR_LOOP_FAILED) }
+        logger("session_events_loop_failed")
+    }
+
     /**
-     * 探测桥接是否重启过（uptime 回退）。
+     * 轮询 Job 已结束：清空它自己（不是别人），让 `start()` 可以重新拉起。
      *
-     * @return true = 观测到重启；false = 同一进程；null = 信标不可用（已经按传输失败上报）。
+     * 与 [start]/[stop] 共用同一把锁；`job` 已被 [stop] 置空时不覆盖新 Job。
+     */
+    @Synchronized
+    private fun clearLoopJob(loopJob: Job?) {
+        if (job === loopJob) job = null
+        running = false
+    }
+
+    /**
+     * 探测桥接是否重启过（processId 变化）。
+     *
+     * @return true = 观测到重启；false = 同一进程；null = 代次未知（已经按传输失败上报）。
      */
     private suspend fun probeBridgeRestart(): Boolean? {
         val epochSource = epochSource ?: return false
         val result = try {
-            withTimeoutOrNull(pollTimeoutMs) { epochSource.uptimeMs() }
+            withTimeoutOrNull(pollTimeoutMs) { epochSource.processId() }
                 ?: BridgeRead.Unavailable(ERROR_POLL_TIMEOUT)
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -322,9 +371,9 @@ class SessionEventPoller(
                 null
             }
             is BridgeRead.Available -> {
-                val previous = lastUptimeMs
-                val restarted = previous != null && result.value < previous
-                lastUptimeMs = result.value
+                val previous = lastProcessId
+                val restarted = previous != null && previous != result.value
+                lastProcessId = result.value
                 if (restarted) logger("session_events_epoch_restarted")
                 restarted
             }
@@ -426,7 +475,7 @@ class SessionEventPoller(
     }
 
     private fun persistCursor() {
-        cursorStore.write(SessionEventCursor(seq = lastSeq, uptimeMs = lastUptimeMs))
+        cursorStore.write(SessionEventCursor(seq = lastSeq, processId = lastProcessId))
     }
 
     /** 第 n 次连续失败后的等待：base, 2*base, 4*base ... 封顶 [backoffMaxMs]。 */
@@ -470,6 +519,13 @@ class SessionEventPoller(
         const val ERROR_POLL_TIMEOUT: String = "session_events_poll_timeout"
 
         /**
+         * 轮询循环自身的一步抛异常（游标持久化/诊断回调等，不是传输失败）。
+         *
+         * 该轮可能已经投递了事件；上报这条诊断后循环继续，绝不静默结束。
+         */
+        const val ERROR_LOOP_FAILED: String = "session_events_loop_failed"
+
+        /**
          * 只属于事件流/诊断、**绝不**能成为“这通电话交还失败”的机器码。
          *
          * [HandbackJournal.outcomeFor] 用它与交还结果隔离：轮询器的传输码不是接管失败。
@@ -480,6 +536,7 @@ class SessionEventPoller(
             ERROR_DELIVER_FAILED,
             ERROR_POLL_FAILED,
             ERROR_POLL_TIMEOUT,
+            ERROR_LOOP_FAILED,
             ERROR_CURSOR_AHEAD,
             BridgeClient.ERROR_BRIDGE_UNAVAILABLE,
             BridgeClient.ERROR_EVENTS_PAYLOAD,

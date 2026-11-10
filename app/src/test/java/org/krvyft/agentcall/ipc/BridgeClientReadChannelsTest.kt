@@ -282,25 +282,25 @@ class BridgeClientReadChannelsTest {
     // ------------------------------------------- 桥接进程代次（7B3 FIX ROUND 1 / CRITICAL）
 
     /**
-     * status.uptimeMs 是**进程重启信标**：它此前被解析后丢弃，于是桥接重启后 APP 既收不到
-     * cursor_ahead（新进程的 latest 可能已超过旧游标），也没有任何其它信号——新进程的前
-     * lastSeq 条事件（通常包含新来电的 RINGING）被静默跳过。这里只锁定“信标被如实读出”，
-     * 重启判定与基线重置在 SessionEventPollerTest 里用假桥接验证。
+     * status.processId 是**进程重启信标**（7B3 FIX ROUND 2）：每进程随机 id，不是墙钟差。
+     * 此前用 uptimeMs 时，时钟回拨会把它变成负数（客户端判负载非法 → 轮询停摆）或变小
+     * （误判重启 → 同一进程的 handback 被重放）。这里只锁定“id 被如实读出、缺失/空值
+     * 一律不可用”，重启判定与基线重置在 SessionEventPollerTest 里用假桥接验证。
      */
     @Test
-    fun statusSurfacesTheBridgeUptimeBeaconAndRejectsAnEmptyPayload() = runTest {
+    fun statusSurfacesTheBridgeProcessIdBeaconAndRejectsAnEmptyPayload() = runTest {
         val control = FakeControlTransport { request ->
             RpcResponse(id = request.id, payload = STATUS_PAYLOAD)
         }
         val client = client(control)
-        assertEquals(1L, (client.status() as BridgeRead.Available).value.uptimeMs)
-        assertEquals(BridgeRead.Available(1L), client.uptimeMs())
+        assertEquals("proc-a", (client.status() as BridgeRead.Available).value.processId)
+        assertEquals(BridgeRead.Available("proc-a"), client.processId())
         client.close()
 
         // 空负载 {} 不是“status 可用，字段恰好缺失”：它必须整体不可用（statusAvailable=false）。
         val empty = client(FakeControlTransport { request -> RpcResponse(id = request.id, payload = "{}") })
         assertEquals(BridgeRead.Unavailable(BridgeClient.ERROR_STATUS_PAYLOAD), empty.status())
-        assertEquals(BridgeRead.Unavailable(BridgeClient.ERROR_STATUS_PAYLOAD), empty.uptimeMs())
+        assertEquals(BridgeRead.Unavailable(BridgeClient.ERROR_STATUS_PAYLOAD), empty.processId())
         empty.close()
 
         // 只有未知键的负载同样不是 status。
@@ -312,14 +312,40 @@ class BridgeClientReadChannelsTest {
     }
 
     @Test
-    fun aMissingUptimeBeaconIsUnavailableInsteadOfZero() = runTest {
+    fun aMissingProcessIdBeaconIsUnavailableInsteadOfAStableGeneration() = runTest {
         val client = client(
             FakeControlTransport { request ->
                 RpcResponse(id = request.id, payload = "{\"supervisionPhase\":\"IDLE\"}")
             },
         )
-        assertEquals(BridgeRead.Unavailable(BridgeClient.ERROR_STATUS_PAYLOAD), client.uptimeMs())
+        assertEquals(BridgeRead.Unavailable(BridgeClient.ERROR_STATUS_PAYLOAD), client.processId())
         client.close()
+    }
+
+    /** 空串/非字符串的 processId 同样是“代次未知”：绝不退化成“同一进程”。 */
+    @Test
+    fun aBlankOrNonStringProcessIdIsUnavailableInsteadOfAStableGeneration() = runTest {
+        val blank = client(
+            FakeControlTransport { request ->
+                RpcResponse(
+                    id = request.id,
+                    payload = "{\"supervisionPhase\":\"IDLE\",\"processId\":\"\"}",
+                )
+            },
+        )
+        assertEquals(BridgeRead.Unavailable(BridgeClient.ERROR_STATUS_PAYLOAD), blank.processId())
+        blank.close()
+
+        val notAString = client(
+            FakeControlTransport { request ->
+                RpcResponse(
+                    id = request.id,
+                    payload = "{\"supervisionPhase\":\"IDLE\",\"processId\":42}",
+                )
+            },
+        )
+        assertEquals(BridgeRead.Unavailable(BridgeClient.ERROR_STATUS_PAYLOAD), notAString.processId())
+        notAString.close()
     }
 
     // ------------------------------------------- 批次容错（7B3 FIX ROUND 1 / minors）
@@ -450,9 +476,10 @@ class BridgeClientReadChannelsTest {
     }
 
     private companion object {
-        /** Task 7C 线格式里的 status 示例（15 键，无密钥）。 */
+        /** Task 7C 线格式里的 status 示例（16 键，无密钥）。 */
         const val STATUS_PAYLOAD: String = "{\"bridgeVersion\":\"1.0\",\"protocolVersion\":1," +
             "\"revision\":3,\"enabled\":true,\"paired\":true,\"uptimeMs\":1," +
+            "\"processId\":\"proc-a\"," +
             "\"activeConnections\":0,\"rejectedConnections\":0," +
             "\"supervisionPhase\":\"IDLE\",\"supervisionOwned\":false," +
             "\"microphoneIsolated\":false,\"supervisionBlocked\":null," +

@@ -238,7 +238,7 @@ class SessionCoordinator(
     }
 
     /**
-     * 桥接进程代次变化（uptime 回退 = 新进程；Task 7B3 FOLLOW-UP 的裁定）。
+     * 桥接进程代次变化（processId 变了 = 新进程；Task 7B3 FOLLOW-UP 的裁定）。
      *
      * 桥接重启后，旧进程里那通电话的 `call_disconnected` 可能永远不会到达：会话会卡在
      * ACTIVE_AI/ENDING 直到 180 s 上限，而新来电又因“只有 IDLE/ENDED 才可替换”一直被忽略。
@@ -487,10 +487,18 @@ class SessionCoordinator(
         // NOT_OWNED；revoke_failed/unknown：所有权可能仍在监督端，必须重试撤销。
         val viaServer = fact.outcome == SupervisorHandback.REVOKE_FAILED ||
             fact.outcome == SupervisorHandback.UNKNOWN
+        // 监督端自己的结果必须原样成为本地的撤销裁决（N3）：CONFIRMED 曾经被本地路径写成
+        // NOT_OWNED，于是“已确认撤销”渲染成“监督端本不持有该会话”，与事实相反。
+        val localOutcome = when (fact.outcome) {
+            SupervisorHandback.CONFIRMED -> RevokeOutcome.CONFIRMED
+            SupervisorHandback.NOT_OWNED -> RevokeOutcome.NOT_OWNED
+            else -> RevokeOutcome.NOT_OWNED
+        }
         reduceAndApply(
             runtime,
             SessionEvent.Takeover(TakeoverReason.UNKNOWN, fact.session),
             handbackViaServer = viaServer,
+            localRevokeOutcome = localOutcome,
         )
         // restore_failed：即使本地的撤销已确认，监督端也没能恢复人工音频——绝不能显示“已交还成功”。
         if (fact.outcome == SupervisorHandback.RESTORE_FAILED) {
@@ -552,11 +560,16 @@ class SessionCoordinator(
         runtime: CallRuntime,
         event: SessionEvent,
         handbackViaServer: Boolean,
+        /**
+         * 只撤销本地租约时使用的裁决。默认 NOT_OWNED（本地本来就不持有监督端所有权）；
+         * 监督端已确认撤销时由调用方传 CONFIRMED，避免把“已确认”渲染成“本不持有”。
+         */
+        localRevokeOutcome: RevokeOutcome = RevokeOutcome.NOT_OWNED,
     ) {
         if (current !== runtime) return
         val effects = runtime.reducer.reduce(event, clock.nowMs())
         observer.onStateChanged(runtime.session, runtime.reducer.state)
-        applyEffects(runtime, effects, handbackViaServer)
+        applyEffects(runtime, effects, handbackViaServer, localRevokeOutcome)
         if (runtime.reducer.state == SessionState.ENDED && current === runtime) {
             retire(runtime, "call_ended")
         }
@@ -566,15 +579,21 @@ class SessionCoordinator(
         runtime: CallRuntime,
         effects: List<SessionEffect>,
         handbackViaServer: Boolean,
+        localRevokeOutcome: RevokeOutcome = RevokeOutcome.NOT_OWNED,
     ) {
         for (effect in effects) {
             // 每个效果执行前都核对目标会话：旧会话/旧代次的效果一律不执行。
             if (!isCurrent(runtime)) return
-            execute(runtime, effect, handbackViaServer)
+            execute(runtime, effect, handbackViaServer, localRevokeOutcome)
         }
     }
 
-    private suspend fun execute(runtime: CallRuntime, effect: SessionEffect, handbackViaServer: Boolean) {
+    private suspend fun execute(
+        runtime: CallRuntime,
+        effect: SessionEffect,
+        handbackViaServer: Boolean,
+        localRevokeOutcome: RevokeOutcome,
+    ) {
         when (effect) {
             is SessionEffect.AcquireLease -> {
                 if (!requireTarget(runtime, effect.id)) return
@@ -584,7 +603,7 @@ class SessionCoordinator(
             }
             is SessionEffect.RevokeLease -> {
                 if (!requireTarget(runtime, effect.id)) return
-                revokeOwnership(runtime, effect.id, handbackViaServer)
+                revokeOwnership(runtime, effect.id, handbackViaServer, localRevokeOutcome)
             }
             is SessionEffect.SendCommand -> sendCommand(runtime, effect.command)
             SessionEffect.StartConversation -> startConversation(runtime)
@@ -602,9 +621,15 @@ class SessionCoordinator(
      * 撤销 AI 所有权。
      *
      * [handbackViaServer] 为 true 时走 handover RPC（人工接管/用户先接听/总开关关闭）；
-     * 为 false 时只撤销本地租约（故障挂断/断开路径由监督端自己的终止与恢复闭环负责）。
+     * 为 false 时只撤销本地租约（故障挂断/断开路径由监督端自己的终止与恢复闭环负责），
+     * 裁决用 [localRevokeOutcome]：监督端已确认撤销时是 CONFIRMED，不能一律写成 NOT_OWNED。
      */
-    private suspend fun revokeOwnership(runtime: CallRuntime, id: SessionId, handbackViaServer: Boolean) {
+    private suspend fun revokeOwnership(
+        runtime: CallRuntime,
+        id: SessionId,
+        handbackViaServer: Boolean,
+        localRevokeOutcome: RevokeOutcome,
+    ) {
         // 关键排序：撤销必须晚于授权。若 session.request 还在途中，先等它结束，
         // 否则监督端可能在 prepareAnswer 完成前处理 handover，让随后到达的接听“无人拥有”。
         val inFlight = runtime.commandJob
@@ -629,7 +654,7 @@ class SessionCoordinator(
                 RevokeOutcome.UNAVAILABLE
             }
         } else {
-            RevokeOutcome.NOT_OWNED
+            localRevokeOutcome
         }
         runtime.revokeOutcome = outcome
         if (outcome == RevokeOutcome.CONFIRMED || outcome == RevokeOutcome.NOT_OWNED) {

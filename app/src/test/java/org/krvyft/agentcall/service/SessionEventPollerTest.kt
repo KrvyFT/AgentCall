@@ -35,6 +35,7 @@ import org.krvyft.agentcall.core.port.ConversationPort
 import org.krvyft.agentcall.core.port.MonotonicClock
 import org.krvyft.agentcall.core.session.LeaseRegistry
 import org.krvyft.agentcall.core.session.SessionReducer
+import org.krvyft.agentcall.ipc.BridgeClient
 import org.krvyft.agentcall.ipc.BridgeRead
 import org.krvyft.agentcall.ipc.EventsBatch
 import org.krvyft.agentcall.ipc.SessionEpochSource
@@ -464,12 +465,12 @@ class SessionEventPollerTest {
      * 模式 B：旧游标 ≤ 新进程的 latest（桥接重启后新进程已经记录了更多事件）。
      *
      * 桥接不会返回 cursor_ahead，返回的批次看起来完全正常——新进程的 seq 1..oldCursor 被
-     * 静默跳过（通常正是新来电的 RINGING）。只有 uptime 信标能发现重启：轮询器必须先清空
-     * 基线、从 0 重读，再应用批次。
+     * 静默跳过（通常正是新来电的 RINGING）。只有进程 id 信标能发现重启：轮询器必须先清空
+     * 基线、从 0 重读，再应用批次（FIX ROUND 2：id 变了，不是 uptime 变小）。
      */
     @Test
     fun aRestartedBridgeWhoseLatestSequenceIsAheadStillDeliversTheNewCallsFirstEvents() = runTest {
-        val bridge = RestartingFakeBridge(uptimeMs = 10_000L)
+        val bridge = RestartingFakeBridge(processId = "proc-a")
         bridge.record(ringing(0, id = session), source = "UNKNOWN")
         bridge.record(ringing(0, id = session), source = "UNKNOWN")
         val published = mutableListOf<SessionEvent>()
@@ -480,8 +481,8 @@ class SessionEventPollerTest {
             assertEquals(2, published.size)
             assertEquals(2L, poller.lastSeq)
 
-            // 桥接重启：事件环从 0 开始，uptime 回退；新来电的 RINGING 是 seq 1。
-            bridge.restart(uptimeMs = 100L)
+            // 桥接重启：事件环从 0 开始，进程 id 变化；新来电的 RINGING 是 seq 1。
+            bridge.restart(processId = "proc-b")
             bridge.record(ringing(0, id = other), source = "UNKNOWN")
             bridge.record(ringing(0, id = other, handbackReason = null), source = "UNKNOWN")
             bridge.record(ringing(0, id = session, state = CallState.DISCONNECTED), source = "UNKNOWN")
@@ -536,11 +537,11 @@ class SessionEventPollerTest {
         }
     }
 
-    /** 服务重启 + 桥接在此期间也重启：持久化的 uptime 让新模式 B 仍能重新同步。 */
+    /** 服务重启 + 桥接在此期间也重启：持久化的进程 id 让新模式 B 仍能重新同步。 */
     @Test
-    fun aPersistedUptimeDetectsARestartThatHappenedWhileTheServiceWasDead() = runTest {
-        val store = InMemoryCursorStore(SessionEventCursor(seq = 5L, uptimeMs = 10_000L))
-        val bridge = RestartingFakeBridge(uptimeMs = 100L)
+    fun aPersistedProcessIdDetectsARestartThatHappenedWhileTheServiceWasDead() = runTest {
+        val store = InMemoryCursorStore(SessionEventCursor(seq = 5L, processId = "proc-a"))
+        val bridge = RestartingFakeBridge(processId = "proc-b")
         bridge.record(ringing(0, id = other), source = "UNKNOWN")
         bridge.record(ringing(0, id = other), source = "UNKNOWN")
         bridge.record(ringing(0, id = other), source = "UNKNOWN")
@@ -549,13 +550,111 @@ class SessionEventPollerTest {
         poller.start()
         try {
             runCurrent()
-            assertEquals("the persisted uptime must expose the restart before the first poll", 0L, bridge.cursors.first())
+            assertEquals("the persisted id must expose the restart before the first poll", 0L, bridge.cursors.first())
             assertEquals("the resynced ring is delivered from its start", 3, published.size)
             assertTrue(
                 "the new process's first event must be delivered",
                 (published.first() as SessionEvent.StateChanged).snapshot.id == other,
             )
             assertEquals(3L, poller.lastSeq)
+        } finally {
+            poller.stop()
+        }
+    }
+
+    /**
+     * 同一进程 id = 同一代次：即使游标是服务重启后从磁盘恢复的，也绝不重置基线。
+     * （FIX ROUND 2：信标从墙钟 uptime 改成每进程随机 id 之后，同代次的判定不能依赖时间。）
+     */
+    @Test
+    fun aPersistedProcessIdThatMatchesTheRunningBridgeKeepsTheBaseline() = runTest {
+        val store = InMemoryCursorStore(SessionEventCursor(seq = 2L, processId = "proc-a"))
+        val bridge = RestartingFakeBridge(processId = "proc-a")
+        bridge.record(ringing(0, id = session), source = "UNKNOWN")
+        bridge.record(ringing(0, id = session), source = "UNKNOWN")
+        bridge.record(ringing(0, id = session), source = "UNKNOWN")
+        val published = mutableListOf<SessionEvent>()
+        val poller = TestScopePoller(bridge, { published += it }, epochSource = bridge, cursorStore = store)
+        poller.start()
+        try {
+            runCurrent()
+            assertEquals("the restored cursor must be used as-is", listOf(2L), bridge.cursors)
+            assertEquals("an unchanged process id must never reset the baseline", 0L, poller.baselineResetCount)
+            assertEquals("only the new event is delivered", 1, published.size)
+            assertEquals(3L, poller.lastSeq)
+            assertEquals(SessionEventCursor(3L, "proc-a"), store.cursor)
+        } finally {
+            poller.stop()
+        }
+    }
+
+    /**
+     * 没有 processId 的 status 是“代次未知”，不是“同一进程”，也不是一次干净的“没重启”：
+     * 轮询器必须 fail closed（不重置基线、不轮询事件、按失败退避）。信标恢复且 id 相同后，
+     * 从原游标继续。
+     */
+    @Test
+    fun aStatusWithoutTheProcessIdFailsClosedAndNeverFakesACleanRestart() = runTest {
+        val bridge = RestartingFakeBridge(processId = "proc-a")
+        bridge.record(ringing(0, id = session), source = "UNKNOWN")
+        val epoch = FixedEpochSource(BridgeRead.Unavailable(BridgeClient.ERROR_STATUS_PAYLOAD))
+        val errors = mutableListOf<String>()
+        val published = mutableListOf<SessionEvent>()
+        val poller = TestScopePoller(
+            bridge,
+            { published += it },
+            onError = { errors += it },
+            epochSource = epoch,
+        )
+        poller.start()
+        try {
+            advance(1_000)
+            assertEquals("an unknown generation must never fake a restart", 0L, poller.baselineResetCount)
+            assertTrue("no event may be polled without a known generation", bridge.cursors.isEmpty())
+            assertTrue("the unknown generation must be reported", errors.isNotEmpty())
+            assertTrue(errors.all { it == BridgeClient.ERROR_STATUS_PAYLOAD })
+            assertEquals("fail closed must not deliver anything", emptyList<SessionEvent>(), published)
+
+            // 信标恢复（同一进程）：从旧游标（0）继续，不重置基线。
+            epoch.set(BridgeRead.Available("proc-a"))
+            advance(3_000)
+            assertEquals("a known generation must not fake a restart", 0L, poller.baselineResetCount)
+            assertEquals("the real cursor is used once the generation is known", 0L, bridge.cursors.first())
+            assertEquals(1, published.size)
+        } finally {
+            poller.stop()
+        }
+    }
+
+    // ------------------------------------- 循环异常保护（7B3 FIX ROUND 2 / N5）
+
+    /**
+     * 游标存储写失败（磁盘/SharedPreferences 异常）不能杀死轮询 Job：此前只有映射/投递被包住，
+     * cursorStore.write 抛异常会让 Job 静默结束且 job 永不为 null，start() 再也拉不起来。
+     * 现在整轮都被守卫：上报固定机器码、继续轮询。
+     */
+    @Test
+    fun aThrowingCursorStoreIsDiagnosedAndNeverWedgesThePoller() = runTest {
+        val source = FakeSource { cursor -> batch(ringing(cursor + 1), nextSeq = cursor + 1, since = cursor) }
+        val diagnostics = mutableListOf<String>()
+        val poller = TestScopePoller(
+            source,
+            {},
+            cursorStore = ThrowingCursorStore(),
+            onDiagnostic = { diagnostics += it },
+        )
+        poller.start()
+        try {
+            runCurrent()
+            assertEquals(listOf(SessionEventPoller.ERROR_LOOP_FAILED), diagnostics)
+            assertTrue("the poller must stay alive after a cursor-store failure", poller.isRunning)
+
+            advance(1_000)
+            assertTrue(
+                "the loop must keep polling after a cursor-store failure, got " + source.cursors,
+                source.cursors.size >= 2,
+            )
+            assertTrue("the cursor must keep advancing, got " + poller.lastSeq, poller.lastSeq >= 2L)
         } finally {
             poller.stop()
         }
@@ -573,7 +672,7 @@ class SessionEventPollerTest {
      */
     @Test
     fun aBridgeRestartEndsTheOwnedSessionLocallyAndTheNextCallIsAnswered() = runTest {
-        val bridge = RestartingFakeBridge(uptimeMs = 10_000L)
+        val bridge = RestartingFakeBridge(processId = "proc-a")
         bridge.record(ringing(0, id = session), source = "UNKNOWN")
         val events = mutableListOf<String>()
         val calls = FakeCallControl()
@@ -604,8 +703,8 @@ class SessionEventPollerTest {
             assertTrue("the AI call must hold the local lease", leases.isLive(session))
             assertEquals(listOf("audio.opened:call-a", "conversation.started:call-a"), events)
 
-            // 桥接重启（uptime 回退）：旧进程的断开事实永远不会到达；新进程里已有一路新响铃。
-            bridge.restart(uptimeMs = 100L)
+            // 桥接重启（进程 id 变化）：旧进程的断开事实永远不会到达；新进程里已有一路新响铃。
+            bridge.restart(processId = "proc-b")
             bridge.record(ringing(0, id = other), source = "UNKNOWN")
             advance(500)
 
@@ -659,7 +758,7 @@ class SessionEventPollerTest {
     /** 同一次重启可能跨多轮轮询被观测：代次信号只能上报一次。 */
     @Test
     fun aDetectedBridgeRestartIsReportedOnceAcrossPolls() = runTest {
-        val bridge = RestartingFakeBridge(uptimeMs = 10_000L)
+        val bridge = RestartingFakeBridge(processId = "proc-a")
         bridge.record(ringing(0, id = session), source = "UNKNOWN")
         var restarts = 0
         val poller = TestScopePoller(
@@ -673,7 +772,7 @@ class SessionEventPollerTest {
             runCurrent()
             assertEquals("an unchanged generation must not signal a restart", 0, restarts)
 
-            bridge.restart(uptimeMs = 100L)
+            bridge.restart(processId = "proc-b")
             advance(500)
             assertEquals("the generation change must be reported", 1, restarts)
 
@@ -690,7 +789,7 @@ class SessionEventPollerTest {
      */
     @Test
     fun aBridgeRestartWithoutAnOwnedSessionStillResyncsTheCursor() = runTest {
-        val bridge = RestartingFakeBridge(uptimeMs = 10_000L)
+        val bridge = RestartingFakeBridge(processId = "proc-a")
         bridge.record(supervisor(0, "call_disconnected", null), source = "SUPERVISOR")
         val events = mutableListOf<String>()
         val calls = FakeCallControl()
@@ -712,7 +811,7 @@ class SessionEventPollerTest {
             assertNull("a disconnect fact without a session owns nothing", coordinator.activeSession)
             assertEquals(1L, poller.lastSeq)
 
-            bridge.restart(uptimeMs = 100L)
+            bridge.restart(processId = "proc-b")
             bridge.record(ringing(0, id = other), source = "UNKNOWN")
             advance(500)
 
@@ -870,10 +969,10 @@ class SessionEventPollerTest {
         onBridgeRestarted = onBridgeRestarted,
     )
 
-    /** 模拟“每进程一份”的事件环：重启后 uptime 回退、seq 从 1 重新开始。 */
-    private class RestartingFakeBridge(uptimeMs: Long) : SessionEventSource, SessionEpochSource {
+    /** 模拟“每进程一份”的事件环：重启后进程 id 变化、seq 从 1 重新开始。 */
+    private class RestartingFakeBridge(processId: String) : SessionEventSource, SessionEpochSource {
         val cursors = mutableListOf<Long>()
-        private var uptime = uptimeMs
+        private var process = processId
         private var latest = 0L
         private val ring = mutableListOf<SessionWireEvent>()
 
@@ -882,13 +981,13 @@ class SessionEventPollerTest {
             ring += event.copy(seq = latest, source = source)
         }
 
-        fun restart(uptimeMs: Long) {
-            uptime = uptimeMs
+        fun restart(processId: String) {
+            process = processId
             latest = 0L
             ring.clear()
         }
 
-        override suspend fun uptimeMs(): BridgeRead<Long> = BridgeRead.Available(uptime)
+        override suspend fun processId(): BridgeRead<String> = BridgeRead.Available(process)
 
         override suspend fun pollEvents(sinceSeq: Long): BridgeRead<EventsBatch> {
             cursors += sinceSeq
@@ -903,6 +1002,24 @@ class SessionEventPollerTest {
 
         override fun write(cursor: SessionEventCursor) {
             this.cursor = cursor
+        }
+    }
+
+    /** 只提供代次信标的事件源（不参与事件轮询）。 */
+    private class FixedEpochSource(private var result: BridgeRead<String>) : SessionEpochSource {
+        override suspend fun processId(): BridgeRead<String> = result
+
+        fun set(next: BridgeRead<String>) {
+            result = next
+        }
+    }
+
+    /** 模拟磁盘/SharedPreferences 写失败：每次持久化都抛异常。 */
+    private class ThrowingCursorStore : SessionEventCursorStore {
+        override fun read(): SessionEventCursor? = null
+
+        override fun write(cursor: SessionEventCursor) {
+            throw IllegalStateException("cursor store is broken")
         }
     }
 

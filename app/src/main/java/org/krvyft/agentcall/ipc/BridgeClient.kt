@@ -187,11 +187,12 @@ data class BridgeStatusFacts(
     val enabled: Boolean? = null,
     val bridgeVersion: String? = null,
     /**
-     * 桥接进程已经运行的毫秒数（`status.uptimeMs`）：**进程重启信标**。
+     * 桥接进程的随机身份（`status.processId`）：**唯一的重启信标**（7B3 FIX ROUND 2）。
      *
-     * 同一进程内单调递增；重启后回退。null = 负载没有提供（调用方不得假设“没重启”）。
+     * 同一进程内恒定；重启后必然是另一个值。null = 负载没有提供合法 id（调用方不得假设
+     * “没重启”）。**不要**再用 `uptimeMs` 判重启：那是墙钟差，时钟回拨会变负或变小。
      */
-    val uptimeMs: Long? = null,
+    val processId: String? = null,
 )
 
 /**
@@ -238,15 +239,19 @@ fun interface SessionEventSource {
 }
 
 /**
- * 桥接进程的 uptime（ms）信标（Task 7B3 FIX ROUND 1）。
+ * 桥接进程代次信标：每进程随机的 `status.processId`（Task 7B3 FIX ROUND 1 / ROUND 2）。
  *
  * 事件环是**每进程一份**的，seq 在重启后从头开始；只靠 `cursor_ahead` 无法发现“新进程的
  * latest 已经超过旧游标”的情况（那时桥接会返回一个看起来完全正常的批次，新来电的前几条
- * 事件被静默跳过）。轮询器每次轮询前读这个信标，回退即视为重启并清空本地基线。
+ * 事件被静默跳过）。轮询器每次轮询前读这个 id，**id 变了**（而不是“uptime 回退了”）即视为
+ * 重启并清空本地基线。id 与墙钟无关：时间回拨既不产生假重启，也不会让信标变成非法值。
  */
 fun interface SessionEpochSource {
-    /** @return 桥接 uptime；[BridgeRead.Unavailable] 表示无法确定（调用方 fail closed）。 */
-    suspend fun uptimeMs(): BridgeRead<Long>
+    /**
+     * @return 桥接进程 id；[BridgeRead.Unavailable] 表示代次未知（调用方 fail closed：
+     * 不重置基线、不把“没有重启”当成事实）。
+     */
+    suspend fun processId(): BridgeRead<String>
 }
 
 /**
@@ -403,22 +408,34 @@ class BridgeClient(
                 paired = json.boolean("paired"),
                 enabled = json.boolean("enabled"),
                 bridgeVersion = json.string("bridgeVersion"),
-                uptimeMs = json.long("uptimeMs")?.takeIf { it >= 0L },
+                processId = processIdOf(json),
             ),
         )
     }
 
     /**
-     * 桥接 uptime 信标（进程重启检测）。
+     * 桥接进程 id 信标（进程重启检测，7B3 FIX ROUND 2）。
      *
-     * 与 [status] 同一条只读请求；没有 `uptimeMs` 的负载返回 [ERROR_STATUS_PAYLOAD]，
-     * 绝不把“缺失”当成 0（0 会让每一次轮询都被判成重启）。
+     * 与 [status] 同一条只读请求；没有合法 `processId` 的负载返回 [ERROR_STATUS_PAYLOAD]，
+     * 绝不把“缺失”当成“同一进程”（那会把“代次未知”伪装成一次干净的重启检查）。
      */
-    override suspend fun uptimeMs(): BridgeRead<Long> = when (val facts = status()) {
+    override suspend fun processId(): BridgeRead<String> = when (val facts = status()) {
         is BridgeRead.Unavailable -> facts
-        is BridgeRead.Available -> facts.value.uptimeMs
+        is BridgeRead.Available -> facts.value.processId
             ?.let { BridgeRead.Available(it) }
             ?: BridgeRead.Unavailable(ERROR_STATUS_PAYLOAD)
+    }
+
+    /**
+     * status.processId 的严格解析：空串/非字符串/含空白或控制字符/超长都算“代次未知”。
+     *
+     * 绝不把不合法 id 截断、补默认值或当成“同一进程”的合法证据。
+     */
+    private fun processIdOf(json: JsonObject): String? {
+        val value = json.string("processId") ?: return null
+        if (value.isEmpty() || value.length > MAX_PROCESS_ID_CHARS) return null
+        if (value.any { it.isISOControl() || it.isWhitespace() }) return null
+        return value
     }
 
     /**
@@ -532,8 +549,9 @@ class BridgeClient(
     }
 
     /**
-     * 解析一条事件。[seq]/[sessionId] 是结构身份（缺失或不合法 → 整批拒绝）；
-     * 其余观测字段缺失/类型不符一律 null，绝不补 false/0/1（7C 线格式）。
+     * 解析一条事件。返回 null = **只跳过这一条**（计数为 skipped），同一批里的真实事件照常
+     * 投递——单条坏事件绝不拒绝整批。[seq]/[sessionId] 是结构身份（缺失或不合法 → 该事件
+     * 被跳过）；其余观测字段缺失/类型不符一律 null，绝不补 false/0/1（7C 线格式）。
      */
     private fun decodeWireEvent(json: JsonObject): SessionWireEvent? {
         val seq = json.long("seq") ?: return null
@@ -1253,11 +1271,14 @@ class BridgeClient(
          */
         const val MAX_SESSION_TOKEN_CHARS: Int = RpcCodec.MAX_SESSION_FIELD_CHARS
 
+        /** processId 的线格式上界（UUID 只有 36 字符；超长负载一律视为代次未知）。 */
+        const val MAX_PROCESS_ID_CHARS: Int = 128
+
         private val ENCODE_STOP: ByteArray = "{\"type\":\"stop\"}".toByteArray(Charsets.UTF_8)
 
         /** status 负载里至少要有其中一个键，否则不是一次可用的 status 读取。 */
         private val STATUS_KEYS = setOf(
-            "bridgeVersion", "protocolVersion", "revision", "enabled", "paired", "uptimeMs",
+            "bridgeVersion", "protocolVersion", "revision", "enabled", "paired", "uptimeMs", "processId",
             "activeConnections", "rejectedConnections", "supervisionPhase", "supervisionOwned",
             "microphoneIsolated", "supervisionBlocked", "supervisionLastFault",
             "hookConnected", "dialerDefaultRole",

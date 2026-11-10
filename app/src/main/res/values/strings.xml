@@ -61,6 +61,7 @@
     <string name="main_note_no_blockers">未就绪原因：尚未完成检测</string>
     <string name="main_note_ready">已就绪：全部就绪事实满足</string>
     <string name="main_error_prefix">最近错误：%1$s</string>
+    <string name="main_diagnostic_prefix">诊断：%1$s</string>
     <string name="main_bridge_reachable">可达，APP 已通过配对核验</string>
     <string name="main_bridge_unreachable">不可达（bridge_unavailable）</string>
     <string name="main_hook_unknown">未知（桥接未向 APP 开放 status）</string>

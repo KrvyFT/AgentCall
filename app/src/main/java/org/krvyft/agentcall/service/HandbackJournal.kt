@@ -142,7 +142,7 @@ object HandbackJournal {
         if (status.lastErrorSession != session) return HandbackOutcome.Pending
         // 轮询器/事件流的诊断码（session_event_incomplete、bridge_unavailable、…）不是接管失败：
         // 它们此前经 lastError 直接进入“交还失败”，掩盖了真实的交还结果并绕过了文案过滤。
-        // 事件流诊断现在写在 AgentCallStatus.lastDiagnostic，这里再做一次防御性隔离。
+        // 事件流诊断现在写在 AgentCallStatus.pollerDiagnostic，这里再做一次防御性隔离。
         if (isDiagnosticOnly(error)) return HandbackOutcome.Pending
         return HandbackOutcome.Failed(error)
     }

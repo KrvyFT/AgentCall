@@ -66,13 +66,22 @@ data class AgentCallStatus(
     /** 最近一次影响安全的错误机器码（触发/音频/撤销失败等）。 */
     val lastError: String? = null,
     /**
-     * 事件流/轮询器的诊断机器码（Task 7B3 FIX ROUND 1），例如
+     * **轮询器**写的诊断机器码（Task 7B3 FIX ROUND 1/2），例如
      * `session_event_incomplete`/`bridge_unavailable`/`session_events_deliver_failed`。
      *
      * 与 [lastError] **分开**：轮询失败不是“这通电话的交还失败”，恢复后（[SessionEventPoller]
      * 的下一次干净轮询）立即清空；[HandbackJournal.outcomeFor] 永不读它。
+     * 与 [bootstrapDiagnostic] 分属不同来源，互不清除（N4）。
      */
-    val lastDiagnostic: String? = null,
+    val pollerDiagnostic: String? = null,
+    /**
+     * **就绪循环（bootstrap）**写的诊断机器码（Task 7B3 FIX ROUND 2 / N4），例如
+     * `bootstrap_failed`。
+     *
+     * 它此前与轮询器共用 `lastDiagnostic`，于是一次“事件流恢复”就把仍成立的 bootstrap 失败
+     * 抹掉了（诊断不可见）。现在由 [ServiceDiagnostics] 按来源分槽，恢复只清各自的槽。
+     */
+    val bootstrapDiagnostic: String? = null,
     /**
      * [lastError] 归属的会话；null 表示服务级/未知会话（例如 bootstrap/轮询失败）。
      *
@@ -86,6 +95,38 @@ data class AgentCallStatus(
     /** 人工交还结果（绑定产生它的会话）；只有 handback_confirmed / handback_not_owned 表示成功。 */
     val lastHandback: HandbackReport? = null,
 )
+
+/**
+ * 诊断码的**来源归属**（Task 7B3 FIX ROUND 2 / N4）。
+ *
+ * 两个来源（轮询器 / 就绪循环）各自写自己的槽：一次“事件流恢复”只清轮询器的槽，
+ * 绝不能顺手抹掉仍然成立的 bootstrap_failed。UI 用 [visible] 取要显示的那一条。
+ */
+object ServiceDiagnostics {
+
+    /** 就绪循环自身抛异常时的固定机器码（与轮询器诊断分开归属）。 */
+    const val BOOTSTRAP_FAILED: String = "bootstrap_failed"
+
+    /** 轮询器的诊断（写入即覆盖轮询器自己的槽）。 */
+    fun withPollerCode(status: AgentCallStatus, code: String): AgentCallStatus =
+        status.copy(pollerDiagnostic = code)
+
+    /** 轮询器恢复（一次干净轮询）：只清轮询器自己的槽。 */
+    fun clearPollerCode(status: AgentCallStatus): AgentCallStatus =
+        if (status.pollerDiagnostic == null) status else status.copy(pollerDiagnostic = null)
+
+    /** 就绪循环失败：清 READY 并写入 bootstrap 槽。 */
+    fun withBootstrapFailure(status: AgentCallStatus): AgentCallStatus =
+        status.copy(ready = false, bootstrapDiagnostic = BOOTSTRAP_FAILED)
+
+    /** 就绪循环成功完成一次判定：只清 bootstrap 槽（轮询器诊断保留）。 */
+    fun clearBootstrapFailure(status: AgentCallStatus): AgentCallStatus =
+        if (status.bootstrapDiagnostic == null) status else status.copy(bootstrapDiagnostic = null)
+
+    /** UI 显示的诊断：轮询器优先（更高频），其次 bootstrap；都没有才是 null。 */
+    fun visible(status: AgentCallStatus): String? =
+        status.pollerDiagnostic ?: status.bootstrapDiagnostic
+}
 
 /**
  * 进程内服务状态总线（UI 与通知共用）。
@@ -316,21 +357,22 @@ class AgentCallService : Service() {
             publish = sessionCoordinator::onEvent,
             scope = scope,
             dispatcher = Dispatchers.Default,
-            // 桥接重启信标：uptime 回退 = 新进程，轮询器先清空基线再读（7B3 CRITICAL）。
+            // 桥接代次信标：processId 变化 = 新进程，轮询器先清空基线再读（7B3 CRITICAL）。
             epochSource = client,
             // 服务重启后从上次已投递的 seq 继续，绝不重放旧 handback/断开事实。
             cursorStore = SharedPreferencesSessionEventCursorStore(this),
             onError = { code ->
-                // 只把固定机器码写进**诊断**；轮询失败绝不静默、绝不伪造事件，也绝不
-                // 变成某通电话的交还失败（IMPORTANT 3）。
-                AgentCallRuntime.update { it.copy(lastDiagnostic = code) }
+                // 只把固定机器码写进**轮询器自己的诊断槽**；轮询失败绝不静默、绝不伪造
+                // 事件，也绝不变成某通电话的交还失败（IMPORTANT 3）。
+                AgentCallRuntime.update { ServiceDiagnostics.withPollerCode(it, code) }
             },
             onDiagnostic = { code ->
-                AgentCallRuntime.update { it.copy(lastDiagnostic = code) }
+                AgentCallRuntime.update { ServiceDiagnostics.withPollerCode(it, code) }
             },
             onRecovered = {
-                // 恢复（一次没有诊断的成功轮询）后清除诊断残留。
-                AgentCallRuntime.update { if (it.lastDiagnostic == null) it else it.copy(lastDiagnostic = null) }
+                // 恢复（一次没有诊断的成功轮询）只清轮询器自己的槽：仍成立的
+                // bootstrap_failed 不能被顺手抹掉（N4）。
+                AgentCallRuntime.update { ServiceDiagnostics.clearPollerCode(it) }
             },
             onSupervisorHandback = { id, outcome ->
                 // 监督端交还事实绑定会话：由协调器裁决撤销路径与可见结论。
@@ -364,10 +406,9 @@ class AgentCallService : Service() {
                 throw cancelled
             } catch (failure: Throwable) {
                 log("bootstrap_failed " + failure.javaClass.simpleName)
-                // 服务级诊断：绝不写进 lastError（那会被当成某通电话的交还失败）。
-                AgentCallRuntime.update {
-                    it.copy(ready = false, lastDiagnostic = "bootstrap_failed")
-                }
+                // 服务级诊断：绝不写进 lastError（那会被当成某通电话的交还失败），
+                // 也只写 bootstrap 自己的槽（N4）。
+                AgentCallRuntime.update { ServiceDiagnostics.withBootstrapFailure(it) }
                 coordinator?.onEvent(SessionEvent.ReadyChanged(false))
             }
             withTimeoutOrNull(READY_RECHECK_INTERVAL_MS) { bootstrapWakeups.receive() }
@@ -390,6 +431,8 @@ class AgentCallService : Service() {
                 supervisionPhase = decision.supervisionPhase,
             )
         }
+        // 一次成功的判定就是 bootstrap 的恢复：只清它自己的槽。
+        AgentCallRuntime.update { ServiceDiagnostics.clearBootstrapFailure(it) }
         coordinator?.onEvent(SessionEvent.ReadyChanged(decision.ready))
         refreshConfig()
         updateNotification()
@@ -566,11 +609,13 @@ private class BridgeConversation(
 }
 
 /**
- * 事件游标的持久化（Task 7B3 FIX ROUND 1）。
+ * 事件游标的持久化（Task 7B3 FIX ROUND 1，ROUND 2 换成进程 id）。
  *
- * 只保存“最近一次已投递的 seq + 当时桥接的 uptime”，不含号码、会话 token、密钥或事件负载。
- * 服务重启后从它继续：桥接环里的旧 handback/断开事实不会被重新投递一遍。若桥接在此期间
- * 重启（uptime 回退），轮询器仍然会清空基线重新同步。
+ * 只保存“最近一次已投递的 seq + 当时桥接的 processId”，不含号码、会话 token、密钥或事件
+ * 负载。服务重启后从它继续：桥接环里的旧 handback/断开事实不会被重新投递一遍。若桥接在
+ * 此期间重启（processId 变化），轮询器仍然会清空基线重新同步。
+ *
+ * 旧的 `lastUptimeMs` 键不再读写（墙钟差不是可信代次）；残留值只是无用的旧数据。
  */
 private class SharedPreferencesSessionEventCursorStore(context: Context) : SessionEventCursorStore {
 
@@ -584,12 +629,8 @@ private class SharedPreferencesSessionEventCursorStore(context: Context) : Sessi
         if (!prefs.contains(KEY_SEQ)) return null
         val seq = prefs.getLong(KEY_SEQ, -1L)
         if (seq < 0L) return null
-        val uptime = if (prefs.contains(KEY_UPTIME)) {
-            prefs.getLong(KEY_UPTIME, -1L).takeIf { it >= 0L }
-        } else {
-            null
-        }
-        return SessionEventCursor(seq = seq, uptimeMs = uptime).also { lastWritten = it }
+        val processId = prefs.getString(KEY_PROCESS_ID, null)?.takeIf { it.isNotEmpty() }
+        return SessionEventCursor(seq = seq, processId = processId).also { lastWritten = it }
     }
 
     override fun write(cursor: SessionEventCursor) {
@@ -597,15 +638,15 @@ private class SharedPreferencesSessionEventCursorStore(context: Context) : Sessi
         if (lastWritten == cursor) return
         lastWritten = cursor
         val editor = prefs.edit().putLong(KEY_SEQ, cursor.seq)
-        val uptime = cursor.uptimeMs
-        if (uptime == null) editor.remove(KEY_UPTIME) else editor.putLong(KEY_UPTIME, uptime)
+        val processId = cursor.processId
+        if (processId == null) editor.remove(KEY_PROCESS_ID) else editor.putString(KEY_PROCESS_ID, processId)
         editor.apply()
     }
 
     companion object {
         const val PREFS_NAME: String = "agentcall.session_events"
         const val KEY_SEQ: String = "lastSeq"
-        const val KEY_UPTIME: String = "lastUptimeMs"
+        const val KEY_PROCESS_ID: String = "lastProcessId"
     }
 }
 

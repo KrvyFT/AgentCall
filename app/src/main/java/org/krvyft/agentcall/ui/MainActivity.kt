@@ -4,7 +4,9 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.view.ViewGroup
 import android.widget.Button
+import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
@@ -40,6 +42,7 @@ import org.krvyft.agentcall.service.ConnectionTestSupport
 import org.krvyft.agentcall.service.EndpointTestOutcome
 import org.krvyft.agentcall.service.EnvironmentResult
 import org.krvyft.agentcall.service.HookPresence
+import org.krvyft.agentcall.service.ServiceDiagnostics
 import org.krvyft.agentcall.service.StatusText
 import org.krvyft.agentcall.service.hasCompleteVoiceEndpoints
 import org.krvyft.agentcall.service.parseRedactedAgentConfig
@@ -68,6 +71,13 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusSession: TextView
     private lateinit var textBlockers: TextView
     private lateinit var textError: TextView
+
+    /**
+     * 服务诊断（轮询器/就绪循环）的小字展示（N4）。
+     *
+     * 程序化插入到“最近错误”下方，不改布局文件；只显示机器码，绝不粉饰成“正常”。
+     */
+    private lateinit var textDiagnostic: TextView
     private lateinit var buttonNotification: Button
     private lateinit var buttonTakeover: Button
     private lateinit var textConnectionResults: TextView
@@ -120,6 +130,18 @@ class MainActivity : AppCompatActivity() {
         statusSession = findViewById(R.id.status_session)
         textBlockers = findViewById(R.id.text_blockers)
         textError = findViewById(R.id.text_error)
+        textDiagnostic = TextView(this).apply {
+            visibility = TextView.GONE
+            textSize = 12f
+        }
+        (textError.parent as ViewGroup).addView(
+            textDiagnostic,
+            (textError.parent as ViewGroup).indexOfChild(textError) + 1,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ),
+        )
         buttonNotification = findViewById(R.id.button_notification)
         buttonTakeover = findViewById(R.id.button_takeover)
         textConnectionResults = findViewById(R.id.text_connection_results)
@@ -301,6 +323,13 @@ class MainActivity : AppCompatActivity() {
         } else {
             textError.visibility = TextView.VISIBLE
             textError.text = getString(R.string.main_error_prefix, error)
+        }
+        val diagnostic = ServiceDiagnostics.visible(status)
+        if (diagnostic == null) {
+            textDiagnostic.visibility = TextView.GONE
+        } else {
+            textDiagnostic.visibility = TextView.VISIBLE
+            textDiagnostic.text = getString(R.string.main_diagnostic_prefix, diagnostic)
         }
         buttonTakeover.isEnabled = status.activeSession != null
 

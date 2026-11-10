@@ -149,7 +149,7 @@ class SessionEventsRpcTest {
 
         assertNull(fromCli.error)
         assertNull(fromApp.error)
-        // 同一份构建器的直接证据：除实时 uptimeMs 外逐字段相等。
+        // 同一份构建器的直接证据：除实时 uptimeMs 外逐字段相等（进程身份在同一进程里相同）。
         assertSamePayloadExceptUptime(fromCli.payload, fromApp.payload)
 
         // APK 的就绪探针按这些字段名解析（ServiceBootstrap/StatusText）：少一个就永远
@@ -162,6 +162,7 @@ class SessionEventsRpcTest {
             "enabled",
             "paired",
             "uptimeMs",
+            "processId",
             "activeConnections",
             "rejectedConnections",
             "supervisionPhase",
@@ -175,6 +176,40 @@ class SessionEventsRpcTest {
             assertTrue("status 缺少字段 " + key, app.has(key))
         }
         assertEquals(1, app.get("protocolVersion").asInt)
+        assertEquals(16, app.keySet().size)
+    }
+
+    /**
+     * 重启信标必须是**每进程随机 id**，不是墙钟差：墙钟回拨会让 uptimeMs 变负（客户端
+     * 判为状态负载非法 → 停摆）或变小（误判重启 → 重放 handback）。进程 id 在同一进程内
+     * 恒定、与时间无关，桥接重启必然换成新值。
+     */
+    @Test
+    fun theRestartBeaconIsAProcessIdAndNotAWallClockUptime() {
+        fun statusJson(): JsonObject {
+            val response = dispatcher().handle(cliPeer, appRequest(RolePolicy.METHOD_STATUS))
+            assertNull(response.error)
+            return JsonParser.parseString(response.payload).asJsonObject
+        }
+
+        val first = statusJson()
+        val second = statusJson()
+        val element = first.get("processId")
+        assertTrue(
+            "processId 必须是非空 JSON 字符串，实际为 " + element,
+            element != null && element.isJsonPrimitive && element.asJsonPrimitive.isString,
+        )
+        val id = element.asString
+        assertTrue("processId 不得为空", id.isNotEmpty())
+        assertTrue(
+            "processId 不能是墙钟差（数字），实际为 " + id,
+            !Regex("-?[0-9]+").matches(id),
+        )
+        assertEquals(
+            "同一桥接进程内 processId 必须恒定（与时间/uptime 无关）",
+            id,
+            second.get("processId").asString,
+        )
     }
 
     @Test
