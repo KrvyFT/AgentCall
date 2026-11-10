@@ -53,6 +53,7 @@ import org.krvyft.agentcall.core.model.EndpointKind
 import org.krvyft.agentcall.core.model.EnvironmentKey
 import org.krvyft.agentcall.core.model.PROTOCOL_VERSION
 import org.krvyft.agentcall.core.model.PeerIdentity
+import org.krvyft.agentcall.core.model.PeerRole
 import org.krvyft.agentcall.core.model.RpcError
 import org.krvyft.agentcall.core.model.RpcRequest
 import org.krvyft.agentcall.core.model.RpcResponse
@@ -172,6 +173,9 @@ internal object BridgeRuntime {
             shutdown = shutdown,
             supervision = supervisionRpc,
             hookCommands = hookCommands,
+            // 与监督端共享同一份收件箱：APP 的 session.command 只能等这条结果通路，
+            // 不存在第二条并行结果路径（C1 唯一装配点）。
+            hookInbox = inbox,
             connectionStats = {
                 val current = server
                 if (current == null) 0 to 0L else current.activeConnectionCount to current.rejectedConnectionCount
@@ -319,7 +323,8 @@ internal fun resolveConfigRoot(args: Array<String>): File {
  *
  * 监督接入（C1）：
  * - 任何已鉴权的 APP/HOOK 请求都按其 sessionId 记心跳（按会话归属，I1）；
- * - session.request → 监督端准备接听；handover → 人工交还；
+ * - session.request → 监督端准备接听；session.heartbeat → 只记录 APP 存在性；
+ *   session.command → 受限命令排入 HOOK 路由并在 4000 ms 内等真实结果；handover → 人工交还；
  * - hook.snapshot → 更新真实通话状态并推动 ACTIVE/断开/交还；
  * - call.command.result → 同时喂给监督端的命令结果收件箱。
  */
@@ -332,6 +337,14 @@ internal class ControlDispatcher(
     private val startedAtMs: Long = System.currentTimeMillis(),
     private val connectionStats: () -> Pair<Int, Long> = { 0 to 0L },
     private val hookCommands: HookCommandRouter = HookCommandRouter(),
+    /**
+     * 监督端与 HOOK 结果共用的收件箱。
+     *
+     * 生产装配**必须**注入 [BridgeRuntime.buildSupervision] 使用的同一实例，绝不能新建
+     * 第二个收件箱（否则 APP 的 session.command 会等待一条永远不会有结果的并行队列）。
+     * 默认值只服务于不经过 APP 命令路径的构造点（诊断/测试）；唯一生产装配点已显式注入。
+     */
+    private val hookInbox: HookCallInbox = HookCallInbox(),
     /** 默认拨号器探测：默认 fail closed 为未知，生产装配注入 Android 实现。 */
     private val dialerDefaultRole: () -> DialerDefaultRole = { DialerDefaultRole.UNKNOWN },
 ) : RpcHandler {
@@ -363,6 +376,8 @@ internal class ControlDispatcher(
                 ok(request, "{\"stopping\":true}")
             }
             RolePolicy.METHOD_SESSION_REQUEST -> sessionRequest(request)
+            RolePolicy.METHOD_SESSION_HEARTBEAT -> sessionHeartbeat(request)
+            RolePolicy.METHOD_SESSION_COMMAND -> sessionCommand(request)
             RolePolicy.METHOD_HANDOVER -> handover(request)
             RolePolicy.METHOD_HOOK_SNAPSHOT,
             RolePolicy.METHOD_HOOK_HEARTBEAT,
@@ -391,6 +406,63 @@ internal class ControlDispatcher(
             return failure(request, "payload_invalid", "session.request payload is too large")
         }
         val result = runBlocking { supervision.prepareAnswer(session) }
+        return ok(request, encodeCommandResult(result))
+    }
+
+    /**
+     * session.heartbeat：APP 仍在看着这通电话的存在性信号（只到监督端，不看通话状态）。
+     *
+     * 绝不触发 prepareAnswer、不改监督阶段、不排任何命令：显式按 [PeerRole.APP] 记录
+     * presence，是“谁活着”的证据，不是“该接听”的指令。会话 ID 不合法时直接拒绝。
+     */
+    private fun sessionHeartbeat(request: RpcRequest): RpcResponse {
+        val session = request.sessionId
+            ?: return failure(request, ERROR_SESSION_REQUIRED, "session.heartbeat must carry a session id")
+        if (!HookCommandRouter.isWireSafeSession(session)) {
+            return failure(request, ERROR_SESSION_REQUIRED, "session id is invalid")
+        }
+        supervision.heartbeat(session, PeerRole.APP)
+        val json = JsonObject()
+        json.addProperty("acknowledged", true)
+        return ok(request, json.toString())
+    }
+
+    /**
+     * session.command：APP 请求一条受限通话命令（answer/hangup）。
+     *
+     * 命令进入生产 [HookCommandRouter]（与监督端同一个实例），随 HOOK 下一次
+     * hook.snapshot/hook.heartbeat 的响应下发；本方法在 [APP_COMMAND_TIMEOUT_MS] 内等待
+     * 同一份 [HookCallInbox] 里的真实 [CommandResult]。排队失败与超时都 fail closed，
+     * 绝不编造 Accepted、也绝不由 bridge 自己操作 Telecom。
+     */
+    private fun sessionCommand(request: RpcRequest): RpcResponse {
+        val session = request.sessionId
+            ?: return failure(request, ERROR_SESSION_REQUIRED, "session.command must carry a session id")
+        if (!HookCommandRouter.isWireSafeSession(session)) {
+            return failure(request, ERROR_SESSION_REQUIRED, "session id is invalid")
+        }
+        val command = when (val decoded = decodeAppCommand(request.payload)) {
+            is AppCommandDecode.Supported -> decoded.command
+            AppCommandDecode.Unsupported -> return failure(
+                request,
+                ERROR_UNSUPPORTED_COMMAND,
+                "command is not in the restricted command set",
+            )
+            AppCommandDecode.Invalid -> return failure(
+                request,
+                ERROR_PAYLOAD_INVALID,
+                "session.command payload must be {\"command\":\"answer\"|\"hangup\"}",
+            )
+        }
+        if (!hookCommands.enqueueCommand(session, command)) {
+            return failure(request, ERROR_COMMAND_NOT_QUEUED, "hook command queue rejected the command")
+        }
+        val result = runBlocking { hookInbox.awaitResult(session, command, APP_COMMAND_TIMEOUT_MS) }
+            ?: return failure(
+                request,
+                ERROR_COMMAND_TIMEOUT,
+                "no hook command result within " + APP_COMMAND_TIMEOUT_MS + " ms",
+            )
         return ok(request, encodeCommandResult(result))
     }
 
@@ -600,6 +672,29 @@ internal class ControlDispatcher(
         return name
     }
 
+    /**
+     * 解析 APP 命令负载：**只**接受单键对象 {"command":"answer"|"hangup"}。
+     *
+     * 结构不合法（非 JSON、非对象、多键/少键、非字符串）整体拒绝且不入队；结构合法但
+     * 动词不在受限表里返回 unsupported_command，同样不入队。没有默认值、没有大小写
+     * 兼容、没有别名：线格式越窄，越不可能把未知动作误当成 Answer/Hangup。
+     */
+    private fun decodeAppCommand(payload: String): AppCommandDecode {
+        if (payload.isEmpty() || payload.length > MAX_APP_COMMAND_CHARS) return AppCommandDecode.Invalid
+        val parsed = runCatching { JsonParser.parseString(payload) }.getOrNull()
+            ?: return AppCommandDecode.Invalid
+        if (!parsed.isJsonObject) return AppCommandDecode.Invalid
+        val json = parsed.asJsonObject
+        if (json.keySet() != APP_COMMAND_KEYS) return AppCommandDecode.Invalid
+        val element = json.get("command") ?: return AppCommandDecode.Invalid
+        if (!element.isJsonPrimitive || !element.asJsonPrimitive.isString) return AppCommandDecode.Invalid
+        return when (element.asString) {
+            "answer" -> AppCommandDecode.Supported(CallCommand.Answer)
+            "hangup" -> AppCommandDecode.Supported(CallCommand.Hangup)
+            else -> AppCommandDecode.Unsupported
+        }
+    }
+
     private fun ok(request: RpcRequest, payload: String): RpcResponse =
         RpcResponse(id = request.id, payload = payload)
 
@@ -609,10 +704,47 @@ internal class ControlDispatcher(
             error = RpcError(code, message.take(ControlServer.MAX_ERROR_MESSAGE_CHARS)),
         )
 
+    /** session.command 负载的解析结果：合法受限命令、结构合法但不受支持、结构非法。 */
+    private sealed interface AppCommandDecode {
+        data class Supported(val command: CallCommand) : AppCommandDecode
+
+        data object Unsupported : AppCommandDecode
+
+        data object Invalid : AppCommandDecode
+    }
+
     private companion object {
         val PACKAGE_PATTERN = Regex("[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)+")
         const val MAX_SESSION_REQUEST_CHARS: Int = 1024
         const val MAX_ERROR_TEXT_CHARS: Int = 200
+        const val MAX_APP_COMMAND_CHARS: Int = 128
+
+        /** APP session.command 的唯一线格式字段表：多一个键就是 payload_invalid。 */
+        val APP_COMMAND_KEYS = setOf("command")
+
+        /** APP 未携带会话 ID 或会话 ID 不是可上线 token 时的机器可读错误。 */
+        const val ERROR_SESSION_REQUIRED: String = "session_required"
+
+        /** 负载不是固定字段表/受限命令时的机器可读错误（与既有 RPC 错误码同名）。 */
+        const val ERROR_PAYLOAD_INVALID: String = "payload_invalid"
+
+        /** 命令结构合法，但不在 APP 允许的受限命令表里。 */
+        const val ERROR_UNSUPPORTED_COMMAND: String = "unsupported_command"
+
+        /** 命令没能进入 HOOK 队列（会话非法或队列饱和）：有界失败，绝不假装已下发。 */
+        const val ERROR_COMMAND_NOT_QUEUED: String = "command_not_queued"
+
+        /** 4000 ms 内没有 HOOK 回报结果：结果不明确，fail closed。 */
+        const val ERROR_COMMAND_TIMEOUT: String = "command_timeout"
+
+        /**
+         * APP 等待 HOOK 命令结果的硬上限，与监督端的
+         * [HookCommandCallControl.DEFAULT_TIMEOUT_MS] 同源（4000 ms）。
+         *
+         * Hook 只在它的下一次心跳响应里取走命令，心跳周期 2000 ms；4000 ms 既覆盖
+         * 最坏取命令延迟，又不超过 10000 ms 人工接管窗口的一半。
+         */
+        const val APP_COMMAND_TIMEOUT_MS: Long = HookCommandCallControl.DEFAULT_TIMEOUT_MS
 
         /** 无法在特权进程可靠确定时的显式未知值（不是布尔 false）。 */
         const val UNKNOWN_STATUS_VALUE: String = "unknown"
