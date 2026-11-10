@@ -76,6 +76,7 @@ class HookTransport(
     private val running = AtomicBoolean(false)
     private val started = AtomicBoolean(false)
     private val droppedSnapshots = AtomicLong(0)
+    private val droppedCommandResults = AtomicLong(0)
     private val transportFailures = AtomicLong(0)
     private val protocolViolations = AtomicLong(0)
     private val untrustedServers = AtomicLong(0)
@@ -85,8 +86,16 @@ class HookTransport(
     @Volatile
     private var worker: Thread? = null
 
-    /** 因队列饱和被丢弃的快照/结果数（有界失败，不阻塞调用方）。 */
+    /** 因传输线程未启动或队列饱和被丢弃的**快照**数（有界失败，不阻塞调用方）。 */
     val droppedSnapshotCount: Long get() = droppedSnapshots.get()
+
+    /**
+     * 因传输线程未启动或队列饱和被丢弃的**命令结果**数（M5）。
+     *
+     * 与快照分开计数：命令结果丢失会让 CallControl.send 拿不到真实裁决，混进快照计数
+     * 会掩盖这个更严重的故障。
+     */
+    val droppedCommandResultCount: Long get() = droppedCommandResults.get()
 
     /** 连接/读写失败次数。 */
     val transportFailureCount: Long get() = transportFailures.get()
@@ -128,7 +137,11 @@ class HookTransport(
         source: ActionSource = ActionSource.UNKNOWN,
         handbackReason: String? = null,
     ) {
-        if (!running.get()) return
+        if (!running.get()) {
+            // M5：启动前/停止后的入队不是“成功”，必须计入丢弃，否则诊断看起来是零丢失。
+            droppedSnapshots.incrementAndGet()
+            return
+        }
         if (!queue.offer(Outbound.Snapshot(snapshot, source, handbackReason))) {
             droppedSnapshots.incrementAndGet()
         }
@@ -136,9 +149,13 @@ class HookTransport(
 
     /** 命令结果转发入口：同样只做非阻塞 offer。 */
     fun enqueueCommandResult(attempt: CommandAttempt) {
-        if (!running.get()) return
+        if (!running.get()) {
+            droppedCommandResults.incrementAndGet()
+            return
+        }
         if (!queue.offer(Outbound.CommandResult(attempt))) {
-            droppedSnapshots.incrementAndGet()
+            // M5：命令结果溢出绝不能记进快照计数。
+            droppedCommandResults.incrementAndGet()
         }
     }
 
@@ -147,6 +164,11 @@ class HookTransport(
     private fun loop() {
         val nextHeartbeat = HashMap<String, Long>()
         while (running.get()) {
+            // 心跳先于出站队列：桥接卡住时一次 snapshot 请求最长会占用 REQUEST_TIMEOUT_MS，
+            // 若把心跳排在它后面，连续卡顿会把“下一次心跳”推过 5000 ms 失联窗口。
+            // 到期时间按发送**开始**时刻计算，请求耗时不会把节奏往后顺延（M5）。
+            sendDueHeartbeats(nextHeartbeat)
+
             val outbound = try {
                 queue.poll(POLL_INTERVAL_MS, TimeUnit.MILLISECONDS)
             } catch (interrupted: InterruptedException) {
@@ -158,26 +180,30 @@ class HookTransport(
                 is Outbound.CommandResult -> sendCommandResult(outbound.attempt)
                 null -> Unit
             }
-
-            val now = clock()
-            val sessions = try {
-                liveSessions()
-            } catch (failure: Throwable) {
-                emptyList()
-            }
-            val liveCallIds = HashSet<String>()
-            for (session in sessions) {
-                // 只对本次进程代次的会话发心跳；旧代次绝不复活。
-                if (session.processEpoch != processEpoch) continue
-                liveCallIds += session.callId
-                val due = nextHeartbeat[session.callId]
-                if (due == null || now >= due) {
-                    sendHeartbeat(session)
-                    nextHeartbeat[session.callId] = now + heartbeatIntervalMs * NANOS_PER_MILLI
-                }
-            }
-            nextHeartbeat.keys.retainAll(liveCallIds)
         }
+    }
+
+    /** 对每个仍存活的本次进程代次会话发送到期心跳；到期时间以发送开始时刻为准。 */
+    private fun sendDueHeartbeats(nextHeartbeat: HashMap<String, Long>) {
+        val startedAt = clock()
+        val sessions = try {
+            liveSessions()
+        } catch (failure: Throwable) {
+            emptyList()
+        }
+        val liveCallIds = HashSet<String>()
+        for (session in sessions) {
+            // 只对本次进程代次的会话发心跳；旧代次绝不复活。
+            if (session.processEpoch != processEpoch) continue
+            liveCallIds += session.callId
+            val due = nextHeartbeat[session.callId]
+            if (due == null || startedAt >= due) {
+                // 先记下一次到期再发：本次请求即使阻塞满超时，下一轮也会立即补发而不是再等一轮。
+                nextHeartbeat[session.callId] = startedAt + heartbeatIntervalMs * NANOS_PER_MILLI
+                sendHeartbeat(session)
+            }
+        }
+        nextHeartbeat.keys.retainAll(liveCallIds)
     }
 
     private fun sendSnapshot(outbound: Outbound.Snapshot) {
