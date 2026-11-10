@@ -18,7 +18,7 @@ substitute for the SDK, and the report still prints the signing warning).
 import argparse
 import hashlib
 import re
-import subprocess
+import stat
 import sys
 import tempfile
 import zipfile
@@ -47,28 +47,13 @@ def sha256_file(path):
 
 
 def probe_signing(apk_path, build_tools=None):
-    """Return an honest description of the APK signer."""
+    """Return an honest description of the APK signer (certificate-derived)."""
     try:
         tools = Path(build_tools) if build_tools else package.find_build_tools()
     except package.PackagingError:
         return SIGNING_UNVERIFIED
-    apksigner = tools / "apksigner"
-    try:
-        completed = subprocess.run(
-            [str(apksigner), "verify", "--print-certs", str(apk_path)],
-            capture_output=True, text=True, check=False)
-    except OSError:
-        return SIGNING_UNVERIFIED
-    if completed.returncode != 0:
-        return "unsigned (apksigner verify failed)"
-    match = re.search(r"Signer #1 certificate DN: (.+)", completed.stdout)
-    subject = match.group(1).strip() if match else "unknown"
-    if "CN=Android Debug" in subject:
-        return "debug keystore (CN=Android Debug) - local debug key"
-    # A non-debug certificate is not automatically a release key; only the
-    # operator knows which key is theirs.  --expected-signer turns this into a
-    # hard check instead of a guess.
-    return "custom signer (" + subject + ") - verify it is your release key"
+    label = package.describe_apk_signer(apk_path, tools)
+    return SIGNING_UNVERIFIED if label is None else label
 
 
 def signing_problem(signing, expected_signer=None):
@@ -193,11 +178,22 @@ def inspect_package(zip_path, apk_path, sha_sums_path="auto",
                         "packaged APK name " + apk_path.name + " does not match " + expected_apk)
 
         for info in archive.infolist():
-            if info.filename in package.EXECUTABLE_MODULE_FILES:
-                mode = (info.external_attr >> 16) & 0o777
-                if not mode & 0o111:
-                    problems.append(
-                        info.filename + " is not executable in the ZIP (mode " + format(mode, "o") + ")")
+            name = info.filename
+            file_type = info.external_attr >> 16
+            mode = file_type & 0o777
+            if not stat.S_ISREG(file_type):
+                problems.append(
+                    name + " is not a regular file in the ZIP (file type mode "
+                    + format(file_type, "o") + ")")
+                continue
+            expected_mode = package.entry_mode(name)
+            if mode != expected_mode:
+                problems.append(
+                    name + " has mode " + format(mode, "o") + " but must be exactly "
+                    + format(expected_mode, "o") + " in the ZIP")
+            if name not in package.ALLOWED_PACKAGE_ENTRIES:
+                problems.append(
+                    "unexpected entry " + name + " is not part of the release package")
 
         for name in names:
             suffix = Path(name).suffix.lower()

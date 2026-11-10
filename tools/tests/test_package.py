@@ -18,6 +18,7 @@ import json
 import io
 import os
 import shutil
+import stat
 import struct
 import sys
 import tempfile
@@ -25,6 +26,7 @@ import unittest
 import zipfile
 import zlib
 from pathlib import Path
+from unittest import mock
 
 TOOLS_DIR = Path(__file__).resolve().parents[1]
 if str(TOOLS_DIR) not in sys.path:
@@ -284,6 +286,7 @@ class PackagingFixture(unittest.TestCase):
             dist_dir=self.dist,
             signer=self.signer,
             version_reader=lambda path: self.version,
+            package_reader=lambda path: APPLICATION_ID,
         )
         kwargs.update(overrides)
         return package.package_artifact(**kwargs)
@@ -546,6 +549,62 @@ class PackagingTests(PackagingFixture):
         write_container_with_manifest(self.jar, self.manifest, {"classes.dex": classes})
         self.assert_packaging_fails("kotlin/Unit")
 
+    def test_packaging_enforces_the_expected_application_id(self):
+        # EXPECTED_APPLICATION_ID used to be enforced only by the checker; a
+        # package with the wrong appId could be produced and silently shipped.
+        self.assert_packaging_fails(
+            "applicationId", package_reader=lambda path: "com.example.other")
+
+    def test_packaging_requires_exactly_one_bridge_apk(self):
+        # The cross-attestation must never be silently skipped: 0 or >1 APKs is a
+        # hard failure, so package-check can never pass a container without it.
+        empty = self.tmp / "bridge-apks-empty"
+        empty.mkdir()
+        with mock.patch.object(package, "DEFAULT_BRIDGE_APK_DIR", empty):
+            self.assert_packaging_fails("bridge release APK", bridge_apk=None)
+
+        many = self.tmp / "bridge-apks-many"
+        many.mkdir()
+        write_bridge_apk(many / "a.apk", {"classes.dex": all_classes()})
+        write_bridge_apk(many / "b.apk", {"classes.dex": all_classes()})
+        with mock.patch.object(package, "DEFAULT_BRIDGE_APK_DIR", many):
+            self.assert_packaging_fails("bridge release APK", bridge_apk=None)
+
+    def test_signing_label_is_derived_from_the_certificate_not_the_keystore_name(self):
+        tools = self.tmp / "build-tools"
+        tools.mkdir()
+        zipalign = tools / "zipalign"
+        zipalign.write_text('#!/bin/sh\ncp "$4" "$5"\n', encoding="utf-8")
+        zipalign.chmod(0o755)
+        apksigner = tools / "apksigner"
+        apksigner.write_text(
+            "#!/bin/sh\n"
+            'case "$*" in\n'
+            "  *--print-certs*) printf 'Signer #1 certificate DN: CN=Android Debug,O=Android,C=US\\n'; exit 0 ;;\n"
+            "esac\n"
+            'out=""\n'
+            'previous=""\n'
+            'last=""\n'
+            'for argument in "$@"; do\n'
+            '  if [ "$previous" = "--out" ]; then out="$argument"; fi\n'
+            '  previous="$argument"\n'
+            '  last="$argument"\n'
+            "done\n"
+            '[ -n "$out" ] || exit 1\n'
+            'cp "$last" "$out"\n',
+            encoding="utf-8")
+        apksigner.chmod(0o755)
+        keystore = self.tmp / "release.keystore"
+        keystore.write_bytes(b"not a real keystore")
+        unsigned = self.tmp / "unsigned.apk"
+        unsigned.write_bytes(b"unsigned apk fixture")
+        signed = self.tmp / "signed.apk"
+
+        label = package.sign_apk(unsigned, signed, keystore=keystore, build_tools=tools)
+
+        self.assertIn("CN=Android Debug", label, "签名标签必须来自证书")
+        self.assertNotIn("release.keystore", label, "不得再从 keystore 文件名推断签名类型")
+
     def test_unsigned_apk_is_reported_by_checker(self):
         self.package()
         inspection = self.inspect(signing_probe=lambda path: "unsigned")
@@ -692,6 +751,49 @@ class CheckPackageTests(PackagingFixture):
         self.package()
         inspection = self.inspect()
         self.assertTrue(inspection.ok, inspection.problems)
+
+
+    def _rebuild_with_modes(self, modes=None, add=None):
+        source = self.dist / "agentcall-1.0.zip"
+        target = self.tmp / "modes.zip"
+        with zipfile.ZipFile(source) as src, zipfile.ZipFile(
+                target, "w", zipfile.ZIP_DEFLATED) as out:
+            for info in src.infolist():
+                data = src.read(info.filename)
+                if info.filename in (modes or {}):
+                    info.external_attr = (
+                        stat.S_IFREG | (modes or {})[info.filename]) << 16
+                out.writestr(info, data)
+            for name, mode, data in add or ():
+                info = zipfile.ZipInfo(name)
+                info.external_attr = (stat.S_IFREG | mode) << 16
+                out.writestr(info, data)
+        return target
+
+    def test_script_mode_must_be_exactly_0755(self):
+        self.package()
+        rebuilt = self._rebuild_with_modes({"customize.sh": 0o777})
+        inspection = self.inspect_rebuilt(rebuilt, sha_sums_path=None)
+        self.assertFalse(inspection.ok)
+        self.assertTrue(any("customize.sh" in problem and "777" in problem
+                            for problem in inspection.problems))
+
+    def test_data_mode_must_be_exactly_0644(self):
+        self.package()
+        rebuilt = self._rebuild_with_modes({"module.prop": 0o666})
+        inspection = self.inspect_rebuilt(rebuilt, sha_sums_path=None)
+        self.assertFalse(inspection.ok)
+        self.assertTrue(any("module.prop" in problem and "666" in problem
+                            for problem in inspection.problems))
+
+    def test_unexpected_entry_is_rejected(self):
+        self.package()
+        rebuilt = self._rebuild_with_modes(
+            add=(("webroot/extra-fixture.txt", 0o644, b"extra"),))
+        inspection = self.inspect_rebuilt(rebuilt, sha_sums_path=None)
+        self.assertFalse(inspection.ok)
+        self.assertTrue(any("unexpected entry" in problem
+                            for problem in inspection.problems))
 
 
 class CheckPackageCliTests(PackagingFixture):

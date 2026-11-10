@@ -79,6 +79,12 @@ REQUIRED_MODULE_FILES = (
 EXECUTABLE_MODULE_FILES = frozenset(
     ("customize.sh", "service.sh", "uninstall.sh", "bin/agentcallctl")
 )
+# The release ZIP has a fixed entry set: the module files above plus the runtime
+# container and its dex manifest.  Anything else is an unexpected entry that the
+# checker must reject rather than let it ride along unexamined.
+ALLOWED_PACKAGE_ENTRIES = frozenset(REQUIRED_MODULE_FILES) | frozenset(
+    ("bridge/agentcall-bridge.jar", "bridge/agentcall-bridge.dex-manifest.json")
+)
 FORBIDDEN_KEY_SUFFIXES = frozenset((".keystore", ".jks", ".p12", ".pepk"))
 EXCLUDED_SUFFIXES = frozenset((".pyc", ".pyo"))
 EXCLUDED_DIRS = ("webroot/tests", "__pycache__")
@@ -737,6 +743,39 @@ def read_apk_package_name(apk_path, build_tools=None):
     return read_apk_badging(apk_path, build_tools=build_tools)["package"]
 
 
+def entry_mode(relative):
+    """Intended ZIP mode: module scripts/wrapper 0755, every data file 0644."""
+    return 0o755 if relative in EXECUTABLE_MODULE_FILES else 0o644
+
+
+def describe_apk_signer(apk_path, build_tools=None):
+    """Describe an APK signer from its certificate, or None without apksigner.
+
+    The label must never be inferred from the keystore file name: the operator can
+    rename a release key to debug.keystore (or vice versa), and the certificate is
+    the only fact the artifact actually carries.  None means signature
+    verification is unavailable on this machine, not that the APK is signed.
+    """
+    apk_path = Path(apk_path)
+    try:
+        tools = Path(build_tools) if build_tools else find_build_tools()
+    except PackagingError:
+        return None
+    try:
+        completed = subprocess.run(
+            [str(tools / "apksigner"), "verify", "--print-certs", str(apk_path)],
+            capture_output=True, text=True, check=False)
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return "unsigned (apksigner verify failed)"
+    match = re.search(r"Signer #1 certificate DN: (.+)", completed.stdout)
+    subject = match.group(1).strip() if match else "unknown"
+    if "CN=Android Debug" in subject:
+        return "debug keystore (CN=Android Debug) - local debug key"
+    return "custom signer (" + subject + ") - verify it is your release key"
+
+
 def sign_apk(apk_path, out_path, keystore=None, alias=None, build_tools=None):
     """Sign with the local debug keystore and report the signing type."""
     apk_path = Path(apk_path)
@@ -773,9 +812,11 @@ def sign_apk(apk_path, out_path, keystore=None, alias=None, build_tools=None):
             raise PackagingError("apksigner failed: " + signed.stderr.strip())
     Path(str(out_path) + ".idsig").unlink(missing_ok=True)
     out_path.chmod(0o644)
-    if keystore_path.name == "debug.keystore":
-        return "debug keystore (CN=Android Debug) - local debug key"
-    return "local keystore " + keystore_path.name + " - verify it is your release key"
+    label = describe_apk_signer(out_path, tools)
+    if label is None or label.startswith("unsigned"):
+        raise PackagingError(
+            "signed APK could not be verified with apksigner: " + str(label))
+    return label
 
 
 # ---------------------------------------------------------------------------
@@ -807,10 +848,6 @@ def _write_zip(entries, out_path):
         raise
 
 
-def _entry_mode(relative):
-    return 0o755 if relative in EXECUTABLE_MODULE_FILES else 0o644
-
-
 def _sha256(path):
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -840,13 +877,19 @@ def package_artifact(
         dist_dir=None,
         keystore=None,
         signer=None,
-        version_reader=None):
+        version_reader=None,
+        package_reader=None):
     """Assemble the signed APK, the deterministic module ZIP and SHA256SUMS.
 
     bridge_apk: the bridge release APK the container manifest must describe.
     None (default) auto-detects the single APK under
-    bridge/build/outputs/apk/release; when none is found the cross-check is
-    skipped (the manifest/container comparison above still applies).
+    bridge/build/outputs/apk/release.  Exactly one APK must be found: skipping
+    the cross-attestation would let a container pass packaging without the
+    manifest ever being compared against the APK it claims to describe.
+
+    package_reader: applicationId reader (default: SDK aapt2), injectable for
+    hermetic tests.  The packaged APK must carry EXPECTED_APPLICATION_ID; this
+    used to be enforced only by the checker.
     """
     module_dir = Path(module_dir) if module_dir else DEFAULT_MODULE_DIR
     apk_path = Path(apk_path) if apk_path else DEFAULT_APK
@@ -855,6 +898,7 @@ def package_artifact(
         Path(bridge_manifest) if bridge_manifest else DEFAULT_BRIDGE_MANIFEST)
     dist_dir = Path(dist_dir) if dist_dir else DEFAULT_DIST_DIR
     reader = version_reader if version_reader else read_apk_version
+    identity_reader = package_reader if package_reader else read_apk_package_name
 
     if not apk_path.is_file():
         raise PackagingError("release APK is missing: " + str(apk_path))
@@ -866,6 +910,12 @@ def package_artifact(
             + " (run :bridge:packageRuntime)")
     if bridge_apk is None:
         bridge_apk = detect_bridge_apk()
+        if bridge_apk is None:
+            raise PackagingError(
+                "cannot attest the bridge runtime container: expected exactly one bridge "
+                "release APK under " + str(DEFAULT_BRIDGE_APK_DIR)
+                + " (found 0 or more than 1); build :bridge:assembleRelease or pass "
+                "bridge_apk explicitly")
     else:
         bridge_apk = Path(bridge_apk)
         if not bridge_apk.is_file():
@@ -873,6 +923,11 @@ def package_artifact(
 
     module_files = collect_module_files(module_dir)
     version = reader(apk_path)
+    application_id = identity_reader(apk_path)
+    if application_id != EXPECTED_APPLICATION_ID:
+        raise PackagingError(
+            "packaged APK applicationId " + repr(application_id) + " is not "
+            + EXPECTED_APPLICATION_ID)
     if not version.name or any(character in version.name for character in "/\\:"):
         raise PackagingError("app versionName cannot be used in an artifact file name: " + repr(version.name))
     prop_text = (Path(module_dir) / "module.prop").read_text(encoding="utf-8")
@@ -902,7 +957,7 @@ def package_artifact(
     entries = []
     for relative, path in module_files.items():
         data = rendered_prop.encode("utf-8") if relative == "module.prop" else path.read_bytes()
-        entries.append((relative, data, _entry_mode(relative)))
+        entries.append((relative, data, entry_mode(relative)))
     entries.append(("bridge/agentcall-bridge.jar", jar_bytes, 0o644))
     entries.append((DEX_MANIFEST_ENTRY, manifest_bytes, 0o644))
 
