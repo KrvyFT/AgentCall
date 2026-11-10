@@ -318,6 +318,61 @@ class FrameworkAudioBridgeTest {
     }
 
     @Test
+    fun unsupportedInternalFormatIsRejectedBeforeOpeningAnything() = runBlocking {
+        val uplink = FakeUplink()
+        val framework = framework(uplink = uplink)
+        val bridge = FrameworkAudioBridge(framework)
+
+        try {
+            bridge.open(session, AudioFormatSpec(sampleRate = 4_000))
+            fail("sample rates outside the declared PCM16 range must be rejected")
+        } catch (expected: AudioUnavailableException) {
+            assertEquals("audio_format_invalid", expected.code)
+            assertEquals(AudioFailureCode.UNSUPPORTED, expected.failure)
+        }
+        assertEquals(0, framework.downlinkOpenCalls)
+        assertEquals(0, framework.uplinkOpenCalls)
+        assertTrue(uplink.written.isEmpty())
+    }
+
+    @Test
+    fun unusableDeviceStreamFormatIsRejectedAndHandlesAreClosed() = runBlocking {
+        val downlink = FakeDownlink(sampleRate = 0, channels = 1)
+        val uplink = FakeUplink()
+        val bridge = FrameworkAudioBridge(framework(downlink = downlink, uplink = uplink))
+
+        try {
+            bridge.open(session, format)
+            fail("a 0 Hz device stream must be rejected")
+        } catch (expected: AudioUnavailableException) {
+            assertEquals("audio_device_format_invalid", expected.code)
+            assertEquals(AudioFailureCode.UNSUPPORTED, expected.failure)
+        }
+        assertTrue(downlink.closed)
+        assertTrue(uplink.closed)
+    }
+
+    @Test
+    fun stereoInjectionTrackReceivesDuplicatedMonoSamples() = runBlocking {
+        val downlink = FakeDownlink(sampleRate = 16_000, channels = 1)
+        val uplink = FakeUplink(sampleRate = 16_000, channels = 2)
+        val bridge = FrameworkAudioBridge(framework(downlink = downlink, uplink = uplink))
+        val audio = bridge.open(session, format)
+
+        val mono = samplesOf(1, 2, 3)
+        val bytes = ByteArray(mono.size * 2)
+        for (index in mono.indices) {
+            bytes[2 * index] = (mono[index].toInt() and 0xFF).toByte()
+            bytes[2 * index + 1] = ((mono[index].toInt() shr 8) and 0xFF).toByte()
+        }
+        audio.writeUplink(PcmAudio(bytes, format))
+
+        // 内部单声道样本必须按帧复制到立体声注入轨，而不是被当成交错帧。
+        assertArrayEquals(shortArrayOf(1, 1, 2, 2, 3, 3), uplink.written.toShortArray())
+        audio.stop()
+    }
+
+    @Test
     fun stopIsIdempotentAndNeverRestoresMicrophone() = runBlocking {
         val downlink = FakeDownlink()
         val uplink = FakeUplink()

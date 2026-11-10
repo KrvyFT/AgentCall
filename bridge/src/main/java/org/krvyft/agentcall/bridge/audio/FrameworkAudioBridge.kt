@@ -333,6 +333,25 @@ class FrameworkAudioBridge(
             )
         }
 
+        // 设备流也可能给出不可用的采样率/声道。必须在构造重采样器/读取循环之前
+        // 明确拒绝并释放句柄，不能让 0 Hz 或 0 声道落到 Resampler/除法里。
+        val invalidDeviceFormat = "device stream format invalid: downlink=" +
+            downlink.sampleRate + "Hz/" + downlink.channels + "ch, uplink=" +
+            uplink.sampleRate + "Hz/" + uplink.channels + "ch"
+        val deviceFormatUsable = downlink.sampleRate in Resampler.MIN_RATE..Resampler.MAX_RATE &&
+            downlink.channels > 0 &&
+            uplink.sampleRate in Resampler.MIN_RATE..Resampler.MAX_RATE &&
+            uplink.channels > 0
+        if (!deviceFormatUsable) {
+            runCatching { downlink.close() }
+            runCatching { uplink.close() }
+            throw AudioUnavailableException(
+                code = "audio_device_format_invalid",
+                failure = AudioFailureCode.UNSUPPORTED,
+                message = invalidDeviceFormat,
+            )
+        }
+
         return FrameworkAudioSession(id, format, downlink, uplink, dispatcher)
     }
 
@@ -365,13 +384,14 @@ private class FrameworkAudioSession(
     private val scope = CoroutineScope(SupervisorJob() + dispatcher)
     private val downlinkResampler = Resampler(downlinkHandle.sampleRate, outputFormat.sampleRate)
     private val uplinkResampler = Resampler(outputFormat.sampleRate, uplinkHandle.sampleRate)
+    private val uplinkChannels: Int = uplinkHandle.channels
     private val uplinkLock = Mutex()
     private val readJob: Job = scope.launch { readDownlink() }
 
     override val downlink: Flow<PcmChunk> = chunks.receiveAsFlow()
 
     private suspend fun readDownlink() {
-        val channels = downlinkHandle.channels.coerceAtLeast(1)
+        val channels = downlinkHandle.channels
         val buffer = ShortArray(READ_FRAMES * channels)
         try {
             while (currentCoroutineContext().isActive && !stopped.get()) {
@@ -434,27 +454,51 @@ private class FrameworkAudioSession(
             }
             val samples = pcm16Samples(audio.data)
             val deviceSamples = uplinkResampler.resampleSamples(samples)
-            var offset = 0
             withContext(dispatcher) {
-                while (offset < deviceSamples.size) {
-                    if (stopped.get()) {
-                        throw AudioUnavailableException(
-                            "audio_stopped",
-                            AudioFailureCode.STOPPED,
-                            "audio session is stopped",
-                        )
-                    }
-                    val written = uplinkHandle.write(deviceSamples, offset, deviceSamples.size - offset)
-                    if (written <= 0) {
-                        throw AudioUnavailableException(
-                            "audio_uplink_failed",
-                            AudioFailureCode.UPLINK_FAILED,
-                            "uplink write returned " + written,
-                        )
-                    }
-                    offset += written
-                }
+                writeUplinkFrames(deviceSamples)
             }
+        }
+    }
+
+    /**
+     * 内部流固定单声道；若注入播放器是立体声，必须按帧复制到所有声道，否则
+     * 直接写单声道样本会被当成交错帧播放（时长减半、声道错位）。
+     */
+    private fun writeUplinkFrames(monoSamples: ShortArray) {
+        val channels = uplinkChannels
+        val interleaved = if (channels == 1) {
+            monoSamples
+        } else {
+            ShortArray(monoSamples.size * channels) { index ->
+                monoSamples[index / channels]
+            }
+        }
+        var offset = 0
+        while (offset < interleaved.size) {
+            if (stopped.get()) {
+                throw AudioUnavailableException(
+                    "audio_stopped",
+                    AudioFailureCode.STOPPED,
+                    "audio session is stopped",
+                )
+            }
+            val written = uplinkHandle.write(interleaved, offset, interleaved.size - offset)
+            if (written <= 0) {
+                throw AudioUnavailableException(
+                    "audio_uplink_failed",
+                    AudioFailureCode.UPLINK_FAILED,
+                    "uplink write returned " + written,
+                )
+            }
+            // AudioTrack 以帧为单位写入；非整帧会破坏交错/循环边界，按失败处理。
+            if (written % channels != 0) {
+                throw AudioUnavailableException(
+                    "audio_uplink_failed",
+                    AudioFailureCode.UPLINK_FAILED,
+                    "uplink write returned a partial frame: " + written,
+                )
+            }
+            offset += written
         }
     }
 
