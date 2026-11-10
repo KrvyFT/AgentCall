@@ -349,8 +349,9 @@ $ flock /tmp/agentcall-gradle.lock ./gradlew :core:testDebugUnitTest :bridge:tes
 BUILD SUCCESSFUL
 ~~~
 
-- 结果统计（JUnit XML）：core 108 tests / 0 failures，bridge 91 tests / 0 failures（本任务完成时的结果；其他任务可能继续增加 core 用例）。
+- 结果统计（JUnit XML）：core 108 tests / 0 failures，bridge 96 tests / 0 failures（本任务完成时的结果；其他任务可能继续增加 core 用例）。
 - 四个必须测试均通过：`streamCreationDoesNotUnlockCalibration`、`environmentChangeInvalidatesEvidence`（core `CalibrationPolicyTest`）、`revokedLeaseCannotDisconnect`、`audioFailureKeepsMicrophoneIsolated`（bridge `SupervisorTest`）。
+- 本任务新增/保留的设备无关覆盖：PCM16 字节长度与立体声注入复制、非法内部格式与 0 Hz 设备流拒绝、终止中通话不可被新接听覆盖、关闭后的监督端不就绪。
 - 这些结果只覆盖 JVM 逻辑：PCM16/重采样、反射分类、租约/心跳/窗口顺序、校准策略与持久化 fail closed。它们**没有**覆盖真实 AudioRecord/AudioTrack、HAL、Telecom、SELinux、KernelSU app_process 或任何真实通话。
 
 ## 8. 当前未验证/阻塞清单
