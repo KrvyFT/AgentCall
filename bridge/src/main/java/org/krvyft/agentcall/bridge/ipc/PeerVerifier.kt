@@ -1,5 +1,6 @@
 package org.krvyft.agentcall.bridge.ipc
 
+import android.app.role.RoleManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.net.LocalSocket
@@ -92,11 +93,30 @@ class AndroidPackageIdentitySource(private val packageManager: PackageManager) :
  * 未在真机验证：不同 ROM 上该反射路径与隐藏 API 策略需实测。
  */
 object RootFramework {
-    fun packageManager(): PackageManager? = try {
+
+    /**
+     * 系统 Context：app_process 由 root 启动，没有 Application/Context；这里走
+     * ActivityThread.systemMain() + getSystemContext()。只在首次需要时构造并复用
+     * （重复 systemMain() 会重复初始化框架状态）。解析失败返回 null，调用方 fail closed。
+     */
+    private val systemContext: Context? by lazy { resolveSystemContext() }
+
+    fun packageManager(): PackageManager? = systemContext?.packageManager
+
+    /**
+     * 系统角色服务（ROLE_DIALER 等）。不同 ROM 的隐藏 API 策略可能不同：不可用时返回
+     * null，由默认拨号器探测回落为“负证据/未知”，绝不停留在猜测的“已设为默认”。
+     */
+    fun roleManager(): RoleManager? = try {
+        systemContext?.getSystemService(RoleManager::class.java)
+    } catch (t: Throwable) {
+        null
+    }
+
+    private fun resolveSystemContext(): Context? = try {
         val activityThreadClass = Class.forName("android.app.ActivityThread")
         val activityThread = activityThreadClass.getMethod("systemMain").invoke(null)
-        val systemContext = activityThreadClass.getMethod("getSystemContext").invoke(activityThread) as Context
-        systemContext.packageManager
+        activityThreadClass.getMethod("getSystemContext").invoke(activityThread) as Context
     } catch (t: Throwable) {
         null
     }

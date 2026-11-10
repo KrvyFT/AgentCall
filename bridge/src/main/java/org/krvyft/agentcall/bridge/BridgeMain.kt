@@ -15,8 +15,10 @@ import org.krvyft.agentcall.bridge.config.CalibrationStore
 import org.krvyft.agentcall.bridge.config.ConfigErrorCode
 import org.krvyft.agentcall.bridge.config.ConfigStore
 import org.krvyft.agentcall.bridge.config.ConfigStoreException
+import org.krvyft.agentcall.bridge.diagnostics.AndroidDialerDefaultRoleProbe
 import org.krvyft.agentcall.bridge.diagnostics.AndroidPlatformFacts
 import org.krvyft.agentcall.bridge.diagnostics.DeviceProbe
+import org.krvyft.agentcall.bridge.diagnostics.DialerDefaultRole
 import org.krvyft.agentcall.bridge.diagnostics.ReflectiveAudioApiProbe
 import org.krvyft.agentcall.bridge.ipc.AndroidPackageIdentitySource
 import org.krvyft.agentcall.bridge.ipc.ControlServer
@@ -131,6 +133,10 @@ internal object BridgeRuntime {
             return 1
         }
 
+        // 默认拨号器事实：系统 RoleManager（权威）+ ACTION_DIAL 默认处理器（负证据）。
+        // 两者都是本地查询；不可读时探测返回 UNKNOWN，status 线上值是字符串 "unknown"。
+        val dialerDefaultRole = AndroidDialerDefaultRoleProbe(packageManager, RootFramework.roleManager())
+
         val verifier = PeerVerifier(packages) { runCatching { store.readPairing() }.getOrNull() }
         val probe = DeviceProbe(
             packages = packages,
@@ -170,6 +176,7 @@ internal object BridgeRuntime {
                 val current = server
                 if (current == null) 0 to 0L else current.activeConnectionCount to current.rejectedConnectionCount
             },
+            dialerDefaultRole = dialerDefaultRole,
         )
 
         // PCM 通道由 ControlServer 独立 bind；音频工作角色负责真实 PCM 生产/消费
@@ -325,6 +332,8 @@ internal class ControlDispatcher(
     private val startedAtMs: Long = System.currentTimeMillis(),
     private val connectionStats: () -> Pair<Int, Long> = { 0 to 0L },
     private val hookCommands: HookCommandRouter = HookCommandRouter(),
+    /** 默认拨号器探测：默认 fail closed 为未知，生产装配注入 Android 实现。 */
+    private val dialerDefaultRole: () -> DialerDefaultRole = { DialerDefaultRole.UNKNOWN },
 ) : RpcHandler {
 
     /**
@@ -484,7 +493,29 @@ internal class ControlDispatcher(
         json.addProperty("microphoneIsolated", state?.microphoneIsolated ?: false)
         json.addProperty("supervisionBlocked", state?.blockedReason)
         json.addProperty("supervisionLastFault", state?.lastFault)
+        // 阶段 B 概览实时字段：确定为 boolean，无法可靠确定时写字符串 "unknown"。
+        addLiveStatus(json, "hookConnected", state?.hookConnected)
+        addLiveStatus(json, "dialerDefaultRole", inspectDialerDefaultRole())
         return json.toString()
+    }
+
+    /** 探测失败一律当作未知：status 不能因为一次异常而消失或编造结论。 */
+    private fun inspectDialerDefaultRole(): Boolean? = try {
+        dialerDefaultRole.invoke().definite
+    } catch (t: Throwable) {
+        DialerDefaultRole.UNKNOWN.definite
+    }
+
+    /**
+     * status 的三态实时值：true/false 写布尔值，null 写字符串 "unknown"。
+     * WebUI 只按真实布尔渲染，缺失/未知都显示“未知（后端未提供/无法确定）”。
+     */
+    private fun addLiveStatus(json: JsonObject, key: String, value: Boolean?) {
+        if (value == null) {
+            json.addProperty(key, UNKNOWN_STATUS_VALUE)
+        } else {
+            json.addProperty(key, value)
+        }
     }
 
     /** 只有 APP 角色能到达这里（RolePolicy 固定表）；HOOK/CLI 都无法读取密钥。 */
@@ -582,6 +613,9 @@ internal class ControlDispatcher(
         val PACKAGE_PATTERN = Regex("[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)+")
         const val MAX_SESSION_REQUEST_CHARS: Int = 1024
         const val MAX_ERROR_TEXT_CHARS: Int = 200
+
+        /** 无法在特权进程可靠确定时的显式未知值（不是布尔 false）。 */
+        const val UNKNOWN_STATUS_VALUE: String = "unknown"
     }
 }
 

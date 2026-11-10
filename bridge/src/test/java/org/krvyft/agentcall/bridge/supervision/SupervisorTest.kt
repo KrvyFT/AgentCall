@@ -368,6 +368,27 @@ class SupervisorTest {
         assertTrue(f.worker.microphoneIsolated)
         assertEquals(0, f.isolation.restoreCalls)
     }
+
+    /**
+     * 阶段 B：控制面 status 的 hookConnected 必须来自真实的 HOOK 心跳存在性，
+     * 而不是固定值；窗口是 SessionLimits.HEARTBEAT_TIMEOUT_MS（5000 ms）。
+     */
+    @Test
+    fun rpcStatusReportsHookPresenceOnlyWithinTheHeartbeatWindow() {
+        val f = Fixture()
+        val port = SupervisorRpcPort(f.supervisor, HookCallInbox())
+
+        assertFalse("没有任何心跳时必须报未连接", port.status().hookConnected)
+
+        f.supervisor.heartbeat(session, PeerRole.APP, f.clock.nowMs())
+        assertFalse("只有 APP 心跳不能把 Hook 标成已连接", port.status().hookConnected)
+
+        f.supervisor.heartbeat(session, PeerRole.HOOK, f.clock.nowMs())
+        assertTrue(port.status().hookConnected)
+
+        f.clock.advance(SessionLimits.HEARTBEAT_TIMEOUT_MS + 1)
+        assertFalse("超过 5000 ms 窗口后必须回落为未连接", port.status().hookConnected)
+    }
 }
 
 /**

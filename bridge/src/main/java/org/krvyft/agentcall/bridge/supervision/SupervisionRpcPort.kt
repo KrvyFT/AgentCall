@@ -14,6 +14,11 @@ data class SupervisionRpcStatus(
     val microphoneIsolated: Boolean,
     val blockedReason: String?,
     val lastFault: String?,
+    /**
+     * HOOK 角色是否在心跳窗口（[Supervisor] 的 heartbeatTimeoutMs，默认 5000 ms）内
+     * 报告过心跳。只反映真实存在性，不发起任何远程调用。
+     */
+    val hookConnected: Boolean,
 )
 
 /**
@@ -74,6 +79,7 @@ class SupervisorRpcPort(
             microphoneIsolated = snapshot.microphoneIsolated,
             blockedReason = snapshot.blockedReason,
             lastFault = snapshot.lastFault,
+            hookConnected = snapshot.peersAlive[PeerRole.HOOK] == true,
         )
     }
 }
