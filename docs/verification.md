@@ -256,3 +256,130 @@ GRADLE_EXIT:0
 - 未验证 okhttp/mockwebserver 在模块中的实际使用：按控制器决定只固定版本目录，任务 6 才有 usage。
 - 未添加 Xposed 仓库：本任务不引入 Xposed 依赖，按“不添加未使用配置/不新增工程级仓库”的约束，留到任务 4 引入 `compileOnly` 时再于 `settings.gradle.kts` 以精确 group 允许；任务 4 的 Modify 列表未列出 `settings.gradle.kts`，届时需要一并处理（见任务 1 报告“问题/风险”）。
 - 镜像可达性依赖机器级 `~/.gradle/init.d/agentcall-mirrors.gradle.kts`；本任务未修改该文件，也未新增工程级仓库。
+
+## 5. 任务 3 — 特权运行容器、IPC、配置与诊断（2026-11-10）
+
+本任务新增 `:bridge`（Android application，仅作 DEX 容器）与 `:core:protocol`，并记录实际执行结果。
+无测试设备：所有真机凭据/SELinux/app_process 行为都未验证，不给设备结论。
+
+### 5.1 模块事实
+
+| 项目 | 值 | 依据 |
+| --- | --- | --- |
+| `:bridge` 插件 | `com.android.application`（AGP 9.5.1，内置 Kotlin） | `bridge/build.gradle.kts` |
+| namespace / applicationId | `org.krvyft.agentcall.bridge` | 同上 |
+| compileSdk / targetSdk / minSdk | 37 / 37 / 36 | 同上 |
+| Java / Kotlin 目标 | VERSION_11 / JVM_11 | 同上 |
+| 组件 | 无 Launcher Activity、无 exported 组件 | 合并后 manifest 只有 `<application android:allowBackup="false">` |
+| 依赖 | `implementation(project(":core"))`、`implementation(libs.gson)` | 版本目录中 gson 仍为 2.11.0，无新增坐标 |
+| settings | 增加 `include(":bridge")` | `settings.gradle.kts` |
+| keep 规则 | `BridgeMain`/`AgentCallCli` 的 main 与类名；`bridge.**` 中带 main 的入口 | `bridge/src/main/keepRules/rules.keep` |
+
+`:bridge:assembleDebug` 首次构建（只建模块、尚无 Kotlin 源码）：
+
+```console
+$ ./gradlew :bridge:assembleDebug
+...
+> Task :bridge:packageDebug
+> Task :bridge:assembleDebug
+
+BUILD SUCCESSFUL in 2s
+50 actionable tasks: 32 executed, 18 up-to-date
+GRADLE_EXIT=0
+```
+
+### 5.2 TDD 红灯（先写测试，实现尚不存在）
+
+`hookCannotReadSecrets`、`claimedUidIsIgnored` 在 `CT/protocol/RolePolicyTest.kt`；
+`truncatedFrameRejected`、`oversizedFrameRejected` 在 `CT/protocol/RpcCodecTest.kt`；
+`staleRevisionDoesNotOverwrite` 在 `BT/config/ConfigStoreTest.kt`。
+
+```console
+$ ./gradlew :core:testDebugUnitTest --tests '*protocol*'
+> Task :core:compileDebugUnitTestKotlin FAILED
+e: .../RpcCodecTest.kt:345:48 Unresolved reference 'patch'.
+e: .../RpcCodecTest.kt:358:13 Unresolved reference 'RpcCodec'.
+...
+BUILD FAILED in 761ms
+GRADLE_EXIT=1
+
+$ ./gradlew :bridge:testDebugUnitTest
+> Task :bridge:compileDebugUnitTestKotlin FAILED
+e: .../ConfigStoreTest.kt:192:29 Unresolved reference 'ConfigStore'.
+e: .../ConfigStoreTest.kt:200:37 Unresolved reference 'ConfigStore'.
+e: .../ConfigStoreTest.kt:226:22 Unresolved reference 'ConfigErrorCode'.
+e: .../ConfigStoreTest.kt:257:22 Unresolved reference 'PairingRecord'.
+...
+BUILD FAILED in 673ms
+GRADLE_EXIT=1
+```
+
+失败预期：测试先于实现提交，Kotlin 在编译期找不到被测类型（与任务 1/2 的判定方式一致）。
+同一编译单元中的 `hookCannotReadSecrets`/`claimedUidIsIgnored` 也因 `RolePolicy` 未实现而失败。
+
+### 5.3 TDD 绿灯与最终验证
+
+```console
+$ ./gradlew :core:testDebugUnitTest :bridge:testDebugUnitTest :bridge:assembleDebug --rerun-tasks
+...
+> Task :core:testDebugUnitTest
+> Task :bridge:testDebugUnitTest
+> Task :bridge:assembleDebug
+
+BUILD SUCCESSFUL in 2s
+66 actionable tasks: 66 executed
+GRADLE_EXIT:0
+```
+
+测试报告（`--rerun-tasks` 后）：
+
+| 测试类 | tests | skipped | failures | errors |
+| --- | --- | --- | --- | --- |
+| `core.model.ContractTest`（任务 1 回归） | 14 | 0 | 0 | 0 |
+| `core.rules.RuleMatcherTest`（任务 2 回归） | 21 | 0 | 0 | 0 |
+| `core.session.LeaseRegistryTest`（任务 2 回归） | 8 | 0 | 0 | 0 |
+| `core.session.SessionReducerTest`（任务 2 回归） | 34 | 0 | 0 | 0 |
+| `core.protocol.RpcCodecTest` | 16 | 0 | 0 | 0 |
+| `core.protocol.RolePolicyTest` | 8 | 0 | 0 | 0 |
+| `bridge.config.ConfigStoreTest` | 8 | 0 | 0 | 0 |
+
+仪器测试只编译、未执行（本机无设备）：
+
+```console
+$ ./gradlew :bridge:assembleDebugAndroidTest
+BUILD SUCCESSFUL
+```
+
+失败路径覆盖（JVM）：64 KiB 帧上限与截断/非正长度（读取正文前失败）、请求 ID/方法/版本/会话校验、
+响应 payload 与 error 互斥、HOOK 无法读取配置与密钥、消息自称 uid/role 不提权、角色与内核 uid 一致性、
+CAS 冲突不改旧配置、空密钥拒绝、损坏/未来 schema 失败关闭、密钥 Keep/Replace/Clear、脱敏导出不含密钥、
+端点空值归一化为 null、0700/0600 权限与无临时文件残留、schema 迁移先备份。
+
+### 5.4 DEX 与公开签名证据
+
+```console
+$ unzip -l bridge/build/outputs/apk/debug/bridge-debug.apk | grep classes
+  classes.dex ... classes10.dex           （10 个 dex，含 Kotlin/Gson/core）
+
+$ grep -l -a -F 'Lorg/krvyft/agentcall/bridge/BridgeMain;' /tmp/bridge-dex/classes*.dex
+/tmp/bridge-dex/classes6.dex
+$ grep -l -a -F 'Lorg/krvyft/agentcall/bridge/AgentCallCli;' /tmp/bridge-dex/classes*.dex
+/tmp/bridge-dex/classes6.dex
+$ grep -l -a -F 'Lorg/krvyft/agentcall/core/model/PeerIdentity;' /tmp/bridge-dex/classes*.dex
+/tmp/bridge-dex/classes2.dex ... classes7.dex
+$ grep -l -a -F 'Lcom/google/gson/Gson;' /tmp/bridge-dex/classes*.dex
+/tmp/bridge-dex/classes.dex
+```
+
+`javap` 检查 `C/protocol` 公开签名：只出现共享契约、JDK 与 sealed 结果类型，没有 Gson 类型。
+
+### 5.5 未验证 / 阻塞（不得当作设备结论）
+
+- `BridgeMain` 在 app_process 中的真实启动、`activityThread.systemMain()` 获取 PackageManager 的反射路径：
+  未验证；获取失败时实现选择退出（`package_manager_unavailable`），不降级信任。
+- `LocalSocket#getPeerCredentials` 返回真实 uid/pid、不同 UID 被拒绝、SELinux 可达性：
+  仅写了 `BI/ipc/PeerCredentialsTest.kt`，本机无设备未执行。
+- 配对与 CLI 在真机上的 root 身份、WebView 桥（任务 8）未验证。
+- PCM 通道已实现独立 bind/限长/凭据校验，但本任务没有音频生产者，`:bridge` 运行容器未注入 sink；
+  真正音频接入属任务 5。
+- 未运行 `:bridge:assembleRelease` 的收缩验证（任务 9 负责真实 DEX 容器与 keep 规则检查）。

@@ -1,13 +1,19 @@
 # :bridge 的反射/按名加载入口。AGP 会把 src/main/keepRules 下的文件合并后交给 R8。
 #
 # app_process 按稳定 JVM 类名加载运行容器，因此 main 与类名都不能被收缩/重命名：
-# 任务 9 的打包检查也按这些名字验证 DEX 入口。后续任务新增“按类名启动”的工作容器
-# （音频、监督）时，必须在这里加显式规则，不要整包保留。
+# 任务 9 的打包检查也按这些名字验证 DEX 入口。
 
+# 运行容器：BridgeMain 与 root CLI。
 -keep class org.krvyft.agentcall.bridge.BridgeMain {
     public static void main(java.lang.String[]);
 }
 -keep class org.krvyft.agentcall.bridge.AgentCallCli {
+    public static void main(java.lang.String[]);
+}
+
+# 后续任务按类名启动的工作容器（音频工作进程、监督进程）只要提供 main 就一并保留；
+# 这里只保留入口类与其 main，不做整包保留。
+-keep class org.krvyft.agentcall.bridge.** {
     public static void main(java.lang.String[]);
 }
 
