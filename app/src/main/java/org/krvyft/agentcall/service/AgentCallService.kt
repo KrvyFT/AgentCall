@@ -14,7 +14,6 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
@@ -24,8 +23,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.krvyft.agentcall.ai.ApiKeyProvider
 import org.krvyft.agentcall.ai.ConversationEngine
@@ -53,8 +50,7 @@ data class AgentCallStatus(
     val foregroundActive: Boolean = false,
     /** 前台类型不可用时的机器码（NOT_READY 原因）。 */
     val foregroundError: String? = null,
-    val notificationPermissionGranted: Boolean = false,
-    /** 五项就绪事实全部满足；只有 true 时协调器才可能自动接听。 */
+    /** 全部就绪事实满足；只有 true 时协调器才可能自动接听。 */
     val ready: Boolean = false,
     /** 未就绪的固定机器码列表（顺序稳定）。 */
     val blockers: List<String> = emptyList(),
@@ -69,8 +65,8 @@ data class AgentCallStatus(
     /** 当前协调器跟踪的会话；无会话为 null。 */
     val activeSession: SessionId? = null,
     val sessionState: SessionState? = null,
-    /** 人工交还结果的机器码；只有 handback_confirmed / handback_not_owned 表示成功。 */
-    val lastHandback: String? = null,
+    /** 人工交还结果（绑定产生它的会话）；只有 handback_confirmed / handback_not_owned 表示成功。 */
+    val lastHandback: HandbackReport? = null,
 )
 
 /**
@@ -89,11 +85,8 @@ object AgentCallRuntime {
     }
 
     /** 服务启动时清空上一轮的就绪/会话事实（避免重启后沿用旧 READY）。 */
-    internal fun resetForStart(notificationPermissionGranted: Boolean) {
-        state.value = AgentCallStatus(
-            serviceRunning = true,
-            notificationPermissionGranted = notificationPermissionGranted,
-        )
+    internal fun resetForStart() {
+        state.value = AgentCallStatus(serviceRunning = true)
     }
 
     internal fun reset() {
@@ -116,7 +109,7 @@ object AgentCallRuntime {
  * 没有类型的常驻服务，也绝不自动接听。
  *
  * ## 就绪与自动接听
- * - 服务启动请求本身不是就绪：每次循环都调用 [ServiceBootstrap.evaluate] 重新探测五项事实，
+ * - 服务启动请求本身不是就绪：每次循环都调用 [ServiceBootstrap.evaluate] 重新探测全部事实，
  *   任一缺失就把 ReadyChanged(false) 投给协调器（保留原响铃）；
  * - 当前桥接不向 APP 开放 status/diagnose，也不存在 HOOK→APP 快照通道，因此生产环境
  *   的判定会是 NOT_READY（见 7B2 报告的“未验证/阻塞”）。这是 fail closed，不是假成功。
@@ -139,6 +132,11 @@ class AgentCallService : Service() {
     private var diagnostics: BridgeDiagnostics? = null
     private var coordinator: SessionCoordinator? = null
     private var bootstrapJob: Job? = null
+    private var preAnswerRecheck: PreAnswerRecheck? = null
+
+    /** 最近一次读到的接听倒计时；复检必须在到期前完成。 */
+    @Volatile
+    private var answerDelayMs: Long = AgentConfig.DEFAULT_ANSWER_DELAY_MS.toLong()
 
     @Volatile
     private var foregroundStarted: Boolean = false
@@ -148,9 +146,7 @@ class AgentCallService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        val permissionGranted = checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
-            PackageManager.PERMISSION_GRANTED
-        AgentCallRuntime.resetForStart(notificationPermissionGranted = permissionGranted)
+        AgentCallRuntime.resetForStart()
         callNotification = CallNotification(this).also { it.ensureChannel() }
         notificationManager = getSystemService(NotificationManager::class.java)
         log("service_created")
@@ -162,11 +158,6 @@ class AgentCallService : Service() {
         if (stopping.get()) return START_NOT_STICKY
         if (!startInForeground()) return START_NOT_STICKY
         when (intent?.action) {
-            ACTION_STOP -> {
-                log("service_stop_requested")
-                stopSelf()
-                return START_NOT_STICKY
-            }
             ACTION_TAKEOVER -> handleTakeover(intent)
             ACTION_START, ACTION_RETRY, null -> {
                 ensureRuntime()
@@ -182,23 +173,32 @@ class AgentCallService : Service() {
         log("service_destroyed")
         bootstrapJob?.cancel()
         bootstrapJob = null
+        preAnswerRecheck?.cancel()
+        preAnswerRecheck = null
         coordinator?.close()
         coordinator = null
         val client = bridge
         bridge = null
-        if (client != null) {
-            // close() 只关 PCM lane 与控制传输，不取消外部 scope；收尾时有界同步等待。
-            runBlocking {
-                withContext(NonCancellable) {
-                    withTimeoutOrNull(CLIENT_CLOSE_TIMEOUT_MS) { runCatching { client.close() } }
+        val diagnosticsClient = diagnostics
+        diagnostics = null
+        // close() 只关 PCM lane 与控制传输，是本地 IO；绝不在主线程 runBlocking（ANR 风险）。
+        // 收尾有界（CLIENT_CLOSE_TIMEOUT_MS），完成后才取消服务 scope。
+        if (client == null && diagnosticsClient == null) {
+            scope.cancel()
+        } else {
+            CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+                try {
+                    withTimeoutOrNull(CLIENT_CLOSE_TIMEOUT_MS) {
+                        runCatching { client?.close() }
+                    }
+                    runCatching { diagnosticsClient?.close() }
+                } finally {
+                    scope.cancel()
                 }
             }
         }
-        diagnostics?.let { runCatching { runBlocking { it.close() } } }
-        diagnostics = null
         runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
         foregroundStarted = false
-        scope.cancel()
         AgentCallRuntime.reset()
         super.onDestroy()
     }
@@ -252,6 +252,7 @@ class AgentCallService : Service() {
         val probes = ReadinessProbes(
             bridge = BridgeProbe { client.ensureReady() },
             hook = BridgeHookPresenceProbe(diagnosticsClient),
+            dialer = BridgeDialerRoleProbe(diagnosticsClient),
             config = RedactedConfigProbe { client.readRedactedConfig() },
             calibration = BridgeDiagnoseCalibrationProbe(diagnosticsClient, evidence),
             network = AndroidNetworkProbe(this),
@@ -268,6 +269,15 @@ class AgentCallService : Service() {
             heartbeat = HeartbeatPump { id -> client.heartbeatWhileLive(id) },
             observer = serviceObserver,
             dispatcher = Dispatchers.Default,
+        )
+        // 接听前最后一次复检：倒计时末尾重读本地事实（桥接 status/config/diagnose + 网络），
+        // 未就绪就投递 ReadyChanged(false)；绝不发起付费端点探测，也绝不下发 true。
+        preAnswerRecheck = PreAnswerRecheck(
+            scope = scope,
+            isReady = { serviceBootstrap.evaluate().ready },
+            publish = { ready ->
+                if (!ready) sessionCoordinator.onEvent(SessionEvent.ReadyChanged(false))
+            },
         )
         sessionCoordinator.start()
         bridge = client
@@ -345,6 +355,8 @@ class AgentCallService : Service() {
         val client = bridge ?: return
         val payload = client.readRedactedConfig() ?: return
         val config = parseRedactedAgentConfig(payload) ?: return
+        // 倒计时长度每次都要刷新（即使 revision 未变）：复检窗口依赖它。
+        answerDelayMs = config.answerDelayMs.toLong()
         if (config.revision == lastConfigRevision) return
         lastConfigRevision = config.revision
         coordinator?.onConfigChanged(config)
@@ -407,22 +419,29 @@ class AgentCallService : Service() {
     private val serviceObserver: SessionObserver = object : SessionObserver() {
         override fun onStateChanged(id: SessionId, state: SessionState) {
             AgentCallRuntime.update {
+                // 新会话的第一个状态就清掉上一通电话的交还结果；同一会话保留到 ENDED。
+                val handback = HandbackJournal.onStateChanged(it.lastHandback, id)
                 if (state == SessionState.ENDED) {
-                    it.copy(activeSession = null, sessionState = state)
+                    it.copy(activeSession = null, sessionState = state, lastHandback = handback)
                 } else {
-                    it.copy(activeSession = id, sessionState = state)
+                    it.copy(activeSession = id, sessionState = state, lastHandback = handback)
                 }
             }
+            // 接听前的最终复检窗口随状态变化重排；非 PREPARING 会立即取消旧复检。
+            preAnswerRecheck?.onStateChanged(id, state, answerDelayMs)
             scope.launch { updateNotification() }
         }
 
         override fun onHandedBack(id: SessionId, outcome: RevokeOutcome) {
-            val code = when (outcome) {
-                RevokeOutcome.CONFIRMED -> "handback_confirmed"
-                RevokeOutcome.NOT_OWNED -> "handback_not_owned"
-                RevokeOutcome.REVOKE_FAILED, RevokeOutcome.UNAVAILABLE -> "handback_unconfirmed"
+            val report = HandbackJournal.record(id, outcome)
+            AgentCallRuntime.update { current ->
+                // 旧会话的迟到交还结果不得写到新通话的页面上。
+                if (current.activeSession != null && current.activeSession != id) {
+                    current
+                } else {
+                    current.copy(lastHandback = report)
+                }
             }
-            AgentCallRuntime.update { it.copy(lastHandback = code) }
             scope.launch { updateNotification() }
         }
 
@@ -448,7 +467,6 @@ class AgentCallService : Service() {
         private const val TAG = "AgentCallService"
 
         const val ACTION_START: String = "org.krvyft.agentcall.action.START"
-        const val ACTION_STOP: String = "org.krvyft.agentcall.action.STOP"
         const val ACTION_RETRY: String = "org.krvyft.agentcall.action.RETRY"
         const val ACTION_TAKEOVER: String = "org.krvyft.agentcall.action.TAKEOVER"
 
@@ -461,13 +479,10 @@ class AgentCallService : Service() {
         /** 关闭 BridgeClient 的收尾上限（PCM lane 关闭是本地操作）。 */
         const val CLIENT_CLOSE_TIMEOUT_MS: Long = 2_000L
 
-        /** 供 UI 启动/重试服务的便捷入口。 */
+        /** 供 UI 启动/重试服务的便捷入口；停止用 [android.content.Context.stopService]。 */
         fun startIntent(context: Context, retry: Boolean = false): Intent =
             Intent(context, AgentCallService::class.java)
                 .setAction(if (retry) ACTION_RETRY else ACTION_START)
-
-        fun stopIntent(context: Context): Intent =
-            Intent(context, AgentCallService::class.java).setAction(ACTION_STOP)
     }
 }
 

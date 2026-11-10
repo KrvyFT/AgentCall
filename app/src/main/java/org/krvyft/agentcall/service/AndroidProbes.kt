@@ -22,6 +22,21 @@ class BridgeHookPresenceProbe(
 }
 
 /**
+ * Google 电话默认角色探针：读桥接 `status.dialerDefaultRole`（Task 7B2 FIX ROUND 1，spec §8）。
+ *
+ * status 不可用/字段缺失时返回 null——就绪判定把 null 当作“不是默认拨号器”，保留原响铃。
+ */
+class BridgeDialerRoleProbe(
+    private val diagnostics: BridgeDiagnostics,
+) : DialerDefaultRoleProbe {
+
+    override suspend fun isDefault(): Boolean? = when (val result = diagnostics.status()) {
+        is BridgeStatusResult.Available -> result.status.dialerDefaultRole
+        is BridgeStatusResult.Unavailable -> null
+    }
+}
+
+/**
  * 校准探针：桥接 diagnose 的 EnvironmentKey + 本机人工测试记录 + core 的 [CalibrationPolicy]。
  *
  * 环境不可用（APP 无权调用 diagnose 或负载不完整）时直接 false：没有完整环境绑定的证据

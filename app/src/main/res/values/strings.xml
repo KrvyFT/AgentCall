@@ -12,6 +12,36 @@
     <string name="notification_call_text">当前状态：%1$s</string>
     <string name="notification_action_takeover">我来接听</string>
 
+    <!-- 状态/机器码文案（StatusText 只保存码 → 资源 id 的映射；UI 与通知共用） -->
+    <string name="status_blocker_bridge_unreachable">root 桥接不可达或 APP 未配对</string>
+    <string name="status_blocker_hook_not_connected">Hook 心跳缺失（5000 ms 内没有心跳）</string>
+    <string name="status_blocker_hook_presence_unknown">Hook 状态未知（桥接未向 APP 开放 status）</string>
+    <string name="status_blocker_dialer_not_default">Google 电话不是默认拨号器（或无法确定默认角色）</string>
+    <string name="status_blocker_config_disabled">总开关关闭</string>
+    <string name="status_blocker_config_invalid">配置校验未通过</string>
+    <string name="status_blocker_config_voice_unsupported">ASR/LLM/TTS 三项语音端点不完整或不是 HTTPS</string>
+    <string name="status_blocker_calibration_blocked">校准未通过（无完整环境绑定的人工测试证据）</string>
+    <string name="status_blocker_network_unreachable">网络不可用或未验证</string>
+    <string name="status_hook_present">在线</string>
+    <string name="status_hook_absent">离线</string>
+    <string name="status_hook_unknown">未知</string>
+    <string name="status_session_none">无进行中的会话</string>
+    <string name="status_session_idle">空闲</string>
+    <string name="status_session_eligible">符合接管条件</string>
+    <string name="status_session_preparing">准备接听（倒计时）</string>
+    <string name="status_session_answer_pending">接听待确认</string>
+    <string name="status_session_active_ai">AI 通话中</string>
+    <string name="status_session_handoff">等待人工接管</string>
+    <string name="status_session_ending">正在结束</string>
+    <string name="status_session_ended">已结束</string>
+    <string name="status_handback_confirmed">已确认撤销 AI 所有权并交还人工</string>
+    <string name="status_handback_not_owned">监督端本不持有该会话，已交还人工</string>
+    <string name="status_handback_unconfirmed">撤销未确认：请勿当作已交还</string>
+    <string name="status_takeover_session_required">接管请求缺少会话标识，已拒绝</string>
+    <string name="status_takeover_no_active_call">当前没有进行中的通话</string>
+    <string name="status_takeover_stale_session">这个入口属于旧通话，不能控制当前通话</string>
+    <string name="status_takeover_state_not_allowed">当前会话状态不允许接管</string>
+
     <!-- 主页/启动向导 -->
     <string name="main_intro">启动向导：以下每一项都必须是真机事实，缺一项就不会自动接听。启动请求本身不代表服务可用。</string>
     <string name="main_status_root_prefix">root 桥接：%1$s</string>
@@ -29,7 +59,7 @@
     <string name="main_note_device">真机状态需在目标 ROM 上人工验证；本页只展示可读取到的真实事实，读不到时显示“未知”，不会伪造成功。</string>
     <string name="main_note_blockers">未就绪原因：%1$s</string>
     <string name="main_note_no_blockers">未就绪原因：尚未完成检测</string>
-    <string name="main_note_ready">已就绪：五项事实全部满足</string>
+    <string name="main_note_ready">已就绪：全部就绪事实满足</string>
     <string name="main_error_prefix">最近错误：%1$s</string>
     <string name="main_bridge_reachable">可达，APP 已通过配对核验</string>
     <string name="main_bridge_unreachable">不可达（bridge_unavailable）</string>
@@ -43,6 +73,7 @@
     <string name="main_calibration_verified">已验证（本机记录）</string>
     <string name="main_calibration_unverified">未验证</string>
     <string name="main_calibration_environment_missing">环境未知，不能判定已验证</string>
+    <string name="main_calibration_policy_blocked">校准策略不允许自动接听（环境不匹配或 SDK 不受支持）</string>
     <string name="main_config_disabled">总开关关闭</string>
     <string name="main_config_enabled">总开关开启</string>
     <string name="main_config_invalid">校验未通过</string>

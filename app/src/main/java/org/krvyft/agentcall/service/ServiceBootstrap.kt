@@ -40,11 +40,20 @@ enum class HookPresence {
 /** 公开配置的就绪事实（只含布尔，绝不携带密钥或号码）。 */
 data class ConfigFacts(
     val enabled: Boolean,
+    /** core ConfigValidator 的结论（时序/地区/名单/长度等）。 */
     val valid: Boolean,
+    /**
+     * 三项语音端点（ASR/LLM/TTS）齐备且都是可用的 HTTPS 端点。
+     *
+     * 与 [valid] **分开**是必须的：ConfigValidator 只管时序/地区/名单，不检查端点；
+     * 端点缺失时 READY 仍可能为 true，而 [org.krvyft.agentcall.ai.ConversationEngine.create]
+     * 会返回 null，导致“接听后立刻终止”。规则与 ConversationEngine.isVoiceCapable 同源。
+     */
+    val voiceCapable: Boolean,
 ) {
     companion object {
-        /** 配置不可读时的唯一安全表示：按“关闭且无效”处理。 */
-        val UNAVAILABLE = ConfigFacts(enabled = false, valid = false)
+        /** 配置不可读时的唯一安全表示：按“关闭、无效且无语音能力”处理。 */
+        val UNAVAILABLE = ConfigFacts(enabled = false, valid = false, voiceCapable = false)
     }
 }
 
@@ -55,6 +64,13 @@ data class ConfigFacts(
 data class ReadinessFacts(
     val bridgeReady: Boolean,
     val hookPresence: HookPresence,
+    /**
+     * Google 电话是否为默认拨号器；null 表示无法确定。
+     *
+     * 不是默认拨号器时 PhoneAccount 不具备接听资格（spec §8 的接听前检查项），
+     * 而“无法确定”绝不能当成“是”——两者都必须保留原响铃。
+     */
+    val dialerDefaultRole: Boolean?,
     val config: ConfigFacts,
     val calibrationAllowed: Boolean,
     val networkReachable: Boolean,
@@ -71,11 +87,17 @@ enum class BootstrapBlocker(val code: String) {
     /** 无法取得 HOOK 存在性（fail closed，不等于离线）。 */
     HOOK_PRESENCE_UNKNOWN("hook_presence_unknown"),
 
+    /** Google 电话不是默认拨号器，或无法确定默认角色（fail closed）。 */
+    DIALER_NOT_DEFAULT("dialer_not_default"),
+
     /** 总开关关闭。 */
     CONFIG_DISABLED("config_disabled"),
 
     /** 配置未通过 core 的 ConfigValidator。 */
     CONFIG_INVALID("config_invalid"),
+
+    /** ASR/LLM/TTS 三项语音端点不齐备（CONFIG_INVALID 不含端点检查）。 */
+    CONFIG_VOICE_UNSUPPORTED("config_voice_unsupported"),
 
     /** 校准策略不允许自动接听（环境/人工测试证据不满足）。 */
     CALIBRATION_BLOCKED("calibration_not_verified"),
@@ -103,15 +125,18 @@ data class BootstrapDecision(
 object BootstrapPolicy {
 
     fun evaluate(facts: ReadinessFacts): BootstrapDecision {
-        val blockers = ArrayList<BootstrapBlocker>(7)
+        val blockers = ArrayList<BootstrapBlocker>(8)
         if (!facts.bridgeReady) blockers += BootstrapBlocker.BRIDGE_UNREACHABLE
         when (facts.hookPresence) {
             HookPresence.PRESENT -> Unit
             HookPresence.ABSENT -> blockers += BootstrapBlocker.HOOK_NOT_CONNECTED
             HookPresence.UNKNOWN -> blockers += BootstrapBlocker.HOOK_PRESENCE_UNKNOWN
         }
+        // 只有明确 true 才通过：false（不是默认拨号器）与 null（无法确定）都保留原响铃。
+        if (facts.dialerDefaultRole != true) blockers += BootstrapBlocker.DIALER_NOT_DEFAULT
         if (!facts.config.enabled) blockers += BootstrapBlocker.CONFIG_DISABLED
         if (!facts.config.valid) blockers += BootstrapBlocker.CONFIG_INVALID
+        if (!facts.config.voiceCapable) blockers += BootstrapBlocker.CONFIG_VOICE_UNSUPPORTED
         if (!facts.calibrationAllowed) blockers += BootstrapBlocker.CALIBRATION_BLOCKED
         if (!facts.networkReachable) blockers += BootstrapBlocker.NETWORK_UNREACHABLE
         return BootstrapDecision(ready = blockers.isEmpty(), blockers = blockers)
@@ -133,6 +158,15 @@ fun interface HookPresenceProbe {
     suspend fun presence(): HookPresence
 }
 
+/**
+ * Google 电话默认角色（生产实现读桥接 `status.dialerDefaultRole`）。
+ *
+ * 返回 null 表示无法确定（status 不可用/字段缺失）。判定只接受 true。
+ */
+fun interface DialerDefaultRoleProbe {
+    suspend fun isDefault(): Boolean?
+}
+
 /** 公开配置读取（生产实现：`BridgeClient.readRedactedConfig()` + core 的 ConfigValidator）。 */
 fun interface ConfigProbe {
     suspend fun read(): ConfigFacts
@@ -152,6 +186,7 @@ fun interface NetworkProbe {
 class ReadinessProbes(
     val bridge: BridgeProbe,
     val hook: HookPresenceProbe,
+    val dialer: DialerDefaultRoleProbe,
     val config: ConfigProbe,
     val calibration: CalibrationProbe,
     val network: NetworkProbe,
@@ -173,7 +208,7 @@ class ServiceBootstrap(
         require(probeTimeoutMs > 0L) { "probeTimeoutMs must be positive" }
     }
 
-    /** @return true 表示五项事实全部满足、可以自动接听；任何缺失都返回 false。 */
+    /** @return true 表示全部事实满足、可以自动接听；任何缺失都返回 false。 */
     suspend fun ensureReady(): Boolean = evaluate().ready
 
     /** 完整裁决（含全部阻塞原因），供 UI/诊断显示“到底缺哪一项”。 */
@@ -181,6 +216,7 @@ class ServiceBootstrap(
         val facts = ReadinessFacts(
             bridgeReady = probe("bridge") { probes.bridge.isReachable() } ?: false,
             hookPresence = probe("hook") { probes.hook.presence() } ?: HookPresence.UNKNOWN,
+            dialerDefaultRole = probe("dialer") { probes.dialer.isDefault() },
             config = probe("config") { probes.config.read() } ?: ConfigFacts.UNAVAILABLE,
             calibrationAllowed = probe("calibration") { probes.calibration.canAutoAnswer() } ?: false,
             networkReachable = probe("network") { probes.network.isOnline() } ?: false,
@@ -190,7 +226,7 @@ class ServiceBootstrap(
         return decision
     }
 
-    private suspend fun <T : Any> probe(label: String, block: suspend () -> T): T? = try {
+    private suspend fun <T> probe(label: String, block: suspend () -> T): T? = try {
         withTimeoutOrNull(probeTimeoutMs) { block() }
     } catch (cancelled: CancellationException) {
         throw cancelled
@@ -226,6 +262,7 @@ class RedactedConfigProbe(
         return ConfigFacts(
             enabled = parsed.enabled,
             valid = ConfigValidator.validate(parsed).isValid,
+            voiceCapable = parsed.hasCompleteVoiceEndpoints(),
         )
     }
 }

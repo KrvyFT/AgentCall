@@ -122,6 +122,24 @@ class BridgeDiagnosticsTest {
         assertTrue(transport.methods.all { it.isNotEmpty() })
     }
 
+    @Test
+    fun dialerDefaultRoleProbeNeverInventsTheRole() = runBlocking {
+        // true/false 按原值透传；不可用或字段缺失一律 null（就绪判定据此保持未就绪）。
+        val defaultRole = BridgeDiagnostics(FakeTransport(statusResponse("{\"dialerDefaultRole\":true}")))
+        assertEquals(true, BridgeDialerRoleProbe(defaultRole).isDefault())
+
+        val notDefault = BridgeDiagnostics(FakeTransport(statusResponse("{\"dialerDefaultRole\":false}")))
+        assertEquals(false, BridgeDialerRoleProbe(notDefault).isDefault())
+
+        val missingField = BridgeDiagnostics(FakeTransport(statusResponse("{}")))
+        assertEquals(null, BridgeDialerRoleProbe(missingField).isDefault())
+
+        val forbidden = BridgeDiagnostics(FakeTransport { request ->
+            RpcResponse(id = request.id, error = RpcError("forbidden", "denied"))
+        })
+        assertEquals(null, BridgeDialerRoleProbe(forbidden).isDefault())
+    }
+
     private fun statusJson(hookConnected: String): String =
         "{\"bridgeVersion\":\"1.0\",\"protocolVersion\":1,\"revision\":3,\"enabled\":true," +
             "\"paired\":true,\"uptimeMs\":1,\"activeConnections\":0,\"rejectedConnections\":0," +

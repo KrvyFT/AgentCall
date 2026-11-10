@@ -21,13 +21,16 @@ class ServiceBootstrapTest {
     private class Fakes(
         var bridge: Boolean = true,
         var hook: HookPresence = HookPresence.PRESENT,
+        var dialer: Boolean? = true,
         var enabled: Boolean = true,
         var valid: Boolean = true,
+        var voiceCapable: Boolean = true,
         var calibration: Boolean = true,
         var online: Boolean = true,
     ) {
         val bridgeCalls = AtomicInteger()
         val hookCalls = AtomicInteger()
+        val dialerCalls = AtomicInteger()
         val configCalls = AtomicInteger()
         val calibrationCalls = AtomicInteger()
         val networkCalls = AtomicInteger()
@@ -41,9 +44,13 @@ class ServiceBootstrapTest {
                 hookCalls.incrementAndGet()
                 hook
             },
+            dialer = DialerDefaultRoleProbe {
+                dialerCalls.incrementAndGet()
+                dialer
+            },
             config = ConfigProbe {
                 configCalls.incrementAndGet()
-                ConfigFacts(enabled = enabled, valid = valid)
+                ConfigFacts(enabled = enabled, valid = valid, voiceCapable = voiceCapable)
             },
             calibration = CalibrationProbe {
                 calibrationCalls.incrementAndGet()
@@ -137,8 +144,10 @@ class ServiceBootstrapTest {
         val decision = Fakes(
             bridge = false,
             hook = HookPresence.UNKNOWN,
+            dialer = null,
             enabled = false,
             valid = false,
+            voiceCapable = false,
             calibration = false,
             online = false,
         ).bootstrap().evaluate()
@@ -147,8 +156,10 @@ class ServiceBootstrapTest {
             listOf(
                 BootstrapBlocker.BRIDGE_UNREACHABLE,
                 BootstrapBlocker.HOOK_PRESENCE_UNKNOWN,
+                BootstrapBlocker.DIALER_NOT_DEFAULT,
                 BootstrapBlocker.CONFIG_DISABLED,
                 BootstrapBlocker.CONFIG_INVALID,
+                BootstrapBlocker.CONFIG_VOICE_UNSUPPORTED,
                 BootstrapBlocker.CALIBRATION_BLOCKED,
                 BootstrapBlocker.NETWORK_UNREACHABLE,
             ),
@@ -169,7 +180,8 @@ class ServiceBootstrapTest {
         val probes = ReadinessProbes(
             bridge = BridgeProbe { awaitCancellation() },
             hook = HookPresenceProbe { HookPresence.PRESENT },
-            config = ConfigProbe { ConfigFacts(enabled = true, valid = true) },
+            dialer = DialerDefaultRoleProbe { true },
+            config = ConfigProbe { ConfigFacts(enabled = true, valid = true, voiceCapable = true) },
             calibration = CalibrationProbe { true },
             network = NetworkProbe { true },
         )
@@ -198,7 +210,10 @@ class ServiceBootstrapTest {
                 "\"tts\":null,\"voice\":\"\",\"speed\":1.0,\"openingLine\":\"\",\"prompt\":\"\"," +
                 "\"revision\":7},\"secrets\":{\"ASR\":\"MISSING\",\"LLM\":\"MISSING\",\"TTS\":\"MISSING\"}}"
         }
-        assertEquals(ConfigFacts(enabled = true, valid = false), invalid.read())
+        assertEquals(
+            ConfigFacts(enabled = true, valid = false, voiceCapable = false),
+            invalid.read(),
+        )
 
         val valid = RedactedConfigProbe {
             "{\"config\":{\"enabled\":true,\"mode\":\"BLACKLIST\",\"blacklist\":[],\"whitelist\":[]," +
@@ -207,16 +222,42 @@ class ServiceBootstrapTest {
                 "\"tts\":null,\"voice\":\"\",\"speed\":1.0,\"openingLine\":\"\",\"prompt\":\"\"," +
                 "\"revision\":7},\"secrets\":{\"ASR\":\"MISSING\",\"LLM\":\"MISSING\",\"TTS\":\"MISSING\"}}"
         }
-        assertEquals(ConfigFacts(enabled = true, valid = true), valid.read())
+        assertEquals(
+            ConfigFacts(enabled = true, valid = true, voiceCapable = false),
+            valid.read(),
+        )
+    }
+
+    @Test
+    fun voiceCapabilityIsAFactSeparateFromConfigValidity() = runBlocking {
+        // 无端点：core ConfigValidator 仍判有效（它只看时序/地区/名单），但不具备语音能力。
+        val none = RedactedConfigProbe { redactedPayload(asr = null, llm = null, tts = null) }.read()
+        assertEquals(ConfigFacts(enabled = true, valid = true, voiceCapable = false), none)
+
+        // 只有聊天兼容服务（LLM）：不能替代 ASR/TTS（spec §10）。
+        val chatOnly = RedactedConfigProbe { redactedPayload(llm = ENDPOINT_LLM) }.read()
+        assertEquals(false, chatOnly.voiceCapable)
+
+        // 部分端点（ASR+LLM，缺 TTS）。
+        val partial = RedactedConfigProbe {
+            redactedPayload(asr = ENDPOINT_ASR, llm = ENDPOINT_LLM)
+        }.read()
+        assertEquals(false, partial.voiceCapable)
+
+        // 三项齐备且都是 HTTPS：只有这时才算具备语音能力。
+        val complete = RedactedConfigProbe {
+            redactedPayload(asr = ENDPOINT_ASR, llm = ENDPOINT_LLM, tts = ENDPOINT_TTS)
+        }.read()
+        assertEquals(ConfigFacts(enabled = true, valid = true, voiceCapable = true), complete)
     }
 
     @Test
     fun redactedConfigProbeFailsClosedOnUnusablePayloads() = runBlocking {
-        assertEquals(ConfigFacts(enabled = false, valid = false), RedactedConfigProbe { null }.read())
-        assertEquals(ConfigFacts(enabled = false, valid = false), RedactedConfigProbe { "not json" }.read())
-        assertEquals(ConfigFacts(enabled = false, valid = false), RedactedConfigProbe { "{}" }.read())
+        assertEquals(ConfigFacts(enabled = false, valid = false, voiceCapable = false), RedactedConfigProbe { null }.read())
+        assertEquals(ConfigFacts(enabled = false, valid = false, voiceCapable = false), RedactedConfigProbe { "not json" }.read())
+        assertEquals(ConfigFacts(enabled = false, valid = false, voiceCapable = false), RedactedConfigProbe { "{}" }.read())
         assertEquals(
-            ConfigFacts(enabled = false, valid = false),
+            ConfigFacts(enabled = false, valid = false, voiceCapable = false),
             RedactedConfigProbe { "{\"config\":{}}" }.read(),
         )
         // 真实校验器对默认启用的正常配置应判定有效，证明上面失败只来自负载不可用。
@@ -232,5 +273,62 @@ class ServiceBootstrapTest {
         assertEquals(HookPresence.PRESENT, HookPresence.fromStatusField("true"))
         assertEquals(HookPresence.PRESENT, HookPresence.fromStatusField(true))
         assertEquals(HookPresence.UNKNOWN, HookPresence.fromStatusField("unknown"))
+    }
+
+    @Test
+    fun unknownDialerRoleBlocksAnswer() = runBlocking {
+        // 取不到默认角色（桥接 status 不可用/字段缺失）时不能猜成“是默认拨号器”。
+        val decision = Fakes(dialer = null).bootstrap().evaluate()
+        assertFalse(decision.ready)
+        assertEquals(listOf(BootstrapBlocker.DIALER_NOT_DEFAULT), decision.blockers)
+    }
+
+    @Test
+    fun nonDefaultDialerBlocksAnswer() = runBlocking {
+        // Google 电话不是默认拨号器：PhoneAccount 不具备接听资格，必须保留原响铃。
+        val decision = Fakes(dialer = false).bootstrap().evaluate()
+        assertFalse(decision.ready)
+        assertEquals(listOf(BootstrapBlocker.DIALER_NOT_DEFAULT), decision.blockers)
+    }
+
+    @Test
+    fun dialerFactIsProbedOnEveryEvaluation() = runBlocking {
+        val fakes = Fakes()
+        val bootstrap = fakes.bootstrap()
+        assertTrue(bootstrap.ensureReady())
+        fakes.dialer = false
+        assertFalse(bootstrap.ensureReady())
+        assertEquals(2, fakes.dialerCalls.get())
+    }
+
+    @Test
+    fun configWithoutVoiceEndpointsBlocksAnswer() = runBlocking {
+        val decision = Fakes(voiceCapable = false).bootstrap().evaluate()
+        assertFalse(decision.ready)
+        assertEquals(listOf(BootstrapBlocker.CONFIG_VOICE_UNSUPPORTED), decision.blockers)
+    }
+
+    private fun redactedPayload(
+        asr: String? = null,
+        llm: String? = null,
+        tts: String? = null,
+    ): String {
+        fun endpoint(value: String?): String = value ?: "null"
+        return "{\"config\":{\"enabled\":true,\"mode\":\"BLACKLIST\",\"blacklist\":[]," +
+            "\"whitelist\":[],\"region\":\"CN\",\"handleUnknownNumbers\":false," +
+            "\"answerDelayMs\":3000,\"maxCallDurationMs\":180000," +
+            "\"enabledPhoneAccounts\":[]," +
+            "\"asr\":" + endpoint(asr) + "," +
+            "\"llm\":" + endpoint(llm) + "," +
+            "\"tts\":" + endpoint(tts) + "," +
+            "\"voice\":\"\",\"speed\":1.0,\"openingLine\":\"\",\"prompt\":\"\"," +
+            "\"revision\":7}," +
+            "\"secrets\":{\"ASR\":\"MISSING\",\"LLM\":\"MISSING\",\"TTS\":\"MISSING\"}}"
+    }
+
+    private companion object {
+        const val ENDPOINT_ASR: String = "{\"baseUrl\":\"https://asr.test/v1/\",\"model\":\"m\"}"
+        const val ENDPOINT_LLM: String = "{\"baseUrl\":\"https://llm.test/v1/\",\"model\":\"m\"}"
+        const val ENDPOINT_TTS: String = "{\"baseUrl\":\"https://tts.test/v1/\",\"model\":\"m\"}"
     }
 }

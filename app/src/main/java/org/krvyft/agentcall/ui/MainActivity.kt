@@ -17,12 +17,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
 import org.krvyft.agentcall.R
 import org.krvyft.agentcall.core.model.AgentConfig
 import org.krvyft.agentcall.core.model.EnvironmentKey
-import org.krvyft.agentcall.core.policy.CalibrationPolicy
 import org.krvyft.agentcall.core.rules.ConfigValidator
 import org.krvyft.agentcall.core.model.EndpointKind
 import org.krvyft.agentcall.ipc.BridgeClient
@@ -35,6 +34,7 @@ import org.krvyft.agentcall.service.BridgeDiagnostics
 import org.krvyft.agentcall.service.BridgeStatus
 import org.krvyft.agentcall.service.BridgeStatusResult
 import org.krvyft.agentcall.service.CalibrationEvidenceStore
+import org.krvyft.agentcall.service.CalibrationVerdict
 import org.krvyft.agentcall.service.ConnectionTestReport
 import org.krvyft.agentcall.service.ConnectionTestSupport
 import org.krvyft.agentcall.service.EndpointTestOutcome
@@ -74,7 +74,7 @@ class MainActivity : AppCompatActivity() {
 
     private var bridgeReachable: Boolean? = null
     private var bridgeStatus: BridgeStatus? = null
-    private var environmentAvailable: Boolean = false
+    private var currentEnvironment: EnvironmentKey? = null
     private var config: AgentConfig? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -98,12 +98,16 @@ class MainActivity : AppCompatActivity() {
         val diagnosticsClient = diagnostics
         client = null
         diagnostics = null
-        // 关闭必须在取消 scope 之前完成：BridgeClient 的 lane reader 运行在该 scope 上。
-        runBlocking {
-            runCatching { bridge?.close() }
-            runCatching { diagnosticsClient?.close() }
+        // 关闭是本地 IO：放到 IO dispatcher，绝不在主线程 runBlocking；
+        // BridgeClient 的 lane reader 运行在 [scope] 上，所以关闭完成后才取消它。
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            try {
+                withTimeoutOrNull(CLOSE_TIMEOUT_MS) { runCatching { bridge?.close() } }
+                runCatching { diagnosticsClient?.close() }
+            } finally {
+                scope.cancel()
+            }
         }
-        scope.cancel()
         super.onDestroy()
     }
 
@@ -128,7 +132,8 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, R.string.main_toast_service_started, Toast.LENGTH_SHORT).show()
         }
         findViewById<Button>(R.id.button_stop).setOnClickListener {
-            startService(AgentCallService.stopIntent(this))
+            // 停止一个未运行的服务不该先把它创建出来；stopService 对未运行的服务是无操作。
+            stopService(Intent(this, AgentCallService::class.java))
         }
         findViewById<Button>(R.id.button_retry).setOnClickListener {
             ContextCompat.startForegroundService(this, AgentCallService.startIntent(this, retry = true))
@@ -244,7 +249,7 @@ class MainActivity : AppCompatActivity() {
                 bridgeReachable = facts.reachable
                 config = facts.config
                 bridgeStatus = facts.status
-                environmentAvailable = facts.environment != null
+                currentEnvironment = facts.environment
                 renderRuntime(AgentCallRuntime.status.value)
             } finally {
                 refreshing.set(false)
@@ -287,7 +292,7 @@ class MainActivity : AppCompatActivity() {
             status.blockers.isEmpty() -> getString(R.string.main_note_no_blockers)
             else -> getString(
                 R.string.main_note_blockers,
-                status.blockers.joinToString("；") { StatusText.blocker(it) },
+                status.blockers.joinToString("；") { StatusText.blocker(it, resources) },
             )
         }
         val error = errorText(status)
@@ -322,17 +327,18 @@ class MainActivity : AppCompatActivity() {
 
     private fun sessionText(status: AgentCallStatus): String {
         val session = status.activeSession
-        val state = StatusText.sessionState(status.sessionState)
+        val state = StatusText.sessionState(status.sessionState, resources)
         return if (session == null) state else state + " · " + session.callId
     }
 
     private fun errorText(status: AgentCallStatus): String? {
-        val handback = StatusText.handback(status.lastHandback)
+        // 报告本身已绑定会话、并在新会话第一个状态时清空，因此这里不会再显示上一通电话的结果。
+        val handback = status.lastHandback?.let { StatusText.handback(it.code, resources) }
         val error = status.lastError
         return when {
             handback != null && error == null -> handback
-            handback != null && error != null -> handback + "；" + StatusText.takeoverRejection(error)
-            error != null -> StatusText.takeoverRejection(error)
+            handback != null && error != null -> handback + "；" + StatusText.takeoverRejection(error, resources)
+            error != null -> StatusText.takeoverRejection(error, resources)
             else -> null
         }
     }
@@ -340,8 +346,8 @@ class MainActivity : AppCompatActivity() {
     private fun hookText(): String {
         val status = bridgeStatus ?: return getString(R.string.main_hook_unknown)
         return when (status.hookConnected) {
-            HookPresence.PRESENT -> StatusText.hookPresence(HookPresence.PRESENT)
-            HookPresence.ABSENT -> StatusText.hookPresence(HookPresence.ABSENT)
+            HookPresence.PRESENT -> StatusText.hookPresence(HookPresence.PRESENT, resources)
+            HookPresence.ABSENT -> StatusText.hookPresence(HookPresence.ABSENT, resources)
             HookPresence.UNKNOWN -> getString(R.string.main_hook_unknown)
         }
     }
@@ -363,19 +369,16 @@ class MainActivity : AppCompatActivity() {
 
     private fun calibrationText(): String {
         val record = evidence?.record() ?: return getString(R.string.main_calibration_unverified)
-        if (!record.allVerified) {
-            val missing = if (!environmentAvailable) {
-                getString(R.string.main_calibration_environment_missing)
-            } else {
-                getString(R.string.main_calibration_unverified)
-            }
-            return missing
+        // “已验证”必须经 core 的 CalibrationPolicy：API 36 / 环境变化 / 证据不完整都不算。
+        if (CalibrationVerdict.canAutoAnswer(record, currentEnvironment)) {
+            return getString(R.string.main_calibration_verified)
         }
-        val environment = record.environment
-        if (environment == null) return getString(R.string.main_calibration_environment_missing)
-        val policyAllows = CalibrationPolicy.canAutoAnswer(environment, record.toEvidence()!!)
-        return getString(R.string.main_calibration_verified) +
-            if (policyAllows) "" else "（" + getString(R.string.main_calibration_environment_missing) + "）"
+        if (!record.allVerified) return getString(R.string.main_calibration_unverified)
+        return if (currentEnvironment == null || record.environment == null) {
+            getString(R.string.main_calibration_environment_missing)
+        } else {
+            getString(R.string.main_calibration_policy_blocked)
+        }
     }
 
     private data class BridgeFacts(
@@ -387,5 +390,8 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val REQUEST_NOTIFICATIONS = 1001
+
+        /** 页面关闭连接的有界收尾（本地 socket 关闭，不应阻塞 UI）。 */
+        private const val CLOSE_TIMEOUT_MS: Long = 2_000L
     }
 }

@@ -49,7 +49,7 @@ class CallNotification(private val context: Context) {
 
     /** 会话通知：带“我来接听”action，target 绑定 [id]。 */
     fun call(status: AgentCallStatus, id: SessionId): Notification {
-        val state = StatusText.sessionState(status.sessionState)
+        val state = StatusText.sessionState(status.sessionState, context.resources)
         val text = context.getString(R.string.notification_call_text, state)
         return base(status, title = context.getString(R.string.notification_call_title))
             .setContentText(text)
@@ -86,7 +86,7 @@ class CallNotification(private val context: Context) {
         if (status.blockers.isEmpty()) {
             return context.getString(R.string.notification_blocked_pending)
         }
-        return status.blockers.joinToString("；") { StatusText.blocker(it) }
+        return status.blockers.joinToString("；") { StatusText.blocker(it, context.resources) }
     }
 
     private fun contentIntent(): PendingIntent {

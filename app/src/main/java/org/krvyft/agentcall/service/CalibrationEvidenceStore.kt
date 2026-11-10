@@ -7,6 +7,7 @@ import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import org.krvyft.agentcall.core.model.CalibrationEvidence
 import org.krvyft.agentcall.core.model.EnvironmentKey
+import org.krvyft.agentcall.core.policy.CalibrationPolicy
 
 /**
  * 校准页的五个人工测试步骤（spec §9）。顺序固定，UI 与存储共用。
@@ -68,6 +69,28 @@ data class CalibrationRecord(
             completed = emptySet(),
             calibratedAtMs = 0L,
         )
+    }
+}
+
+/**
+ * 校准页/主页的“已验证”裁决（Task 7B2 FIX ROUND 1，spec §9）。
+ *
+ * 本机记录只说明“用户勾选过五步”，**不是**自动接听资格：必须再走 core 的
+ * [CalibrationPolicy]——它会拒绝 API 36（不继承校准）、环境不一致/不完整与缺失的证据。
+ * 任何展示“已验证”的路径都必须经过这里，不能只看 [CalibrationRecord.allVerified]。
+ */
+object CalibrationVerdict {
+
+    /**
+     * @param record 本机记录的校准进度
+     * @param environment 当前设备实际环境（diagnose 的结果）；null 表示无法取得
+     * @return true 仅当证据绑定同一个受支持环境并通过 [CalibrationPolicy]
+     */
+    fun canAutoAnswer(record: CalibrationRecord, environment: EnvironmentKey?): Boolean {
+        if (environment == null) return false
+        if (record.environment != environment) return false
+        val evidence = record.toEvidence() ?: return false
+        return CalibrationPolicy.canAutoAnswer(environment, evidence)
     }
 }
 

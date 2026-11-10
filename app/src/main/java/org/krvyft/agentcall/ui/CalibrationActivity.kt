@@ -11,13 +11,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import org.krvyft.agentcall.R
 import org.krvyft.agentcall.core.model.EnvironmentKey
 import org.krvyft.agentcall.service.BridgeDiagnostics
 import org.krvyft.agentcall.service.CalibrationEvidenceStore
 import org.krvyft.agentcall.service.CalibrationManualStep
+import org.krvyft.agentcall.service.CalibrationVerdict
 import org.krvyft.agentcall.service.EnvironmentResult
 
 /**
@@ -76,8 +76,11 @@ class CalibrationActivity : AppCompatActivity() {
     override fun onDestroy() {
         val diagnosticsClient = diagnostics
         diagnostics = null
-        runBlocking { runCatching { diagnosticsClient?.close() } }
-        scope.cancel()
+        // 关闭是本地 IO：不在主线程 runBlocking；关闭完成后才取消页面 scope。
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
+            runCatching { diagnosticsClient?.close() }
+            scope.cancel()
+        }
         super.onDestroy()
     }
 
@@ -109,10 +112,8 @@ class CalibrationActivity : AppCompatActivity() {
 
     private fun render() {
         val record = store.record()
-        val verified = record.allVerified &&
-            environment != null &&
-            record.environment == environment &&
-            record.toEvidence() != null
+        // 必须走 CalibrationPolicy：API 36、环境不匹配或证据不完整都不能显示“已验证”。
+        val verified = CalibrationVerdict.canAutoAnswer(record, environment)
         val environmentText = when {
             environment != null -> getString(R.string.calibration_environment_available, environment!!.apiLevel)
             environmentError != null -> getString(R.string.calibration_environment_unavailable, environmentError)
