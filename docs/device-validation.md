@@ -3,15 +3,15 @@
 - 依据：`docs/superpowers/specs/2026-11-10-agentcall-design.md` §8（会话状态与故障恢复）、§9（音频与校准）。
 - 范围：受限通话音频提取/注入、PCM16 单声道与重采样、麦克风隔离、心跳故障终止、人工接管、特权 Telecom 终止、持久校准证据。
 - 记录时间：2026-11-11（Asia/Shanghai）。
-- 最终代码 HEAD：`1776ba4`（`master`）。
+- 最终代码 HEAD：`438cbbd`（`master`）。
 - **当前结论：本文件所有验证项均为「未验证」。没有任何一行被真机执行过，也没有任何一行被标记为「已验证」。**
   交付时没有连接设备（`adb devices` 为空），用户也明确禁止设备侧验证。
 - JVM 单元测试（`:core:testDebugUnitTest`、`:bridge:testDebugUnitTest`）只证明无设备可测的逻辑；它们不是、也不能代替任何一行真机结论。
 
-## 当前状态（HEAD `1776ba4`，2026-11-11）
+## 当前状态（HEAD `438cbbd`，2026-11-11）
 
-- 最终本地矩阵（HEAD `1776ba4`）：225 个 Gradle task，BUILD SUCCESSFUL；JVM core 126 /
-  bridge 354 / app 359，合计 **839**，0 failures / 0 errors / 0 skipped；lint 0 errors /
+- 最终本地矩阵（HEAD `438cbbd`）：225 个 Gradle task，BUILD SUCCESSFUL；JVM core 126 /
+  bridge 360 / app 359，合计 **845**，0 failures / 0 errors / 0 skipped；lint 0 errors /
   15 warnings；WebUI node 115/115；Python 59/59。release APK 与模块 ZIP 已在该 HEAD
   重新打包（大小与 SHA-256 见 `docs/verification.md` 4.5）。
 - **交付时 `adb devices` 为空，没有设备连接。** 实现期间曾只读观察到 XQ-DQ72（API 37），
@@ -369,8 +369,8 @@ adb shell grep @org.krvyft.agentcall.control /proc/net/unix \
 
 ## 7. 任务 5 的 JVM 证据（不是真机证据）
 
-> 本节的 108 / 161 是任务 5 当时的历史计数；当前（HEAD `1776ba4`）的计数是
-> core 126 / bridge 354 / app 359，合计 839，见 `docs/verification.md`。本节保留历史记录，
+> 本节的 108 / 161 是任务 5 当时的历史计数；当前（HEAD `438cbbd`）的计数是
+> core 126 / bridge 360 / app 359，合计 845，见 `docs/verification.md`。本节保留历史记录，
 > 不用它冒充最终数字。
 
 已执行（可复现）：
@@ -393,9 +393,9 @@ BUILD SUCCESSFUL
 - 自动接听仍被两道 fail-closed 闸门关闭：**校准记录** + `UnverifiedCallIdentityVerifier`
   不可用（`blocksAutoAnswer=true`）。因此真机上监督端当前不会拥有任何 AI 通话；D06/D09 需要
   先完成 D10 的身份核验与 D12 校准。校准写入通道已经存在：root CLI `calibrate` →
-  `calibration.record`（仅 CLI_ROOT）；环境只有 frameworkVersion/simCarrier 由桥接真实观测，
-  transport/route 没有任何观测路径、始终 UNKNOWN，只能由 root 背书（frameworkVersion/
-  simCarrier 观测不到时同样背书）。**但这两道闸门是产品阻塞项，不是单纯的设备缺口**：即使校准记录齐全，没有设备
+  `calibration.record`（仅 CLI_ROOT）；十个环境字段中六个由桥接真实观测，四个可背书字段里
+  frameworkVersion/simCarrier 有真实观测源、只在观测不到时才由 root 背书，transport/route
+  则从不观测、始终 UNKNOWN、只能由 root 背书。**但这两道闸门是产品阻塞项，不是单纯的设备缺口**：即使校准记录齐全，没有设备
   验证过的、按身份定位的特权 Telecom 终止路径，自动接听也不会开启。五项人工测试与背书都
   尚未在真机执行，D12 仍未验证，见 `docs/verification.md` 5.3。
 - **APK 只有 debug 签名**（`CN=Android Debug`），不可分发；必须用发布密钥重签并重生成

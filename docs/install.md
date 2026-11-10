@@ -2,8 +2,8 @@
 
 本文描述 AgentCall 的安装范围、配对、配置、校准、升级与卸载。**所有真机步骤均为「未验证」**：
 交付时 `adb devices` 为空，本仓库没有真机 Google 电话、KernelSU WebView 或音频证据；
-用户也明确禁止设备侧验证。最终本地矩阵（HEAD `1776ba4`）通过：JVM 单测 **839**
-（core 126 / bridge 354 / app 359，0 failures / 0 errors / 0 skipped）、lint 0 errors /
+用户也明确禁止设备侧验证。最终本地矩阵（HEAD `438cbbd`）通过：JVM 单测 **845**
+（core 126 / bridge 360 / app 359，0 failures / 0 errors / 0 skipped）、lint 0 errors /
 15 warnings；release APK 与模块 ZIP 已在该 HEAD 上重新打包（大小与 SHA-256 见第 1 节）。
 标注「未验证」的条目仍不能当作已可用。
 
@@ -17,11 +17,11 @@
 | `dist/agentcall-<version>.apk` | AgentCall APK（Xposed 模块 + 远程语音回合） |
 | `dist/SHA256SUMS` | 两个产物的 SHA-256 |
 
-最终打包（代码 HEAD `1776ba4`，在最后的 bridge/module 修复之后重新构建；以
-`dist/SHA256SUMS` 为准）：`agentcall-1.0.zip` 1,405,356 B（11 个条目），SHA-256
-`e5660f58b8fd6d3b0eddd61fdc6e0fff52e4254de596c4e1dc63b0a691b34608`；
+最终打包（代码 HEAD `438cbbd`，在最后的 bridge/module 修复之后重新构建；以
+`dist/SHA256SUMS` 为准）：`agentcall-1.0.zip` 1,405,746 B（11 个条目），SHA-256
+`31eedd1fd4ca99571b7267e181624f00eafdf53022e1d2415ed11a20828c19a4`；
 `agentcall-1.0.apk` 2,274,772 B，SHA-256
-`b9834fe4ffec28f0872089fc0313bff4d61994e68e989421797d27f0f2e6e1ff`。
+`8fd9332de246baf31154f83ca5fc7bfe48e41e28d676023aeadd108e135e0dc6`。
 `python3 tools/check_package.py --dist dist` 输出 `Status: PASS`：appId
 `org.krvyft.agentcall`、版本 1.0 (1)、`module.prop` 1.0 (1)、dex `classes.dex`、
 结构 module=1/scripts=3/bridge=2/bin=1/webroot=4。
@@ -208,14 +208,18 @@ verified && environmentComplete && environmentMatchesEvidence`；`supportedApiLe
 桥接证据的唯一写入通道是 root CLI 的固定命令 `calibrate`（`calibration.record` RPC）：
 JSON 只从 stdin 进入，argv 携带负载会在启动 CLI 前以 `usage_invalid` 拒绝。
 
-环境事实只有两项由桥接观测：`frameworkVersion` 依次读 root SystemProperties
+十个环境字段中，`apiLevel`、`romFingerprint`、`kernelVersion`、
+`dialerPackageVersion`、`bridgeVersion`、`audioPolicyDigest` 由桥接真实观测；
+四个可背书字段中，`frameworkVersion` 依次读 root SystemProperties
 （`ro.lsposed.version` / `persist.sys.lsposed.version` / `ro.vector.version` /
 `persist.sys.vector.version` / `ro.edxposed.version` / `persist.sys.edxposed.version`），再读
 `/data/adb/modules/{lsposed,zygisk_lsposed,vector}/module.prop` 的 `version=`，最后做
-XposedBridge 类检查（接受 `getXposedVersion()` 的 int 或 String 返回值）；`simCarrier` 先取
-TelephonyManager 的 SIM 运营商名，再回退 `gsm.sim.operator.alpha` /
-`gsm.sim.operator.default-name` / `ro.cdma.home.operator.alpha`。
-`transport`/`route` 没有任何观测路径（`PlatformFacts.transport()`/`route()` 默认即
+XposedBridge 类检查（只接受 `getXposedVersion()` 的 int/long/String：整数且为正、long 不超过
+`Int.MAX_VALUE`，Double/NaN/负数/零/溢出一律视为未知；String 有界 ≤128、无控制字符、非
+UNKNOWN）；`simCarrier` 先取 TelephonyManager 的 SIM 运营商名，再回退
+`gsm.sim.operator.alpha` / `gsm.sim.operator.default-name` /
+`ro.cdma.home.operator.alpha`；两者观测不到时才由 root 背书。
+`transport`/`route` 则**从不观测**（`PlatformFacts.transport()`/`route()` 默认即
 `UNKNOWN`，DeviceProbe 只调用它们），因此始终为 `UNKNOWN`，只能在 `calibrate` 时由 root
 操作员背书；设备测试者不能把它们当作观测项验证。任何观测到的已知值都优先于背书。
 
@@ -278,7 +282,7 @@ su -c 'rm -f /data/adb/agentcall/inbox/calibration.json'
   effective environment）的任一字段未知时返回 `calibration_environment_unknown`，与预期
   不一致时返回 `calibration_environment_mismatch`，两者都整体拒绝、绝不假装已验证。
 - 校准存储未接线时返回 `calibration_unavailable`。
-- 字段名、词表与最终语义以 HEAD `1776ba4` 与 `docs/config-schema.md` 为准。
+- 字段名、词表与最终语义以 HEAD `438cbbd` 与 `docs/config-schema.md` 为准。
 - **产品阻塞项**：即使校准记录齐全，默认 `UnverifiedCallIdentityVerifier` 仍无法按通话
   身份核验，保持 `blocksAutoAnswer=true`；不存在设备验证过的、按身份定位的特权 Telecom
   终止路径。因此自动接听仍保持关闭（`calibration_not_verified`）。
@@ -291,7 +295,7 @@ su -c /data/adb/modules/agentcall/bin/agentcallctl diagnose
 
 **未验证**：`calibrate` 的 stdin 继承、frameworkVersion/simCarrier 的真实观测（root
 SystemProperties、模块 `module.prop`、XposedBridge 类检查、TelephonyManager/telephony 属性）
-与五项人工测试本身的设备行为均未上机；`transport`/`route` 没有任何观测路径、始终为
+与五项人工测试本身的设备行为均未上机；`transport`/`route` 从不观测、始终为
 `UNKNOWN`，只能由 root 背书。
 校准通道已能在文档所述的 LSPosed/Vector + KernelSU 栈上补齐环境，但这不等于设备验证；
 在真机完成校准前，产物一律按
@@ -418,10 +422,10 @@ AI 会话，等待人工处理。恢复路径：
 | 步骤 | 状态 |
 | --- | --- |
 | 模块 ZIP 结构、DEX 入口、版本、SHA-256、密钥泄漏检查 | 本地已验证（`make package-check`） |
-| 最终矩阵（HEAD `1776ba4`） | 本地 PASS：225 个 Gradle task；JVM 839（core 126 / bridge 354 / app 359，0 failures / 0 errors / 0 skipped）、lint 0 errors / 15 warnings；APK/ZIP 已在该 HEAD 重新打包（哈希见第 1 节） |
-| JVM/JS/Python/脚本检查 | JVM 839；WebUI node 115/115；Python 59/59；`sh -n` 模块脚本通过；`make test` / `make build` / `make package-check` 全 PASS |
+| 最终矩阵（HEAD `438cbbd`） | 本地 PASS：225 个 Gradle task；JVM 845（core 126 / bridge 360 / app 359，0 failures / 0 errors / 0 skipped）、lint 0 errors / 15 warnings；APK/ZIP 已在该 HEAD 重新打包（哈希见第 1 节） |
+| JVM/JS/Python/脚本检查 | JVM 845；WebUI node 115/115；Python 59/59；`sh -n` 模块脚本通过；`make test` / `make build` / `make package-check` 全 PASS |
 | release 收缩（R8） | 本地已验证：`packageScope = setOf("**")`，mapping 99,205 行，release 未签名 APK 2.18 MB（debug 重签 2.27 MB）；**真机未验证** |
-| 配对（WebUI/root CLI）与 APK 校准/诊断界面 | 已实现；root CLI `calibrate` 经 `calibration.record` 写入五项人工证据；环境只有 frameworkVersion/simCarrier 有真实观测源，transport/route 没有任何观测路径、始终为 UNKNOWN，只能由 root 操作员在 calibrate 时背书（frameworkVersion/simCarrier 观测不到时同样背书）；APP 就绪另需 `calibration.read` 的 supported/verified/environmentComplete/environmentMatchesEvidence（supportedApiLevel 是策略常量 `CalibrationPolicy.SUPPORTED_API_LEVEL`=37，不是设备 API 等级；API 36 因 `API_LEVEL_UNSUPPORTED` 保持阻断；真机探针与五项实测未验证，见第 7 节） |
+| 配对（WebUI/root CLI）与 APK 校准/诊断界面 | 已实现；root CLI `calibrate` 经 `calibration.record` 写入五项人工证据；十个环境字段中六个（apiLevel、romFingerprint、kernelVersion、dialerPackageVersion、bridgeVersion、audioPolicyDigest）由桥接观测；四个可背书字段里 frameworkVersion/simCarrier 有真实观测源、只在观测不到时才由 root 背书，transport/route 则从不观测、始终为 UNKNOWN、只能在 calibrate 时由 root 背书；APP 就绪另需 `calibration.read` 的 supported/verified/environmentComplete/environmentMatchesEvidence（supportedApiLevel 是策略常量 `CalibrationPolicy.SUPPORTED_API_LEVEL`=37，不是设备 API 等级；API 36 因 `API_LEVEL_UNSUPPORTED` 保持阻断；真机探针与五项实测未验证，见第 7 节） |
 | 优雅关闭停止顺序（先取 stop.lock、shutdown、后停音频工作进程、再 TERM→KILL） | 本地宿主已验证（`shutdown-order.test.mjs`、`module-scripts.test.mjs` 进程/CLI 替身，含并发锁等待）；**真机未验证** |
 | 关闭裁决/隔离读回与未确认警告（service.sh + uninstall.sh） | 本地宿主已验证（shutdown 响应与最终 status 探测的隔离读回、`! microphone_still_isolated`）；**真机 KernelSU 卸载时序未验证** |
 | `agentcallctl restart` 关闭裁决拒绝 | 本地宿主已验证（clean=false、mic 仍隔离、裁决缺失都返回 `restart_refused` 并收回标记）；**真机未验证** |
@@ -435,9 +439,9 @@ AI 会话，等待人工处理。恢复路径：
 | 双卡、VoWiFi、蓝牙 | **未验证**，未测组合不启用 |
 
 结论：安装步骤按设计写成，但**除本地构建/打包/结构检查与宿主测试替身外，没有真机证据**；
-交付时也没有设备连接。root CLI `calibrate` 已提供桥接校准写入通道，环境事实可由桥接真实
-观测只有 frameworkVersion/simCarrier 两项；`transport`/`route` 没有任何观测路径、始终为
-UNKNOWN，只能由 root 背书（frameworkVersion/simCarrier 观测不到时同样背书）；但真实环境
+交付时也没有设备连接。root CLI `calibrate` 已提供桥接校准写入通道：十个环境字段中六个
+由桥接真实观测；四个可背书字段里 frameworkVersion/simCarrier 有真实观测源、只在观测不到
+时才由 root 背书，`transport`/`route` 则从不观测、始终为 UNKNOWN、只能由 root 背书；但真实环境
 探针、五项人工测试、优雅关闭的麦克风恢复读回与 KernelSU 卸载时序都未上机。
 **剩余产品阻塞项（不是单纯的设备缺口）**：即使校准记录齐全，按通话身份定位的特权 Telecom
 终止路径仍不存在（`UnverifiedCallIdentityVerifier` 保持 `blocksAutoAnswer=true`），自动接听

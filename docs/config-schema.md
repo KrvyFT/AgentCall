@@ -342,7 +342,9 @@ root 背书只能填补桥接观测不到的 `frameworkVersion`/`simCarrier`，�
 `persist.sys.lsposed.version`/`ro.vector.version`/`persist.sys.vector.version`/
 `ro.edxposed.version`/`persist.sys.edxposed.version`）、
 `/data/adb/modules/{lsposed,zygisk_lsposed,vector}/module.prop` 的 `version=`、XposedBridge
-类检查（接受 `getXposedVersion()` 的 int/String 返回值）；`simCarrier` 读 TelephonyManager
+类检查（只接受 `getXposedVersion()` 的 int/long/String 返回值：整数且为正、long 不超过
+`Int.MAX_VALUE`；Double/Float/NaN/负数/零/溢出、String 超长/含控制字符/为 `UNKNOWN` 一律
+视为未知）；`simCarrier` 读 TelephonyManager
 SIM 运营商名并回退
 `gsm.sim.operator.alpha`/`gsm.sim.operator.default-name`/`ro.cdma.home.operator.alpha`。未知或
 不一致环境整体拒绝。校准存储未接线时返回 `calibration_unavailable`，绝不假装已验证。

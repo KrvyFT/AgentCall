@@ -4,15 +4,18 @@ AgentCall 在不替换 Google 电话（`com.google.android.dialer`）的前提�
 Xposed Hook 观察来电与通话状态，AgentCall APK 完成远程 ASR / LLM / TTS 语音回合，KernelSU 模块里的
 `app_process` 特权桥执行 Telecom 控制、音频注入、root 侧配置与中文 WebUI。
 
-> **状态：本地构建与验收矩阵通过，不等于可用。** 最终矩阵（HEAD `1776ba4`）JVM 单测
-> core 126 / bridge 354 / app 359（合计 **839**，0 failures / 0 errors / 0 skipped），
+> **状态：本地构建与验收矩阵通过，不等于可用。** 最终矩阵（HEAD `438cbbd`）JVM 单测
+> core 126 / bridge 360 / app 359（合计 **845**，0 failures / 0 errors / 0 skipped），
 > lint 0 errors / 15 warnings；release APK 与模块 ZIP 已在该 HEAD 上重新打包（大小与
 > SHA-256 见下）。但**没有真机证据**：交付时 `adb devices` 为空，设备侧一行都没跑；
-> 配对（WebUI/root CLI）、root CLI `calibrate` 与 APK 校准/诊断界面已实现。校准环境有两项
-> 可由桥接真实观测（`frameworkVersion` 读 root SystemProperties 与模块 `module.prop` 的
-> `version=`，`simCarrier` 读 TelephonyManager 的 SIM 运营商名与 telephony 属性）；
-> `transport`/`route` 没有任何观测路径，始终为 UNKNOWN，只能在 `calibrate` 时由 root
-> 操作员背书（`frameworkVersion`/`simCarrier` 观测不到时同样由 root 背书）。**但仍有产品阻塞项（不是单纯的设备缺口）**：自动接听需要校准记录**且**需要设备
+> 配对（WebUI/root CLI）、root CLI `calibrate` 与 APK 校准/诊断界面已实现。校准环境的十个
+> 字段中，`apiLevel`、`romFingerprint`、`kernelVersion`、`dialerPackageVersion`、
+> `bridgeVersion`、`audioPolicyDigest` 由桥接真实观测；四个可背书字段里 `frameworkVersion`
+> （root SystemProperties、模块 `module.prop` 的 `version=`、XposedBridge 类检查的
+> int/long/String）与 `simCarrier`（TelephonyManager 的 SIM 运营商名与 telephony 属性）
+> 有真实观测源，只在观测不到时才由 root 背书；`transport`/`route` 则**从不观测**（始终
+> UNKNOWN），只能在 `calibrate` 时由 root 操作员背书。
+> **但仍有产品阻塞项（不是单纯的设备缺口）**：自动接听需要校准记录**且**需要设备
 > 验证过的、按通话身份定位的特权 Telecom 终止路径（`UnverifiedCallIdentityVerifier`
 > 保持 `blocksAutoAnswer=true`）；APK 只有 debug 签名、不可分发。生产就绪仍为
 > `NOT_READY`（`calibration_not_verified`），设备验收（spec §12）全部待做，见「状态与边界」与
@@ -93,12 +96,12 @@ python3 tools/check_package.py    # 失败即非零退出
   apksigner 的 v4 `.idsig` 旁文件不生成（不属于发布物）。
 - `dist/SHA256SUMS`：`sha256sum` 兼容格式。
 
-最终打包产物（在 HEAD `1776ba4` 的最终代码改动之后重新构建；`dist/` 不提交）：
+最终打包产物（在 HEAD `438cbbd` 的最终代码改动之后重新构建；`dist/` 不提交）：
 
 | 文件 | 大小 | SHA-256 |
 | --- | --- | --- |
-| `dist/agentcall-1.0.zip` | 1,405,356 B（11 个条目） | `e5660f58b8fd6d3b0eddd61fdc6e0fff52e4254de596c4e1dc63b0a691b34608` |
-| `dist/agentcall-1.0.apk` | 2,274,772 B | `b9834fe4ffec28f0872089fc0313bff4d61994e68e989421797d27f0f2e6e1ff` |
+| `dist/agentcall-1.0.zip` | 1,405,746 B（11 个条目） | `31eedd1fd4ca99571b7267e181624f00eafdf53022e1d2415ed11a20828c19a4` |
+| `dist/agentcall-1.0.apk` | 2,274,772 B | `8fd9332de246baf31154f83ca5fc7bfe48e41e28d676023aeadd108e135e0dc6` |
 | `dist/SHA256SUMS` | 168 B | 与上面两行一致 |
 
 APK 由本机 debug keystore 签名（`CN=Android Debug`，证书 SHA-256
@@ -156,7 +159,7 @@ manifest，打包与 `check_package.py` 都拿容器与 manifest 比对（名称
 
 | 范围 | 状态 |
 | --- | --- |
-| JVM 单测（core/bridge/app） | 最终本地矩阵（HEAD `1776ba4`）：126 / 354 / 359，合计 **839**，0 failures / 0 errors / 0 skipped |
+| JVM 单测（core/bridge/app） | 最终本地矩阵（HEAD `438cbbd`）：126 / 360 / 359，合计 **845**，0 failures / 0 errors / 0 skipped |
 | WebUI node 测试、Python 打包测试、模块脚本语法 | 本地已验证：node 115/115、Python 59/59、`sh -n` 通过 4 个模块脚本 |
 | `:app:lintDebug` | 本地已验证：SUCCESSFUL，0 errors、15 warnings（13 条既有告警 + 2 条 `UseKtx`） |
 | R8（release） | 启用：`packageScope = setOf("**")`，release mapping 约 99,205 行；release 未签名 APK 2.18 MB（debug 重签交付 2.27 MB） |
@@ -166,7 +169,7 @@ manifest，打包与 `check_package.py` 都拿容器与 manifest 比对（名称
 | 音频 downlink/uplink、麦克风隔离、真实 Google 电话 | **未验证**（无设备证据，不宣称可用） |
 | 人工接管、故障终止、锁屏/重启握手 | **未验证** |
 | KernelSU 真机安装、WebView WebUI、`ksu.io` 路径 | **未验证**（无真机） |
-| 配对（WebUI/root CLI）与 APK 校准/诊断界面 | 已实现；root CLI `calibrate` 经 `calibration.record` 写入五项人工证据。环境只有 frameworkVersion/simCarrier 有真实观测源；transport/route 没有任何观测路径、始终为 UNKNOWN，只能由 root 操作员在 calibrate 时背书（frameworkVersion/simCarrier 观测不到时同样背书）。APP 就绪要求 `calibration.read` 的 available && supportedApiLevel==37 && verified && environmentComplete && environmentMatchesEvidence，再叠加本机 `CalibrationPolicy`；`supportedApiLevel` 是策略常量 `CalibrationPolicy.SUPPORTED_API_LEVEL`（37），不是设备 API 等级——API 36 会因 `verified=false` 且 blockers 含 `API_LEVEL_UNSUPPORTED` 保持阻断。读取失败/未知一律 false（`calibration_unavailable`），不缓存旧 true。真机证据仍缺失，自动接听保持关闭（`calibration_not_verified`） |
+| 配对（WebUI/root CLI）与 APK 校准/诊断界面 | 已实现；root CLI `calibrate` 经 `calibration.record` 写入五项人工证据。十个环境字段中六个（apiLevel、romFingerprint、kernelVersion、dialerPackageVersion、bridgeVersion、audioPolicyDigest）由桥接观测；四个可背书字段里 frameworkVersion/simCarrier 有真实观测源、只在观测不到时才由 root 背书，transport/route 则从不观测、始终为 UNKNOWN、只能在 calibrate 时由 root 背书。APP 就绪要求 `calibration.read` 的 available && supportedApiLevel==37 && verified && environmentComplete && environmentMatchesEvidence，再叠加本机 `CalibrationPolicy`；`supportedApiLevel` 是策略常量 `CalibrationPolicy.SUPPORTED_API_LEVEL`（37），不是设备 API 等级——API 36 会因 `verified=false` 且 blockers 含 `API_LEVEL_UNSUPPORTED` 保持阻断。读取失败/未知一律 false（`calibration_unavailable`），不缓存旧 true。真机证据仍缺失，自动接听保持关闭（`calibration_not_verified`） |
 | 双卡、VoWiFi、蓝牙 | **未验证**，未测组合不启用 |
 | **产品阻塞项**：按通话身份定位的特权 Telecom 终止 | **不存在**：`UnverifiedCallIdentityVerifier` 保持 `blocksAutoAnswer=true`；即使校准记录齐全，自动接听也不会开启 |
 | **产品阻塞项**：APK 签名 | 仅 debug 签名（`CN=Android Debug`），不可分发；必须用发布密钥重签并重生成 `SHA256SUMS` |
