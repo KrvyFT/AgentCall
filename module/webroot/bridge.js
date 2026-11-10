@@ -28,7 +28,9 @@
   var INBOX_PATH = INBOX_DIR + "/config-set.json";
   var LOG_PATH = DATA_ROOT + "/logs/service.log";
   var MODULE_DIR_PATTERN = /^\/data\/adb\/modules\/[A-Za-z][A-Za-z0-9._-]+$/;
-  var OPERATIONS = ["status", "config-get", "config-set", "pair", "diagnose", "shutdown"];
+  // restart 是模块侧控制动作：agentcallctl 写重启请求后执行固定 CLI shutdown，
+  // 由 service.sh 在本次开机的有限循环内重新拉起。它不是 AgentCallCli 的 RPC。
+  var OPERATIONS = ["status", "config-get", "config-set", "pair", "diagnose", "shutdown", "restart"];
   /** 与 AgentCallCli.MAX_STDIN_BYTES 一致：控制帧 64 KiB 预留 1 KiB。 */
   var CONFIG_WRITE_LIMIT_BYTES = 64 * 1024 - 1024;
   var COMMAND_TIMEOUT_MS = 20000;
@@ -90,7 +92,7 @@
     bridge_unavailable: "未检测到 KernelSU 管理器的桥接接口（普通浏览器或未注入）。当前为只读演示状态，无法保存。",
     secret_transport_unsupported: "当前管理器不提供受控文件写入接口，无法在不暴露密钥的前提下提交配置，已拒绝保存。",
     module_dir_unresolved: "无法确认模块安装目录，已拒绝执行任何命令。",
-    unsupported_operation: "只允许 status/config-get/config-set/pair/diagnose/shutdown 六条固定命令。",
+    unsupported_operation: "只允许 status/config-get/config-set/pair/diagnose/shutdown/restart 七条固定命令。",
     payload_not_allowed: "该命令不接受参数。",
     payload_invalid: "请求内容不符合后端固定字段表，已被拒绝。",
     transport_failed: "无法连接 AgentCall 桥接服务（未启动或已退出）。",
@@ -114,6 +116,10 @@
     forbidden: "当前角色无权调用该命令。",
     usage_invalid: "命令用法不正确。",
     response_id_mismatch: "响应与请求不匹配，已丢弃。",
+    service_not_running: "service.sh 不在运行：本次开机内已没有重启循环，只能重启设备或重新启用模块。",
+    module_disabled: "模块已被禁用或标记移除：不会重启桥接。",
+    restart_unconfirmed: "桥接没有接受重启请求（可能已退出或不可达），本次没有重启；请刷新状态后再试。",
+    restart_request_failed: "无法写入 root 私有重启请求，本次没有重启。",
   };
 
   // ---------------------------------------------------------------- 通用工具

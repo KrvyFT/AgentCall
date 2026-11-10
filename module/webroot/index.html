@@ -340,11 +340,13 @@
       <div class="card-label">服务操作</div>
       <div class="actions actions-wrap">
         <button type="button" class="btn btn-secondary btn-small" id="diag-refresh">重试连接</button>
+        <button type="button" class="btn btn-secondary btn-small" id="diag-retry-service" disabled>重试服务</button>
         <button type="button" class="btn btn-secondary btn-small" id="diag-repair">重新配对</button>
         <button type="button" class="btn btn-secondary btn-small" id="diag-reload">重新加载配置</button>
         <button type="button" class="btn btn-warn btn-small" id="diag-disable">停用自动接管</button>
         <button type="button" class="btn btn-danger btn-small" id="diag-shutdown">关闭桥接服务</button>
       </div>
+      <p class="card-hint" id="diag-retry-note">“重试服务”执行固定命令 <code>agentcallctl restart</code>：写入 root 私有重启请求，再让桥接干净退出，由 <code>service.sh</code> 在本次开机的有限循环内重新拉起（用于桥接进入 BLOCKED 后的恢复）。它不执行任意 shell、不接受参数；演示态或模块目录不可信时禁用。</p>
     </div>
 
     <div class="card">

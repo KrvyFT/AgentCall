@@ -424,3 +424,46 @@ test("saveEnabledOnly 在 state.form 缺失时也不抛错（Minor 守卫）", a
   const payload = JSON.parse(fake.writes[0].text);
   assert.deepEqual(payload, { expectedRevision: 4, patch: { enabled: true } });
 });
+
+
+test("诊断页重试服务：真实桥接时只发固定 agentcallctl restart（无任意 shell/参数）", async () => {
+  const holder = {};
+  const handlers = defaultHandlers(holder);
+  handlers.restart = () => ({ errno: 0, stdout: JSON.stringify({ restart: "requested" }), stderr: "" });
+  const fake = fakeManager({ handlers });
+  holder.current = fake;
+  const { doc } = await boot({ fake });
+
+  const button = doc.getElementById("diag-retry-service");
+  assert.equal(button.disabled, false, "真实桥接时重试服务必须可用");
+  button.click();
+  const actions = doc.getElementById("banner-actions");
+  assert.ok(actions.children.length >= 1, "重试服务必须二次确认，避免误中断");
+  actions.children[0].click();
+  await tick(30);
+
+  const retryCommands = fake.commands.filter((command) => /\srestart$/.test(command));
+  assert.deepEqual(retryCommands, [CTL + " restart"], "只允许固定模块命令 agentcallctl restart");
+  assert.equal(fake.commands[fake.commands.length - 1], CTL + " restart", "重试服务必须是最后一次固定命令");
+  for (const command of fake.commands) {
+    assert.equal(/[;&|]/.test(command), false, "不得拼接任意 shell：" + command);
+  }
+  assert.match(doc.getElementById("toast").textContent, /重启/);
+});
+
+test("诊断页重试服务：演示态（无真实桥接）保持禁用且点击不发命令", async () => {
+  const { doc, app } = await boot({});
+  const button = doc.getElementById("diag-retry-service");
+  assert.equal(app.bridge.mode, "demo");
+  assert.equal(button.disabled, true, "演示态重试服务必须禁用（诚实 disabled 状态）");
+  button.click();
+  await tick(20);
+  assert.match(doc.getElementById("toast").textContent, /不能重试服务|只读|演示/);
+});
+
+test("索引页包含重试服务入口，并明确它执行固定 agentcallctl restart", () => {
+  const webroot = dirname(fileURLToPath(import.meta.url)) + "/..";
+  const html = readFileSync(join(webroot, "index.html"), "utf8");
+  assert.match(html, /id="diag-retry-service"[^>]*disabled/, "重试服务初始必须禁用，真实桥接后再启用");
+  assert.match(html, /agentcallctl restart/, "页面必须说明固定命令契约");
+});

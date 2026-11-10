@@ -194,6 +194,7 @@ function serviceEnv(harness, extra = {}) {
     AGENTCALL_APP_PROCESS: harness.appProcess,
     AGENTCALL_GETPROP: harness.getprop,
     AGENTCALL_DATA_ROOT: harness.dataRoot,
+    AGENTCALL_UNIX_LIST: harness.unixList,
     ...extra,
   };
 }
@@ -208,10 +209,14 @@ function serviceHarness() {
   const moduleDir = join(root, "module");
   const dataRoot = join(root, "data");
   const binDir = join(root, "bin");
+  // 假 /proc/net/unix：service.sh 通过 AGENTCALL_UNIX_LIST 注入点读取该文件，
+  // 替身 app_process 在“绑定 socket”时把 abstract 名字追加进去（真机上是内核表）。
+  const unixList = join(root, "proc-net-unix.txt");
   mkdirSync(join(moduleDir, "bridge"), { recursive: true });
   mkdirSync(join(dataRoot, "logs"), { recursive: true });
   mkdirSync(binDir, { recursive: true });
   writeFileSync(join(moduleDir, "bridge", "agentcall-bridge.jar"), "stub");
+  writeFileSync(unixList, "");
   copyFileSync(join(MODULE, "service.sh"), join(moduleDir, "service.sh"));
 
   const appProcess = join(binDir, "app_process");
@@ -221,8 +226,17 @@ function serviceHarness() {
       "#!/bin/sh",
       'case "$*" in',
       "  *BridgeMain*)",
+      '    if [ "${AGENTCALL_FAKE_BRIDGE_NO_SOCKET:-0}" != "1" ] && [ -n "${AGENTCALL_UNIX_LIST:-}" ]; then',
+      '      printf \'@org.krvyft.agentcall.control\\n\' >> "$AGENTCALL_UNIX_LIST"',
+      "    fi",
       '    if [ "${AGENTCALL_FAKE_BRIDGE_STAY:-0}" = "1" ]; then',
-      "      while :; do sleep 1; done",
+      "      while :; do",
+      '        if [ -n "${AGENTCALL_FAKE_BRIDGE_RESTART_TRIGGER:-}" ] && [ -f "$AGENTCALL_FAKE_BRIDGE_RESTART_TRIGGER" ]; then',
+      '          rm -f "$AGENTCALL_FAKE_BRIDGE_RESTART_TRIGGER"',
+      "          exit 0",
+      "        fi",
+      "        sleep 1",
+      "      done",
       "    else",
       "      sleep 1",
       '      exit "${AGENTCALL_FAKE_BRIDGE_EXIT:-0}"',
@@ -230,6 +244,9 @@ function serviceHarness() {
       "    exit 0",
       "    ;;",
       "esac",
+      'if [ "${AGENTCALL_FAKE_AUDIO_NO_SOCKET:-0}" != "1" ] && [ -n "${AGENTCALL_UNIX_LIST:-}" ]; then',
+      '  printf \'@org.krvyft.agentcall.audio-role\\n\' >> "$AGENTCALL_UNIX_LIST"',
+      "fi",
       'if [ "${AGENTCALL_FAKE_AUDIO_IGNORE_TERM:-0}" = "1" ]; then trap "" TERM; fi',
       "while :; do sleep 1; done",
       "",
@@ -247,9 +264,12 @@ function serviceHarness() {
     dataRoot,
     appProcess,
     getprop,
+    unixList,
     script: join(moduleDir, "service.sh"),
     audioPidFile: join(dataRoot, "audio-worker.pid"),
     bridgePidFile: join(dataRoot, "bridge.pid"),
+    servicePidFile: join(dataRoot, "service.pid"),
+    restartRequestFile: join(dataRoot, "restart.requested"),
     logFile: join(dataRoot, "logs", "service.log"),
   };
 }
@@ -766,3 +786,402 @@ test(
     }
   },
 );
+
+
+// ---------------------------------------------------------------------------------------------
+// 任务 11B：音频角色就绪门禁（I1）与 in-product 重启（I2）
+//
+// I1：service.sh 过去在后台启动音频 app_process 后立刻拉起 BridgeMain；音频侧要等
+//     app_process + framework 初始化才 bind abstract socket，正常开机可能输掉竞争，
+//     让桥接进入永久 BLOCKED。现在 BridgeMain 之前必须有界等待音频 socket；超时则
+//     不启动半就绪的桥接（音频监督进程仍保留自己的有限重启预算）。
+// I2：agentcallctl restart 写 restart.requested（内容是本次 service.sh 的 PID）后执行
+//     固定 CLI shutdown；service.sh 在桥接干净退出后消费该标记并在同一有限循环内重新
+//     拉起。remove/disable 标记优先：不得复活已移除模块。
+// ---------------------------------------------------------------------------------------------
+
+test(
+  "service.sh：BridgeMain 之前有界等待音频角色 socket；超时不启动半就绪桥接",
+  { timeout: 60000 },
+  async () => {
+    const harness = serviceHarness();
+    let child = null;
+    try {
+      const startedAt = Date.now();
+      child = spawn("sh", [harness.script], {
+        env: serviceEnv(harness, {
+          AGENTCALL_FAKE_AUDIO_NO_SOCKET: "1",
+          AGENTCALL_AUDIO_READY_TIMEOUT_SECONDS: "2",
+        }),
+        stdio: "ignore",
+      });
+      await waitFor(() => existsSync(harness.audioPidFile), 15000, "audio worker pid file");
+      const workerPid = readPidFile(harness.audioPidFile);
+      assert.equal(processAlive(workerPid), true, "音频工作进程替身必须存活");
+
+      const { code } = await waitForExit(child, 30000);
+      assert.notEqual(code, 0, "音频未就绪时不得假装启动成功");
+      assert.ok(Date.now() - startedAt < 20000, "等待必须有界，不能挂住开机流程");
+
+      assert.equal(existsSync(harness.bridgePidFile), false, "音频未就绪时不得启动 BridgeMain");
+      const log = readFileSync(harness.logFile, "utf8");
+      assert.match(log, /audio_worker_ready_timeout waited=2s/, "超时必须记录有界等待的时长：" + log);
+      assert.match(log, /bridge_start_skipped reason=audio_not_ready/, "跳过 BridgeMain 必须记录机器可读原因");
+      assert.equal(/bridge_start attempt=/.test(log), false, "不得启动半就绪的桥接");
+      await waitFor(() => !processAlive(workerPid), 10000, "audio worker termination after timeout");
+      assert.equal(processAlive(workerPid), false, "超时退出也不得留下持有的音频 app_process");
+    } finally {
+      killQuietly(child);
+      rmSync(harness.root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "service.sh：音频 socket 就绪后才拉起桥接（真实日志顺序）",
+  { timeout: 60000 },
+  async () => {
+    const harness = serviceHarness();
+    let child = null;
+    try {
+      child = spawn("sh", [harness.script], {
+        env: serviceEnv(harness, { AGENTCALL_FAKE_BRIDGE_STAY: "1" }),
+        stdio: "ignore",
+      });
+      await waitFor(
+        () => existsSync(harness.bridgePidFile) && existsSync(harness.servicePidFile),
+        20000,
+        "bridge/service pid files",
+      );
+      const log = readFileSync(harness.logFile, "utf8");
+      const audioReadyAt = log.indexOf("audio_worker_ready socket=@org.krvyft.agentcall.audio-role");
+      const bridgeStartAt = log.indexOf("bridge_start attempt=");
+      assert.ok(audioReadyAt > -1, "必须记录音频角色 socket 就绪：" + log);
+      assert.ok(bridgeStartAt > -1, "音频就绪后必须启动桥接：" + log);
+      assert.ok(audioReadyAt < bridgeStartAt, "BridgeMain 必须在音频角色就绪之后启动");
+    } finally {
+      killQuietly(child);
+      rmSync(harness.root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "service.sh：restart.requested（本服务 PID）在桥接干净退出后重新拉起一次",
+  { timeout: 60000 },
+  async () => {
+    const harness = serviceHarness();
+    const trigger = join(harness.dataRoot, "restart-trigger");
+    let child = null;
+    try {
+      child = spawn("sh", [harness.script], {
+        env: serviceEnv(harness, {
+          AGENTCALL_FAKE_BRIDGE_STAY: "1",
+          AGENTCALL_FAKE_BRIDGE_RESTART_TRIGGER: trigger,
+        }),
+        stdio: "ignore",
+      });
+      await waitFor(
+        () => existsSync(harness.bridgePidFile) && existsSync(harness.servicePidFile),
+        20000,
+        "bridge/service pid files",
+      );
+      const firstBridgePid = readPidFile(harness.bridgePidFile);
+      const servicePid = readPidFile(harness.servicePidFile);
+      assert.ok(servicePid > 0, "service.sh 必须写自己的 PID 供 restart 命令核验");
+
+      writeFileSync(harness.restartRequestFile, servicePid + "\n");
+      writeFileSync(trigger, "");
+
+      await waitFor(
+        () => existsSync(harness.bridgePidFile) && readPidFile(harness.bridgePidFile) !== firstBridgePid,
+        20000,
+        "bridge relaunch after restart request",
+      );
+      const secondBridgePid = readPidFile(harness.bridgePidFile);
+      assert.notEqual(secondBridgePid, firstBridgePid, "重启必须拉起新的桥接进程");
+      assert.equal(processAlive(firstBridgePid), false, "旧桥接进程必须已经干净退出");
+      assert.equal(existsSync(harness.restartRequestFile), false, "重启请求只能被消费一次");
+
+      const log = readFileSync(harness.logFile, "utf8");
+      assert.match(log, /bridge_restart_requested/, "必须记录重启请求被消费：" + log);
+      assert.match(log, /bridge_exit_clean/, "干净退出（退出码 0）也必须被记录");
+
+      child.kill("SIGTERM");
+      await waitForExit(child, 20000);
+    } finally {
+      killQuietly(child);
+      rmSync(harness.root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "service.sh：remove 标记存在时 restart 请求不得复活桥接",
+  { timeout: 60000 },
+  async () => {
+    const harness = serviceHarness();
+    const trigger = join(harness.dataRoot, "restart-trigger");
+    let child = null;
+    try {
+      child = spawn("sh", [harness.script], {
+        env: serviceEnv(harness, {
+          AGENTCALL_FAKE_BRIDGE_STAY: "1",
+          AGENTCALL_FAKE_BRIDGE_RESTART_TRIGGER: trigger,
+        }),
+        stdio: "ignore",
+      });
+      await waitFor(
+        () => existsSync(harness.bridgePidFile) && existsSync(harness.servicePidFile),
+        20000,
+        "bridge/service pid files",
+      );
+      const firstBridgePid = readPidFile(harness.bridgePidFile);
+      const servicePid = readPidFile(harness.servicePidFile);
+
+      writeFileSync(harness.restartRequestFile, servicePid + "\n");
+      writeFileSync(join(harness.moduleDir, "remove"), "");
+      writeFileSync(trigger, "");
+
+      const { code } = await waitForExit(child, 30000);
+      assert.equal(code, 0, "标记移除后必须有界退出，而不是继续重启");
+      assert.equal(processAlive(firstBridgePid), false);
+      const log = readFileSync(harness.logFile, "utf8");
+      assert.match(log, /bridge_restart_skipped reason=marked_stopped/, "必须记录因标记而拒绝重启：" + log);
+      assert.equal(/bridge_start attempt=/.test(log.split("bridge_restart_skipped")[1] || ""), false, "remove 标记存在时不得再次拉起桥接");
+      assert.equal(existsSync(harness.restartRequestFile), false, "被拒绝的重启请求也必须被收回");
+    } finally {
+      killQuietly(child);
+      rmSync(harness.root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "service.sh：不属于当前 service.sh 的过期 restart 标记被丢弃，不触发重启",
+  { timeout: 60000 },
+  async () => {
+    const harness = serviceHarness();
+    const trigger = join(harness.dataRoot, "restart-trigger");
+    let child = null;
+    try {
+      child = spawn("sh", [harness.script], {
+        env: serviceEnv(harness, {
+          AGENTCALL_FAKE_BRIDGE_STAY: "1",
+          AGENTCALL_FAKE_BRIDGE_RESTART_TRIGGER: trigger,
+        }),
+        stdio: "ignore",
+      });
+      await waitFor(
+        () => existsSync(harness.bridgePidFile) && existsSync(harness.servicePidFile),
+        20000,
+        "bridge/service pid files",
+      );
+      const firstBridgePid = readPidFile(harness.bridgePidFile);
+
+      // 上一次开机/上一次实例遗留的请求：内容是别的 PID。
+      writeFileSync(harness.restartRequestFile, process.pid + "\n");
+      writeFileSync(trigger, "");
+
+      const { code } = await waitForExit(child, 30000);
+      assert.equal(code, 0, "过期请求不得让服务继续重启");
+      assert.equal(processAlive(firstBridgePid), false);
+      const log = readFileSync(harness.logFile, "utf8");
+      assert.match(log, /bridge_restart_stale/, "过期请求必须被显式丢弃并记录：" + log);
+      assert.match(log, /bridge_exit_clean/, "过期请求应落到普通干净退出路径");
+      assert.equal(/bridge_restart_requested/.test(log), false, "过期请求不得被消费");
+      assert.equal(existsSync(harness.restartRequestFile), false, "过期请求文件必须被收回");
+    } finally {
+      killQuietly(child);
+      rmSync(harness.root, { recursive: true, force: true });
+    }
+  },
+);
+
+test("agentcallctl：restart 是固定模块命令，写重启标记后只执行固定 shutdown", () => {
+  const ctl = read("bin/agentcallctl");
+  assert.match(ctl, /status|config-get|config-set|diagnose|shutdown|restart/, "restart 必须是固定命令之一");
+  assert.match(
+    ctl,
+    /^RESTART_REQUEST_FILE=\$DATA_ROOT\/restart\.requested$/m,
+    "重启请求必须是 root 私有目录下的固定文件",
+  );
+  assert.match(ctl, /^SERVICE_PID_FILE=\$DATA_ROOT\/service\.pid$/m, "必须核验正在运行的 service.sh");
+  assert.match(ctl, /service_not_running/, "service.sh 未运行时必须给出机器可读错误");
+  assert.match(ctl, /module_disabled/, "remove/disable 标记存在时必须拒绝重启");
+  assert.match(ctl, /run_cli shutdown/, "只允许执行固定 CLI shutdown，绝不执行任意 shell");
+  assert.equal(/run_cli restart/.test(ctl), false, "restart 不得转发给 AgentCallCli（它不是 RPC 命令）");
+  assert.equal(/eval |sh -c|system\(/.test(ctl), false, "包装器不得新增任意 shell 路径");
+  const restartAt = ctl.indexOf("restart_bridge");
+  const genericAt = ctl.indexOf('run_cli "\$COMMAND"');
+  assert.ok(restartAt > -1 && genericAt > restartAt, "restart 必须在通用转发之前单独处理");
+});
+
+
+// ---------------------------------------------------------------------------------------------
+// 任务 11B / I2：agentcallctl restart 的真实执行契约
+//
+// 宿主上没有 root，也没有 /system/bin/app_process；测试用 PATH 前置的假 id（仅替身）与
+// 文档化的 AGENTCALL_APP_PROCESS / AGENTCALL_DATA_ROOT 注入点执行真实包装器，断言：
+// - 成功只在“标记已写 + 固定 shutdown 已执行”后返回 restart requested；
+// - service.sh 不在运行时明确拒绝（不会留下将来生效的标记）；
+// - remove/disable 标记优先，不写标记也不执行任何 CLI；
+// - shutdown 失败时收回标记并返回 restart_unconfirmed。
+// ---------------------------------------------------------------------------------------------
+
+function ctlHarness() {
+  const root = mkdtempSync(join(tmpdir(), "agentcall-ctl-"));
+  const moduleDir = join(root, "module");
+  const dataRoot = join(root, "data");
+  const binDir = join(root, "bin");
+  const serviceDir = join(root, "fake-service");
+  mkdirSync(join(moduleDir, "bin"), { recursive: true });
+  mkdirSync(join(moduleDir, "bridge"), { recursive: true });
+  mkdirSync(join(dataRoot, "logs"), { recursive: true });
+  mkdirSync(binDir, { recursive: true });
+  mkdirSync(serviceDir, { recursive: true });
+  copyFileSync(join(MODULE, "bin", "agentcallctl"), join(moduleDir, "bin", "agentcallctl"));
+  writeFileSync(join(moduleDir, "bridge", "agentcall-bridge.jar"), "stub");
+
+  const fakeId = join(binDir, "id");
+  writeFileSync(fakeId, "#!/bin/sh\nprintf '0\\n'\n");
+  chmodSync(fakeId, 0o755);
+
+  const argsFile = join(root, "app-process-args.txt");
+  const appProcess = join(binDir, "app_process");
+  writeFileSync(
+    appProcess,
+    [
+      "#!/bin/sh",
+      'if [ -n "$AGENTCALL_FAKE_ARGS_FILE" ]; then',
+      '  printf "%s\\n" "$*" >> "$AGENTCALL_FAKE_ARGS_FILE"',
+      "fi",
+      'exit "${AGENTCALL_FAKE_CLI_EXIT:-0}"',
+      "",
+    ].join("\n"),
+  );
+  chmodSync(appProcess, 0o755);
+
+  return {
+    root,
+    moduleDir,
+    dataRoot,
+    binDir,
+    serviceDir,
+    argsFile,
+    appProcess,
+    ctl: join(moduleDir, "bin", "agentcallctl"),
+    servicePidFile: join(dataRoot, "service.pid"),
+    restartRequestFile: join(dataRoot, "restart.requested"),
+  };
+}
+
+function runCtl(harness, env = {}) {
+  return spawnSync("sh", [harness.ctl, "restart"], {
+    encoding: "utf8",
+    timeout: 20000,
+    env: {
+      ...process.env,
+      PATH: harness.binDir + ":" + process.env.PATH,
+      AGENTCALL_DATA_ROOT: harness.dataRoot,
+      AGENTCALL_APP_PROCESS: harness.appProcess,
+      AGENTCALL_FAKE_ARGS_FILE: harness.argsFile,
+      ...env,
+    },
+  });
+}
+
+function startFakeService(harness) {
+  const script = join(harness.serviceDir, "service.sh");
+  writeFileSync(script, "#!/bin/sh\nwhile :; do sleep 1; done\n");
+  return spawn("sh", [script], { stdio: "ignore" });
+}
+
+function ctlErrorCode(result) {
+  const line = result.stdout.trim().split("\n").pop();
+  return JSON.parse(line).error.code;
+}
+
+test("agentcallctl restart：写本服务 PID 的重启标记并只执行固定 shutdown", () => {
+  const harness = ctlHarness();
+  let service = null;
+  try {
+    service = startFakeService(harness);
+    writeFileSync(harness.servicePidFile, String(service.pid) + "\n");
+
+    const result = runCtl(harness);
+    assert.equal(result.status, 0, "restart 必须成功：" + result.stdout + result.stderr);
+    assert.equal(result.stdout.trim(), '{"restart":"requested"}', "成功只输出机器可读的请求结果");
+    assert.equal(readFileSync(harness.restartRequestFile, "utf8").trim(), String(service.pid), "标记必须指向当前 service.sh");
+    const args = readFileSync(harness.argsFile, "utf8").trim();
+    assert.match(args, /AgentCallCli shutdown$/, "只允许固定 CLI shutdown：" + args);
+    assert.equal(/ restart/.test(args), false, "restart 不得转发给 AgentCallCli");
+  } finally {
+    killQuietly(service);
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("agentcallctl restart：service.sh 不在运行时拒绝，不留下将来生效的标记", () => {
+  const harness = ctlHarness();
+  try {
+    const result = runCtl(harness);
+    assert.notEqual(result.status, 0);
+    assert.equal(ctlErrorCode(result), "service_not_running");
+    assert.equal(existsSync(harness.restartRequestFile), false, "拒绝重启时不得写标记");
+    assert.equal(existsSync(harness.argsFile), false, "拒绝重启时不得启动 CLI");
+  } finally {
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("agentcallctl restart：remove/disable 标记优先，绝不复活已移除模块", () => {
+  for (const marker of ["remove", "disable"]) {
+    const harness = ctlHarness();
+    let service = null;
+    try {
+      service = startFakeService(harness);
+      writeFileSync(harness.servicePidFile, String(service.pid) + "\n");
+      writeFileSync(join(harness.moduleDir, marker), "");
+
+      const result = runCtl(harness);
+      assert.notEqual(result.status, 0, marker + " 标记必须阻止重启");
+      assert.equal(ctlErrorCode(result), "module_disabled");
+      assert.equal(existsSync(harness.restartRequestFile), false, marker + " 标记存在时不得写重启请求");
+      assert.equal(existsSync(harness.argsFile), false, "被标记移除时不得执行任何 CLI");
+    } finally {
+      killQuietly(service);
+      rmSync(harness.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("agentcallctl restart：固定 shutdown 失败时收回请求并报 restart_unconfirmed", () => {
+  const harness = ctlHarness();
+  let service = null;
+  try {
+    service = startFakeService(harness);
+    writeFileSync(harness.servicePidFile, String(service.pid) + "\n");
+
+    const result = runCtl(harness, { AGENTCALL_FAKE_CLI_EXIT: "1" });
+    assert.notEqual(result.status, 0);
+    assert.equal(ctlErrorCode(result), "restart_unconfirmed");
+    assert.equal(existsSync(harness.restartRequestFile), false, "失败的请求不得留在磁盘上");
+    const args = readFileSync(harness.argsFile, "utf8").trim();
+    assert.match(args, /AgentCallCli shutdown$/);
+  } finally {
+    killQuietly(service);
+    rmSync(harness.root, { recursive: true, force: true });
+  }
+});
+
+test("uninstall.sh：先收回待处理的重启请求，避免卸载过程中桥接被重新拉起", () => {
+  const uninstall = read("uninstall.sh");
+  const clearAt = uninstall.indexOf('rm -f "$RESTART_REQUEST_FILE"');
+  const shutdownAt = uninstall.indexOf('"$CTL" shutdown');
+  const cleanupAt = uninstall.indexOf('rm -rf "$DATA_ROOT"');
+  assert.ok(clearAt > -1, "卸载必须先收回 restart.requested");
+  assert.ok(shutdownAt > -1 && cleanupAt > -1);
+  assert.ok(clearAt < shutdownAt, "收回请求必须早于 shutdown（否则 shutdown 后仍可能被拉起）");
+  assert.ok(clearAt < cleanupAt, "收回请求必须早于删除数据目录");
+});

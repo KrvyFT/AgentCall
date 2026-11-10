@@ -43,6 +43,7 @@ CONTROL_SOCKET=@org.krvyft.agentcall.control
 CTL=$MODDIR/bin/agentcallctl
 PID_FILE=$DATA_ROOT/bridge.pid
 AUDIO_PID_FILE=$DATA_ROOT/audio-worker.pid
+RESTART_REQUEST_FILE=$DATA_ROOT/restart.requested
 STOP_WAIT_SECONDS=15
 KILL_WAIT_SECONDS=5
 
@@ -140,6 +141,13 @@ terminate_verified_pid() {
 }
 
 say "- AgentCall: 卸载开始"
+
+# 先收回可能待处理的重启请求：否则 shutdown 之后 service.sh 会按请求把桥接重新拉起，
+# 与卸载的“停止”意图冲突。这里只删除固定模块标记，不删除其它数据。
+if [ -f "$RESTART_REQUEST_FILE" ]; then
+    rm -f "$RESTART_REQUEST_FILE" 2>/dev/null
+    say "- 已收回待处理的重启请求（避免卸载过程中桥接被重新拉起）"
+fi
 
 socket_present=0
 control_socket_present && socket_present=1

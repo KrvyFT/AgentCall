@@ -1,8 +1,11 @@
 #!/system/bin/sh
-# AgentCall 固定命令包装器（spec §6.4 / 任务 8）。
+# AgentCall 固定命令包装器（spec §6.4 / 任务 8；任务 11B 新增 restart）。
 #
 # 设计边界：
 # - 只转发固定六条命令给 org.krvyft.agentcall.bridge.AgentCallCli，没有任意 RPC、没有任意 shell。
+# - restart 是模块侧控制动作（不是 AgentCallCli 命令）：写 root 私有重启请求标记，再执行
+#   固定 CLI shutdown 让桥接干净退出；service.sh 在本次开机的有限循环内消费标记并重新
+#   拉起桥接。它不接受参数，也不会把 restart 转发给 CLI。
 # - 配置写入只从 stdin 进入。本脚本从不接收、拼接或回显配置内容：密钥不可能出现在
 #   进程 argv、URL 或日志中。调用方（WebUI）把补丁 JSON 写入 root 私有文件后重定向 stdin：
 #     agentcallctl config-set < /data/adb/agentcall/inbox/config-set.json
@@ -28,11 +31,16 @@ case "$0" in
         ;;
 esac
 MODDIR=$SCRIPT_DIR/..
-DATA_ROOT=/data/adb/agentcall
+# 测试/诊断注入点（与 service.sh/uninstall.sh 同名）：默认值就是真机路径；覆盖只改变
+# 本脚本读写标记与启动固定 CLI 的路径，不引入任意命令执行。
+DATA_ROOT=${AGENTCALL_DATA_ROOT:-/data/adb/agentcall}
+APP_PROCESS=${AGENTCALL_APP_PROCESS:-/system/bin/app_process}
 INBOX_DIR=$DATA_ROOT/inbox
 LOG_DIR=$DATA_ROOT/logs
+SERVICE_PID_FILE=$DATA_ROOT/service.pid
+RESTART_REQUEST_FILE=$DATA_ROOT/restart.requested
+MAX_PID_DIGITS=7
 BRIDGE_JAR=$MODDIR/bridge/agentcall-bridge.jar
-APP_PROCESS=/system/bin/app_process
 MAIN_CLASS=org.krvyft.agentcall.bridge.AgentCallCli
 
 emit_error() {
@@ -44,12 +52,12 @@ emit_error() {
 }
 
 if [ "$#" -lt 1 ]; then
-    emit_error "usage_invalid" "usage: status | config-get | config-set (JSON on stdin) | pair [packageName] | diagnose | shutdown" 2
+    emit_error "usage_invalid" "usage: status | config-get | config-set (JSON on stdin) | pair [packageName] | diagnose | shutdown | restart" 2
 fi
 
 COMMAND=$1
 case "$COMMAND" in
-    status|config-get|config-set|diagnose|shutdown)
+    status|config-get|config-set|diagnose|shutdown|restart)
         if [ "$#" -ne 1 ]; then
             emit_error "usage_invalid" "$COMMAND takes no arguments; config-set reads JSON from stdin" 2
         fi
@@ -66,7 +74,7 @@ case "$COMMAND" in
         fi
         ;;
     *)
-        emit_error "usage_invalid" "unknown command; allowed: status config-get config-set pair diagnose shutdown" 2
+        emit_error "usage_invalid" "unknown command; allowed: status config-get config-set pair diagnose shutdown restart" 2
         ;;
 esac
 
@@ -90,6 +98,54 @@ run_cli() {
     "$APP_PROCESS" -Djava.class.path="$BRIDGE_JAR" /system/bin --nice-name=agentcall-cli "$MAIN_CLASS" "$@"
 }
 
+# 重启请求必须有一个“活着的接收者”。service.pid 由 service.sh 写（单行十进制 PID）；
+# 这里按 cmdline 核验确实是 service.sh，避免 PID 复用把请求写进另一个实例。
+verified_service_pid() {
+    [ -f "$SERVICE_PID_FILE" ] || return 1
+    raw=$(head -n 1 "$SERVICE_PID_FILE" 2>/dev/null)
+    case "$raw" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "${#raw}" -le "$MAX_PID_DIGITS" ] || return 1
+    candidate=$(printf '%s' "$raw" | tr -cd '0-9')
+    [ "$candidate" -gt 1 ] || return 1
+    [ -d "/proc/$candidate" ] || return 1
+    cmdline=$(tr '\000' ' ' < "/proc/$candidate/cmdline" 2>/dev/null)
+    case "$cmdline" in
+        *service.sh*) printf '%s\n' "$candidate"; return 0 ;;
+    esac
+    return 1
+}
+
+# 模块侧重启（I2）：
+# 1. remove/disable 标记存在时拒绝——已移除/停用的模块不得被重启请求复活；
+# 2. service.sh 不在运行则明确拒绝（本次开机已没有重启循环，只能重启设备）；
+# 3. 先写重启请求（内容是 service.sh 的 PID），再执行固定 CLI shutdown 让它干净退出；
+#    shutdown 失败则收回请求，绝不留下未来会生效的标记；
+# 4. 成功只宣称“已请求”；实际重新拉起由 service.sh 的有限循环完成。
+restart_bridge() {
+    if [ -f "$MODDIR/remove" ] || [ -f "$MODDIR/disable" ]; then
+        emit_error "module_disabled" "module is disabled or marked for removal; restart is not allowed" 2
+    fi
+    service_pid=$(verified_service_pid) || emit_error "service_not_running" "service.sh is not running; the bridge can only be restarted within an active boot (reboot the device)" 3
+    temporary="$RESTART_REQUEST_FILE.tmp.$$"
+    if ! printf '%s\n' "$service_pid" > "$temporary" 2>/dev/null; then
+        rm -f "$temporary" 2>/dev/null
+        emit_error "restart_request_failed" "cannot write the restart request under the root private data directory" 3
+    fi
+    chmod 0600 "$temporary" 2>/dev/null
+    if ! mv -f "$temporary" "$RESTART_REQUEST_FILE" 2>/dev/null; then
+        rm -f "$temporary" 2>/dev/null
+        emit_error "restart_request_failed" "cannot publish the restart request under the root private data directory" 3
+    fi
+    if ! run_cli shutdown > /dev/null 2>&1; then
+        rm -f "$RESTART_REQUEST_FILE" 2>/dev/null
+        emit_error "restart_unconfirmed" "bridge did not accept the shutdown request; nothing was restarted" 3
+    fi
+    printf '{"restart":"requested"}\n'
+    exit 0
+}
+
 case "$COMMAND" in
     config-set)
         # stdin 只来自调用方的重定向；内容不经过任何 shell 拼接或回显。
@@ -106,6 +162,9 @@ case "$COMMAND" in
             run_cli pair
         fi
         exit $?
+        ;;
+    restart)
+        restart_bridge
         ;;
     *)
         run_cli "$COMMAND"

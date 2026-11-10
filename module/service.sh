@@ -43,11 +43,22 @@ APP_PROCESS=${AGENTCALL_APP_PROCESS:-/system/bin/app_process}
 GETPROP=${AGENTCALL_GETPROP:-getprop}
 CONTROL_SOCKET=@org.krvyft.agentcall.control
 AUDIO_SOCKET=@org.krvyft.agentcall.audio-role
+# 本脚本自己的 PID（agentcallctl restart 据此确认“重启请求有接收者”）；请求标记里保存
+# 同一个 PID，跨实例/跨开机的过期标记不会被新实例消费。
+SERVICE_PID_FILE=$DATA_ROOT/service.pid
+RESTART_REQUEST_FILE=$DATA_ROOT/restart.requested
+# 测试/诊断注入点：真机读内核的 /proc/net/unix；覆盖只改变本脚本的探测来源。
+UNIX_LIST=${AGENTCALL_UNIX_LIST:-/proc/net/unix}
 
 BOOT_WAIT_SECONDS=600
 MAX_RESTARTS=3
+# 操作者主动请求的重启不消耗故障预算，但也不能无限：每次请求只允许一次重启，且有总上限。
+MAX_REQUESTED_RESTARTS=10
 RESTART_DELAY_SECONDS=5
 READY_WAIT_SECONDS=20
+# BridgeMain 启动前等待音频角色 abstract socket 的总上限：覆盖音频监督进程的整个有限
+# 重启预算（每轮 READY_WAIT_SECONDS + RESTART_DELAY_SECONDS）。超时则不启动半就绪桥接。
+AUDIO_READY_TIMEOUT_SECONDS=${AGENTCALL_AUDIO_READY_TIMEOUT_SECONDS:-$((READY_WAIT_SECONDS * (MAX_RESTARTS + 1) + RESTART_DELAY_SECONDS * MAX_RESTARTS))}
 MAX_LOG_BYTES=262144
 # PID 文件首行允许的最大位数：Linux/Android 的 pid_max 是 7 位（默认 4194304），
 # 更长的数字串一律按损坏内容处理，不解析成巨大的 PID 去 kill。
@@ -229,7 +240,7 @@ shutdown_children() {
         reap_child "$bridge_pid"
     fi
     bridge_pid=
-    rm -f "$PID_FILE" "$AUDIO_PID_FILE" 2>/dev/null
+    rm -f "$PID_FILE" "$AUDIO_PID_FILE" "$SERVICE_PID_FILE" 2>/dev/null
 }
 
 on_stop() {
@@ -304,7 +315,27 @@ if [ ! -x "$APP_PROCESS" ]; then
 fi
 
 socket_present() {
-    grep -q "$1" /proc/net/unix 2>/dev/null
+    grep -q "$1" "$UNIX_LIST" 2>/dev/null
+}
+
+# 重启请求：内容是发起请求时的 service.sh PID（单行十进制）。只有本实例的请求才算数；
+# 上一次开机/上一实例遗留的标记会被显式丢弃，绝不因为一个旧文件而多拉起一次桥接。
+restart_requested() {
+    [ -f "$RESTART_REQUEST_FILE" ] || return 1
+    requested_by=$(head -n 1 "$RESTART_REQUEST_FILE" 2>/dev/null)
+    case "$requested_by" in
+        ''|*[!0-9]*) requested_by= ;;
+    esac
+    if [ "$requested_by" != "$$" ]; then
+        log_line "bridge_restart_stale requested_by=${requested_by:-invalid} service_pid=$$"
+        rm -f "$RESTART_REQUEST_FILE" 2>/dev/null
+        return 1
+    fi
+    return 0
+}
+
+clear_restart_request() {
+    rm -f "$RESTART_REQUEST_FILE" 2>/dev/null
 }
 
 wait_ready() {
@@ -321,6 +352,34 @@ wait_ready() {
         sleep 1
         tries=$((tries + 1))
     done
+    return 1
+}
+
+# BridgeMain 启动门禁（I1）：音频工作角色是独立 app_process，需要 app_process + framework
+# 初始化后才 bind abstract socket。旧实现后台启动音频后立刻启动 BridgeMain，正常开机可能
+# 输掉竞争，桥接启动期读不到音频角色而进入 BLOCKED。这里在 BridgeMain 之前有界等待：
+# - 上限覆盖音频监督进程的整个有限重启预算；
+# - 等待期间每轮重新检查 remove/disable 标记；
+# - 超时只记录并返回失败，调用方据此跳过 BridgeMain（绝不启动半就绪桥接）。
+wait_for_audio_role() {
+    waited=0
+    while [ "$waited" -lt "$AUDIO_READY_TIMEOUT_SECONDS" ]; do
+        if module_marked_stopped; then
+            log_line "audio_worker_wait_skipped marked_stopped"
+            return 1
+        fi
+        if socket_present "$AUDIO_SOCKET"; then
+            log_line "audio_worker_ready socket=$AUDIO_SOCKET waited=${waited}s"
+            return 0
+        fi
+        if [ -z "$audio_manager_pid" ] || ! pid_alive "$audio_manager_pid"; then
+            log_line "audio_worker_wait_failed reason=supervisor_exit waited=${waited}s"
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    log_line "audio_worker_ready_timeout waited=${waited}s"
     return 1
 }
 
@@ -364,9 +423,12 @@ audio_worker_supervisor() {
     exit 1
 }
 
-# bridge 容器（控制面 + 监督角色）：保持原有有限重启与干净退出语义。
+# bridge 容器（控制面 + 监督角色）：保持原有有限重启与干净退出语义，并新增
+# “操作者请求的重启”：桥接干净退出（退出码 0）后若存在本实例的 restart.requested，
+# 消费标记并在同一有限循环内重新拉起（不消耗故障预算，但每次请求只换一次重启且有上限）。
 bridge_container_supervisor() {
     restarts=0
+    requested_restarts=0
     while [ "$restarts" -le "$MAX_RESTARTS" ]; do
         if module_marked_stopped; then
             log_line "bridge_start_skipped marked_stopped"
@@ -392,6 +454,24 @@ bridge_container_supervisor() {
             return 0
         fi
         if [ "$exit_code" -eq 0 ]; then
+            if restart_requested; then
+                if module_marked_stopped; then
+                    clear_restart_request
+                    log_line "bridge_restart_skipped reason=marked_stopped"
+                    log_line "bridge_exit_clean"
+                    return 0
+                fi
+                if [ "$requested_restarts" -ge "$MAX_REQUESTED_RESTARTS" ]; then
+                    clear_restart_request
+                    log_line "bridge_restart_budget_exhausted requested=$requested_restarts"
+                    return 1
+                fi
+                clear_restart_request
+                requested_restarts=$((requested_restarts + 1))
+                log_line "bridge_restart_requested requested=$requested_restarts"
+                log_line "bridge_exit_clean"
+                continue
+            fi
             log_line "bridge_exit_clean"
             return 0
         fi
@@ -408,11 +488,21 @@ bridge_container_supervisor() {
 
 reclaim_stale_worker
 
+# service.sh 自己的 PID：agentcallctl restart 在写请求前核验“接收者还在”。
+printf '%s\n' "$$" > "$SERVICE_PID_FILE" 2>/dev/null
+
 audio_worker_supervisor &
 audio_manager_pid=$!
 
-bridge_container_supervisor
-bridge_status=$?
+# I1：必须先等到音频角色 socket，再启动 BridgeMain。音频监督进程保留自己的有限重启预算；
+# 总等待有上限，超时则跳过桥接并做有界回收（绝不让开机流程无限挂住）。
+if wait_for_audio_role; then
+    bridge_container_supervisor
+    bridge_status=$?
+else
+    log_line "bridge_start_skipped reason=audio_not_ready"
+    bridge_status=1
+fi
 
 if [ "$stopping" -eq 0 ]; then
     log_line "service_cleanup reason=bridge_exit status=$bridge_status"

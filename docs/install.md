@@ -94,7 +94,7 @@ AgentCall APK 是传统 Xposed 模块（`xposedmodule`、`xposed_init`、`xposed
 `com.google.android.dialer`），不是替代拨号器：
 
 - 不请求默认拨号器角色，不伪用只授予默认拨号器的前台服务资格。
-- 不插入 Google 电话内部布局；人工接管通过 APK 界面（界面未实现）。
+- 不插入 Google 电话内部布局；人工接管通过 APK 的接管页/通知（TakeoverActivity）。
 - Hook 只在 Google 电话进程内观察/受限控制，任何权限不足或环境不符都 fail-closed。
 
 ## 4. 首次配对（未验证）
@@ -205,18 +205,45 @@ su -c /data/adb/modules/agentcall/bin/agentcallctl diagnose
 ### 升级
 
 1. 关闭总开关，结束进行中的会话。`shutdown` 会优雅停止桥接进程，且 `service.sh` 不会自动重启；
-   除排障外不要用它代替总开关，误用后需要重启手机才能恢复。
+   除排障外不要用它代替总开关，误用后可用 `agentcallctl restart`（或 WebUI 诊断页的
+   “重试服务”）在本次开机内恢复，见下节；否则需要重启手机。
 2. 安装新模块 ZIP（KernelSU 会替换模块目录），重启。
 3. 安装新 APK，重新执行 `pair`：APK 的 `versionName` 已变化，旧配对记录必然触发
    `peer_version_mismatch`，不重新配对就无法连接。
 4. Google 电话升级后同样要重新 `pair`（拨号器 `versionName` 变了）。
 5. 重新校验 `status` 与 `diagnose`，再按需开启总开关。
 
+### 桥接 BLOCKED / 服务恢复（重试服务）
+
+桥接在麦克风恢复失败、持久状态损坏或“重启时仍持有旧通话”等情况下会进入
+`BLOCKED`（`status.json` 的 `phase=BLOCKED` 与 `blockedReason`）：此时禁止开启新的
+AI 会话，等待人工处理。恢复路径：
+
+1. **WebUI**：诊断 → 服务操作 → **重试服务**。它只执行固定模块命令
+   `agentcallctl restart`（无参数、无任意 shell），成功仅表示“重启请求已被接受”。
+2. **root CLI**（等价）：
+   ```sh
+   su -c /data/adb/modules/agentcall/bin/agentcallctl restart
+   ```
+3. 命令先写 `/data/adb/agentcall/restart.requested`（内容是当前 `service.sh` 的 PID，
+   0600），再执行固定 CLI `shutdown` 让桥接干净退出；`service.sh` 在本次开机的有限
+   重启循环内消费该标记并重新拉起桥接（只消费一次，不消耗故障重启预算）。
+4. **诚实边界**：
+   - `service_not_running`：`service.sh` 已退出（例如之前用过“关闭桥接服务”），
+     本次开机内没有重启循环；只能重启设备或重新启用模块，`restart` **不会**伪造成功。
+   - `module_disabled`：模块被 `disable`/`remove` 标记，重启请求会被拒绝，
+     不会复活已移除模块。
+   - `restart_unconfirmed`：桥接没有接受 `shutdown`（已退出或不可达），命令会收回
+     请求，本次没有重启。
+   - 真实 BLOCKED 恢复（重启后的启动恢复是否清除阻塞）尚未在真机验证；
+     `restart` 只负责“干净重启”，不代表阻塞条件已被修复。
+
 ### 回退（保留模块但停止自动化）
 
 1. WebUI 关闭总开关（总开关持久化，重启后仍保持关闭）。
    如需彻底停止桥接进程可执行 `agentcallctl shutdown`；它会让桥优雅退出且不再自动重启，
-   之后重启手机才能恢复，因此只用于回退/排障。
+   之后可用 `agentcallctl restart`/“重试服务”恢复（需 `service.sh` 仍在运行），
+   因此只用于回退/排障。
 2. 在 LSPosed/Vector 中停用 AgentCall 作用域并强制停止 Google 电话——Hook 退出后
    Google 电话恢复原生行为。
 3. 删除/停用配对记录由 `pair` 重新建立；不需要也不应卸载官方拨号器。
@@ -249,6 +276,9 @@ su -c /data/adb/modules/agentcall/bin/agentcallctl diagnose
 | `io_missing` / `module_dir_unresolved` | WebUI 只读降级 | 更新 KernelSU 管理器或检查模块目录 |
 | `inbox_write_failed` | 无法写入 root 私有 inbox | 检查 `/data/adb/agentcall` 权限 |
 | `secret_transport_unsupported` | 只读能力下尝试保存密钥 | 升级管理器或在 root CLI 写入 |
+| `service_not_running` | `service.sh` 已退出（本次开机没有重启循环） | 重启设备或重新启用模块；不要伪造重启成功 |
+| `module_disabled` | 模块带 `disable`/`remove` 标记 | 先启用/重装模块；不会重启已移除模块 |
+| `restart_unconfirmed` | 桥接未接受 `shutdown`（退出/不可达） | 刷新状态；仍不可达时重启设备 |
 
 ## 9. 验证状态
 

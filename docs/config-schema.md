@@ -399,6 +399,26 @@ WebUI 不加载任何在线 CDN、不发起 fetch/XHR、不用 `innerHTML` 渲�
   标记存在时不再拉起（不会复活已移除模块）。
   在没有标记的情况下手动对进程执行 TERM，约 5 s 后可能被重新拉起——脚本会打印这一点。
 
+  **操作者重启（`agentcallctl restart` / WebUI“重试服务”）**：桥接进入 `BLOCKED`
+  后的人工恢复路径。契约固定如下：
+  1. `agentcallctl restart` 只接受无参数调用；先核验 `disable`/`remove` 标记（存在即
+     `module_disabled`，不写标记、不执行 CLI）。
+  2. 读取 `/data/adb/agentcall/service.pid`（`service.sh` 写自己的 PID，单行十进制），
+     按 `/proc/<pid>/cmdline` 核验它确实是 `service.sh`；缺失/不可核验返回
+     `service_not_running`（本次开机没有重启循环，只能重启设备）。
+  3. 写 `/data/adb/agentcall/restart.requested`（内容为 `service.sh` 的 PID，0600，
+     先写临时文件再 rename），随后只执行固定 CLI `shutdown`（`shutdown` 失败返回
+     `restart_unconfirmed` 并收回标记）。
+  4. `service.sh` 在桥接**干净退出（退出码 0）**后消费标记：内容必须等于本实例 PID，
+     否则视为跨实例/跨开机的过期标记，记录 `bridge_restart_stale` 后丢弃；
+     `remove`/`disable` 标记存在时记录 `bridge_restart_skipped reason=marked_stopped`
+     并退出（不复活）。每次请求只允许一次重启，另有 `MAX_REQUESTED_RESTARTS` 上限；
+     主动重启不消耗故障重启预算。
+  5. 成功输出只有 `{"restart":"requested"}`：表示请求已被接受，不宣称阻塞条件已修复；
+     WebUI 在真实桥接时启用该动作，演示态/模块目录不可信时保持禁用。
+  6. 卸载时 `uninstall.sh` 先收回待处理的 `restart.requested`，避免 `shutdown` 后
+     又被重启循环拉起。
+
   **诚实边界**：当前桥接没有会话/租约实现（`session.request` 为
   `method_not_implemented`），`shutdown` 只关闭配置服务与 socket，**不能终止或交还
   正在进行的 AI 通话**；脚本会打印这一点，并提示用户先在 Google 电话中手动结束。

@@ -450,6 +450,27 @@
     return availability;
   }
 
+  /**
+   * “重试服务”可用性：必须真的有模块桥接（管理器注入 + 可信模块目录）。
+   * 演示态没有管理器；module_dir_unresolved 时固定命令路径不可信，同一规则禁用。
+   * 只读（io_missing）仍有可执行 CLI，因此保留重试服务。
+   */
+  function retryServiceAvailable() {
+    return bridge.mode !== "demo" && bridge.support.moduleDir !== null;
+  }
+
+  function applyServiceAvailability() {
+    var available = retryServiceAvailable();
+    var button = $("diag-retry-service");
+    if (button) {
+      button.disabled = !available;
+      button.title = available
+        ? "请求桥接干净退出并由 service.sh 重新拉起（固定命令 agentcallctl restart）"
+        : "当前没有可执行的模块桥接，重试服务不可用";
+    }
+    return available;
+  }
+
   /** 只读/演示态：配置输入与密钥动作都不可用，避免“能改但存不了”的误导。 */
   function disableConfigEditing() {
     Array.prototype.forEach.call(
@@ -1106,6 +1127,31 @@
         toast("已重试");
       });
     });
+    // 重试服务：固定模块命令 agentcallctl restart（无参数、无任意 shell）。
+    // 成功只代表“重启请求已被接受”，实际重新拉起由 service.sh 完成。
+    $("diag-retry-service").addEventListener("click", function () {
+      if (!retryServiceAvailable()) {
+        toast("当前为只读/演示状态，不能重试服务", true);
+        return;
+      }
+      confirmAction(
+        "重试服务会请求桥接干净退出，并由 service.sh 在数秒内重新拉起；桥接 BLOCKED 时使用。请确认当前没有正在进行的 AI 通话。",
+        "确认重试服务",
+        function () {
+          bridge.call("restart").then(function (result) {
+            if (result.ok) {
+              toast("已请求重启桥接服务");
+              setText($("ov-bridge-state"), "已请求重启（等待 service.sh 重新拉起）");
+              return;
+            }
+            recordError(result.code, result.message || "");
+            showBanner("err", "重试服务失败：" + (result.message || B.errorText(result.code)), [
+              { label: "关闭", onClick: hideBanner },
+            ]);
+          });
+        },
+      );
+    });
     $("diag-repair").addEventListener("click", repairPairing);
     $("diag-reload").addEventListener("click", function () {
       loadAll();
@@ -1166,6 +1212,7 @@
     });
     // 配置加载完成前保存按钮一律禁用（HTML 里也是 disabled）。
     applySaveAvailability();
+    applyServiceAvailability();
     renderLiveOverview();
 
     if (bridge.mode === "demo") {
@@ -1224,6 +1271,8 @@
     saveConfig: saveConfig,
     saveEnabledOnly: saveEnabledOnly,
     applySaveAvailability: applySaveAvailability,
+    applyServiceAvailability: applyServiceAvailability,
+    retryServiceAvailable: retryServiceAvailable,
     loadAll: loadAll,
   };
 
