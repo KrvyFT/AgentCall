@@ -6,10 +6,11 @@
 - **当前结论：本文件所有验证项均为「未验证」。没有任何一行被真机执行过，也没有任何一行被标记为「已验证」。**
 - JVM 单元测试（`:core:testDebugUnitTest`、`:bridge:testDebugUnitTest`）只证明无设备可测的逻辑；它们不是、也不能代替任何一行真机结论。
 
-## 交付时状态（HEAD `1ee7277`，2026-11-10 最终验收）
+## 当前状态（HEAD `2d924f4`，2026-11-11，11E 已合入）
 
-- 最终验收矩阵（225 个任务）通过：JVM core 125 / bridge 283 / app 323，合计 731，0 失败；
-  lint 0 errors；release APK 与模块 ZIP 已打包，详见 `docs/verification.md`。
+- 最近一次本地矩阵：JVM core 126 / bridge 343 / app 337，合计 806，0 失败；lint 0 errors；
+  11E 已在 HEAD `2d924f4` 合入并重跑 core/bridge。release APK 与模块 ZIP 仍是 11E 之前的
+  产物（哈希见 `docs/verification.md`），最终重新打包后需替换。
 - **交付时 `adb devices` 为空，没有设备连接。** 实现期间曾只读观察到 XQ-DQ72（API 37），
   但 shell uid 2000 没有 `su`，所以没有安装模块、启动桥接、发起通话或执行任何音频测试。
 - 结论不变：**D01–D12 每一行仍为「未验证」**；最终 JVM 计数不构成任何一行真机结论，
@@ -318,7 +319,7 @@ adb shell grep @org.krvyft.agentcall.control /proc/net/unix \
 
 步骤：
 
-1. 采集环境字段：SDK、ROM 指纹、内核、Google 电话版本、框架版本、桥接版本、音频策略摘要、SIM/承载/路由（见第 6 节）。
+1. 采集环境字段：SDK、ROM 指纹、内核、Google 电话版本、框架版本、桥接版本、音频策略摘要、SIM/承载/路由（见第 6 节）。桥接观测不到的 transport/route 由 root 操作员在 `agentcallctl calibrate` 的 `operatorAttestation` 中显式背书（固定词表，`manualTestCompleted=true`）；已观测到的已知值优先，背书不能覆盖。
 2. 依次完成五项：下行识别、对端听到测试语音、麦克风隔离、人工恢复、进程故障注入；每步记录证据。
 3. 检查 `calibration.json`：五个布尔值均为 true、`calibratedAtMs > 0`、环境字段与当前一致；确认 `isVerified` 为 true。
 4. 只改变一个字段（例如切 VoWiFi 或换蓝牙路由），确认 `loadFor` 返回 null、`isVerified` 为 false、自动接听关闭。
@@ -343,10 +344,10 @@ adb shell grep @org.krvyft.agentcall.control /proc/net/unix \
 | bridgeVersion | `agentcallctl status`（当前 BridgeInfo.VERSION=1.0） | 未验证 |
 | audioPolicyDigest | `agentcallctl diagnose`（vendor/system audio policy SHA-256） | 未验证 |
 | simCarrier | 通话上下文/`dumpsys telecom` + `dumpsys telephony.registry` | 未验证；`DeviceProbe` 当前写 UNKNOWN |
-| transport | 通话承载（VoLTE/VoWiFi/CS） | 未验证；`DeviceProbe` 当前写 UNKNOWN |
-| route | `dumpsys audio` 通话路由（手持/蓝牙/耳机） | 未验证；`DeviceProbe` 当前写 UNKNOWN |
+| transport | 通话承载（VoLTE/VoWiFi/CS）；root 操作员可背书 | 未验证；`DeviceProbe` 当前写 UNKNOWN |
+| route | `dumpsys audio` 通话路由（手持/蓝牙/耳机）；root 操作员可背书 | 未验证；`DeviceProbe` 当前写 UNKNOWN |
 
-注意：`DeviceProbe` 在没有通话上下文时把 SIM/承载/路由写成 `UNKNOWN`，而 `CalibrationPolicy.isComplete()` 会拒绝 `UNKNOWN`。因此在通话上下文补全这三项之前，任何环境都无法通过自动接听判定；这是 fail closed 的预期行为，不是绕过校准的理由。
+注意：`DeviceProbe` 在没有通话上下文时把 SIM/承载/路由写成 `UNKNOWN`，而 `CalibrationPolicy.isComplete()` 会拒绝 `UNKNOWN`。11E 允许 root 操作员在 `agentcallctl calibrate` 的 `operatorAttestation` 中显式背书 transport/route（固定词表：transport ∈ CELLULAR/VOWIFI/UNKNOWN，route ∈ EARPIECE/SPEAKER/HEADSET/BLUETOOTH/UNKNOWN；UNKNOWN 不能解锁完整环境）；桥接已观测到的已知值永远优先，背书不能覆盖。其余环境字段与时间戳仍由服务端采集/写入，APP/HOOK 不能背书。没有完整且一致的环境时自动接听保持关闭；这是 fail closed 的预期行为，不是绕过校准的理由。
 
 五项人工测试（全部完成才允许 `calibratedAtMs` 非零并可能解锁）：
 
@@ -358,8 +359,8 @@ adb shell grep @org.krvyft.agentcall.control /proc/net/unix \
 
 ## 7. 任务 5 的 JVM 证据（不是真机证据）
 
-> 本节的 108 / 161 是任务 5 当时的历史计数；最终交付（HEAD `1ee7277`）的计数是
-> core 125 / bridge 283 / app 323，合计 731，见 `docs/verification.md`。本节保留历史记录，
+> 本节的 108 / 161 是任务 5 当时的历史计数；当前（HEAD `2d924f4`，11E 已合入）的计数是
+> core 126 / bridge 343 / app 337，合计 806，见 `docs/verification.md`。本节保留历史记录，
 > 不用它冒充最终数字。
 
 已执行（可复现）：
@@ -379,7 +380,7 @@ BUILD SUCCESSFUL
 - 全部 D01–D12：未验证。
 - 设备侧 root/模块：实现期间 adb 会话无 `su`，交付时无设备连接；无法安装/启动模块或执行 `agentcallctl`；需人工准备 root 环境。
 - 监督/音频工作进程：入口已接入。`service.sh` 启动 `BridgeMain`（控制面 + 监督角色 + 500 ms 轮询 + 状态持久化）与独立 `AudioWorkerMain`（PCM/隔离，root 私有 abstract socket），各自有限重启；但实现期间 adb 无 root、交付时无设备连接，D06/D09/D11 的进程级注入**仍未执行**，SELinux 域、app_process 类加载、真实 AudioManager 反射均未验证。
-- 自动接听仍被两道 fail-closed 闸门关闭：校准证据未验证 + `UnverifiedCallIdentityVerifier` 不可用（`blocksAutoAnswer=true`）。因此真机上监督端当前不会拥有任何 AI 通话；D06/D09 需要先完成 D10 的身份核验与 D12 校准。校准写入通道本身也缺失（bridge `CalibrationStore` 无读/写 RPC），所以 D12 在当前构建下无法从设备侧解除，见 `docs/verification.md` 5.3。
+- 自动接听仍被两道 fail-closed 闸门关闭：校准证据未验证 + `UnverifiedCallIdentityVerifier` 不可用（`blocksAutoAnswer=true`）。因此真机上监督端当前不会拥有任何 AI 通话；D06/D09 需要先完成 D10 的身份核验与 D12 校准。校准写入通道已经存在：root CLI `calibrate` → `calibration.record`（仅 CLI_ROOT），11E 增加 root 操作员对 transport/route 的固定词表背书；但五项人工测试与背书都尚未在真机执行，D12 仍未验证，见 `docs/verification.md` 5.3。
 - 监督端持久状态 `supervisor-state.json`（含 boot_id）、同一开机重启策略（有旧所有权时保持隔离并 BLOCKED）、重启预算与隔离读回均只有 JVM 证据；崩溃/重启时序与 `SystemClock.elapsedRealtime` 行为未在真机验证。
 - 特权 Telecom 精确终止：没有经过真机验证的身份来源；默认 `UnverifiedCallIdentityVerifier` 阻止自动接听，`ReflectiveTelecomTermination` 未在目标 ROM 验证。
 - 音频 HAL/受限方法：未在任何真机上确认三个 AOSP 受限方法可见、可调用、可创建对象，更未确认对端能听到注入。

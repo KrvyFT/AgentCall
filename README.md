@@ -4,12 +4,12 @@ AgentCall 在不替换 Google 电话（`com.google.android.dialer`）的前提�
 Xposed Hook 观察来电与通话状态，AgentCall APK 完成远程 ASR / LLM / TTS 语音回合，KernelSU 模块里的
 `app_process` 特权桥执行 Telecom 控制、音频注入、root 侧配置与中文 WebUI。
 
-> **状态：本地构建与最终验收矩阵通过，不等于可用。** 在 HEAD `1ee7277` 上，225 个任务的
-> 验收矩阵全部通过：JVM 单测 core 125 / bridge 283 / app 323（0 失败），lint 0 error，
-> release APK 与模块 ZIP 已打包。但**没有真机证据**：交付时未连接设备；配对（WebUI/root CLI）
-> 与 APK 的校准 / 诊断界面已实现，校准证据却无法端到端写入桥接，因此生产就绪仍为 `NOT_READY`
-> （`calibration_not_verified`）。设备验收（spec §12）全部待做，见「状态与边界」与
-> `docs/verification.md`。
+> **状态：本地构建与验收矩阵通过，不等于可用。** 最近一次矩阵（HEAD `2d924f4`，11E 已合入）JVM 单测 core 126 / bridge 343 / app 337
+> （0 失败），lint 0 error；release APK 与模块 ZIP 仍是 11E 之前的产物，需按
+> `docs/verification.md` 重新打包并替换最终哈希。但**没有真机证据**：交付时未连接设备；
+> 配对（WebUI/root CLI）、root CLI `calibrate` 与 APK 校准/诊断界面已实现，校准写入需要
+> root 操作员对 transport/route 背书；生产就绪仍为 `NOT_READY`（`calibration_not_verified`），
+> 设备验收（spec §12）全部待做，见「状态与边界」与 `docs/verification.md`。
 
 ## 架构
 
@@ -22,13 +22,13 @@ Google 电话进程 (com.google.android.dialer, Xposed/LSPosed/Vector 作用域)
         ▼
 KernelSU 模块 / root 特权桥 (app_process，uid 0)
   ├─ BridgeMain       控制面 + 监督（5000 ms 心跳、10000 ms 人工接管窗口、180000 ms 上限）
-  ├─ AgentCallCli     root 固定六条命令：status/config-get/config-set/pair/diagnose/shutdown
+  ├─ AgentCallCli     root 固定七条命令：status/config-get/config-set/calibrate/pair/diagnose/shutdown
   ├─ AudioWorkerMain  音频工作角色（独立 app_process，只持有 PCM 与麦克风隔离）
   └─ WebUI            静态中文配置页，只调用固定 CLI，不经 shell 拼接、不发起远程请求
         ▲
         │ 本地 socket + 配对
 AgentCall APK (org.krvyft.agentcall, 普通应用 uid)
-  └─ 远程语音回合、会话状态机、校准/诊断界面与配对（WebUI/root CLI；校准写入桥接的通道缺失）
+  └─ 远程语音回合、会话状态机、校准/诊断界面与配对（WebUI/root CLI；校准证据经 root CLI 写入）
 ```
 
 规则、时钟、会话状态机、协议与安全边界都在 `core`：它不依赖 Android，由 JVM 单测覆盖；
@@ -84,12 +84,13 @@ python3 tools/check_package.py    # 失败即非零退出
   apksigner 的 v4 `.idsig` 旁文件不生成（不属于发布物）。
 - `dist/SHA256SUMS`：`sha256sum` 兼容格式。
 
-本次交付产物（HEAD `1ee7277`，`dist/` 不提交）：
+最近一次打包产物（代码 HEAD `0073cfe`；11E 的桥接改动尚未重新打包，最终以 11E 重跑后的
+`dist/SHA256SUMS` 为准；`dist/` 不提交）：
 
 | 文件 | 大小 | SHA-256 |
 | --- | --- | --- |
-| `dist/agentcall-1.0.zip` | 1,362,660 B | `a1ff82fd5cf87f4e70d824ac6740a3f714ec1bb735a933e1473c5e84ece02f67` |
-| `dist/agentcall-1.0.apk` | 6,435,668 B | `cf479056686b262f9f2c005e43e53fad56f9364b24d048d71580122915942003` |
+| `dist/agentcall-1.0.zip` | 1,389,833 B | `01f5a22da46b27f0d60de5f17b2076add74ee5ffc46b6e7fb079d885312e8be7` |
+| `dist/agentcall-1.0.apk` | 2,266,580 B | `f5ac5b3ed55b9d092e188c10c549f56b9f3d68829a1e3d307019f5a8f66b94a6` |
 | `dist/SHA256SUMS` | 168 B | 与上面两行一致 |
 
 APK 由本机 debug keystore 签名（`CN=Android Debug`，证书 SHA-256
@@ -115,8 +116,8 @@ manifest，打包与 `check_package.py` 都拿容器与 manifest 比对（名称
 
 | 范围 | 状态 |
 | --- | --- |
-| JVM 单测（core/bridge/app） | 本地已验证：125 / 283 / 323，合计 731，0 failures / 0 errors / 0 skipped（HEAD `1ee7277`） |
-| WebUI node 测试、Python 打包测试、模块脚本语法 | 本地已验证：node 79/79、Python 52 tests OK、`sh -n` 4 个脚本（`make test` PASS） |
+| JVM 单测（core/bridge/app） | 最近一次本地矩阵：126 / 343 / 337，合计 806，0 failures / 0 errors / 0 skipped（HEAD `2d924f4`，11E 已合入） |
+| WebUI node 测试、Python 打包测试、模块脚本语法 | 本地已验证：node 113/113（11F 新增停止锁/隔离/重启裁决用例）、Python 52 tests OK、`sh -n` 4 个脚本 |
 | `:app:lintDebug` | 本地已验证：SUCCESSFUL，0 errors、14 warnings（13 条既有告警 + 1 条 `UseKtx`） |
 | release APK、模块 ZIP、SHA256SUMS、打包检查 | 本地已验证：`make build` / `make package-check` PASS；产物与哈希见上表 |
 | `app_process` 容器入口（BridgeMain/AgentCallCli/AudioWorkerMain）与 Kotlin/coroutines/Gson/core 运行库 | 结构级已验证（自研 DEX 解析：只校验类描述符与方法名存在，不校验方法原型/字节码语义） |
@@ -124,7 +125,7 @@ manifest，打包与 `check_package.py` 都拿容器与 manifest 比对（名称
 | 音频 downlink/uplink、麦克风隔离、真实 Google 电话 | **未验证**（无设备证据，不宣称可用） |
 | 人工接管、故障终止、锁屏/重启握手 | **未验证** |
 | KernelSU 真机安装、WebView WebUI、`ksu.io` 路径 | **未验证**（无真机） |
-| 配对（WebUI/root CLI）与 APK 校准/诊断界面 | 已实现；但桥接 `CalibrationStore` 没有读/写 RPC，校准证据无法写入，真机自动接听保持关闭（`calibration_not_verified`） |
+| 配对（WebUI/root CLI）与 APK 校准/诊断界面 | 已实现；root CLI `calibrate` 经 `calibration.record` 写入五项人工证据，transport/route 需 root 操作员显式背书（固定词表）。真机证据仍缺失，自动接听保持关闭（`calibration_not_verified`） |
 | 双卡、VoWiFi、蓝牙 | **未验证**，未测组合不启用 |
 
 多 DEX 说明：`app_process` 的 `PathClassLoader` 只从 classpath JAR 根部的 `classes.dex` 加载类。

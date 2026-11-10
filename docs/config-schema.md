@@ -113,10 +113,12 @@ inbox 中的一次性明文负载只在一次保存期间存在：正常路径�
 
 - `config` 含 `revision`，不含 `secrets`。
 - `secrets` 的值为 `CONFIGURED` 或 `MISSING`，没有原值、没有长度、没有前缀。
-- `status` 负载（16 个键）：`bridgeVersion`、`protocolVersion`、`revision`、`enabled`、
-  `paired`、`uptimeMs`、`processId`、`activeConnections`、`rejectedConnections`、
-  `supervisionPhase`、`supervisionOwned`、`microphoneIsolated`、`supervisionBlocked`、
-  `supervisionLastFault`、`hookConnected`、`dialerDefaultRole`。
+- `status` 负载（17 个键，11E 起含 `shutdownCode`）：`bridgeVersion`、`protocolVersion`、
+  `revision`、`enabled`、`paired`、`uptimeMs`、`processId`、`activeConnections`、
+  `rejectedConnections`、`supervisionPhase`、`supervisionOwned`、`microphoneIsolated`、
+  `supervisionBlocked`、`supervisionLastFault`、`shutdownCode`、`hookConnected`、
+  `dialerDefaultRole`。`shutdownCode` 是最近一次优雅关闭的机器码；未关闭或干净关闭为
+  JSON `null`。
 - `processId`：桥接进程每次启动生成的随机字符串，是判断“桥接是否重启过”的唯一信标。
   缺失、非字符串、含空白/控制字符或超长时，调用方必须按“代次未知”处理，不得当成同一进程；
   `uptimeMs` 只作展示，不能替代它。
@@ -286,7 +288,9 @@ inbox 中的一次性明文负载只在一次保存期间存在：正常路径�
 
 `usage_invalid`、`payload_invalid`、`payload_too_large`、`pair_requires_root`、
 `transport_failed`、`response_id_mismatch`、`cli_failed`、`cli_requires_root`
-（非 root 调用包装器）、`bridge_container_missing`、`app_process_missing`。
+（非 root 调用包装器）、`bridge_container_missing`、`app_process_missing`；
+模块侧 `restart` 另有 `service_not_running`、`module_disabled`、`restart_unconfirmed`、
+`restart_refused`（关闭裁决不干净/仍隔离/缺失）。
 
 ---
 
@@ -304,20 +308,21 @@ inbox 中的一次性明文负载只在一次保存期间存在：正常路径�
 | `calibrate` | 无（argv 负载一律拒绝） | 必须：`{steps:{...五项布尔}, expectedEnvironment?}` JSON | 校准记录结果 `{recorded, environment, steps, verified, blockers, calibratedAtMs}` | 0 | CLI_ROOT |
 | `pair` | 可选一个包名（默认 `org.krvyft.agentcall`） | 不用 | 配对成功负载 | 0 | 仅 root |
 | `diagnose` | 无 | 不用 | 能力/环境报告 | 0 | CLI_ROOT |
-| `shutdown` | 无 | 不用 | `{"stopping":true,"clean":<bool>,"shutdownCode":<string|null>,"supervision":{...}}` | 0 | CLI_ROOT |
+| `shutdown` | 无 | 不用 | `{"stopping":true,"clean":<bool>,"shutdownCode":<string|null>,"supervision":{"clean":<bool>,"ownedSession":<bool>,"termination":<string|null>,"ownershipResolved":<bool>,"disconnected":<bool>,"microphoneIsolated":<bool>,"code":<string|null>}}` | 0 | CLI_ROOT |
 
 `restart` 是模块侧控制动作，不是 AgentCallCli 命令（见 §10）。
 
 退出码：`0` 成功、`1` 服务端错误、`2` 用法/负载错误、`3` 传输失败。
 错误输出始终是单行机器可读 JSON：`{"error":{"code":"...","message":"..."}}`。
 
-**`calibrate` 包装器契约（任务 11D2b）**：`module/bin/agentcallctl calibrate` 只接受零参数；
-stdin 逐字节原样交给 `AgentCallCli calibrate`（包装器不读、不拼、不回显），任何 argv 负载都在
-启动 CLI 之前以 `usage_invalid`（退出码 2）拒绝。外层只做“JSON 对象 + 只允许 `steps`/可选
-`expectedEnvironment`”的形状校验；五项步骤是否齐全、环境是否未知/不一致、以及 `verified`
-裁决仍由桥接的 `calibration.record` handler 独占（唯一权威）。环境与时间戳一律由桥接进程
-重新采集/写入；未知或不一致环境整体拒绝。校准存储未接线时返回 `calibration_unavailable`，
-绝不假装已验证。
+**`calibrate` 包装器契约（任务 11D2b / 11E）**：`module/bin/agentcallctl calibrate` 只接受
+零参数；stdin 逐字节原样交给 `AgentCallCli calibrate`（包装器不读、不拼、不回显），任何
+argv 负载都在启动 CLI 之前以 `usage_invalid`（退出码 2）拒绝。外层只做“JSON 对象 + 只允许
+`steps`、可选 `expectedEnvironment`、可选 `operatorAttestation`，三者都是对象”的形状校验；
+五项步骤是否齐全、环境是否未知/不一致、背书词表/角色、以及 `verified` 裁决仍由桥接的
+`calibration.record` handler 独占（唯一权威）。环境与时间戳一律由桥接进程重新采集/写入；
+root 背书只能填补桥接观测不到的 transport/route，观测到的已知值永远优先。未知或不一致
+环境整体拒绝。校准存储未接线时返回 `calibration_unavailable`，绝不假装已验证。
 
 WebUI 的实际命令行（完整字符串，无用户数据）：
 
@@ -328,40 +333,71 @@ WebUI 的实际命令行（完整字符串，无用户数据）：
 /data/adb/modules/agentcall/bin/agentcallctl pair
 /data/adb/modules/agentcall/bin/agentcallctl diagnose
 /data/adb/modules/agentcall/bin/agentcallctl shutdown
+/data/adb/modules/agentcall/bin/agentcallctl restart
 ```
 
-`calibrate` 只作为 root 操作员命令提供（见下方校准通道），WebUI 不调用它。
+WebUI 使用上述七条固定操作；`calibrate` 只作为 root 操作员命令提供（见下方校准通道），
+WebUI 不调用它。
 
 - 没有任意 RPC、没有任意 shell、没有把用户输入拼进命令。
 - 模块目录必须匹配 `^/data/adb/modules/[A-Za-z][A-Za-z0-9._-]+$`；无法确认时拒绝执行。
 - 旧管理器没有 `moduleInfo()` 时回退到固定路径 `/data/adb/modules/agentcall`，
   不拼接任何外部输入。
 
-**校准通道（11A/11D2b）**：`calibration.read`（APP 只读，CLI_ROOT 也可读）与
+**校准通道（11A/11D2b/11E）**：`calibration.read`（APP 只读，CLI_ROOT 也可读）与
 `calibration.record`（仅 CLI_ROOT）是控制 socket 上的固定 RPC 方法。操作员入口是
 `agentcallctl calibrate`（零参数，JSON 只从 stdin 进入）；WebUI 不提供该动作，也不伪造
-校准证据。`calibration.record` 只接受五项布尔人工测试步骤与可选的“预期环境”，环境与
-时间戳一律由桥接进程重新采集/写入；未知或不一致环境整体拒绝。校准存储未接线时返回
-`calibration_unavailable`，绝不假装已验证。
+校准证据。`calibration.record` 接受五项布尔人工测试步骤、可选的“预期环境”与可选的
+`operatorAttestation`；环境与时间戳一律由桥接进程重新采集/写入（背书只补 transport/route），
+未知或不一致环境整体拒绝。校准存储未接线时返回 `calibration_unavailable`，绝不假装已验证。
 
-**`shutdown` 结果语义（11D2a/11D2b）**：响应固定为
+**`operatorAttestation`（11E，root 操作员背书）**：对象只允许三个键，多键/少键/错误类型都
+整体拒绝（`payload_invalid`）：
+
+| 键 | 类型/词表 | 语义 |
+| --- | --- | --- |
+| `transport` | string；`CELLULAR` / `VOWIFI` / `UNKNOWN` | 通话承载；只有 bridge 观测为 UNKNOWN 时才采用 |
+| `route` | string；`EARPIECE` / `SPEAKER` / `HEADSET` / `BLUETOOTH` / `UNKNOWN` | 音频路由；只有 bridge 观测为 UNKNOWN 时才采用 |
+| `manualTestCompleted` | 必须是 JSON `true` | 操作员确认五项人工测试真实完成 |
+
+- APP/HOOK 不能调用 `calibration.record`（RolePolicy 已拒绝，handler 再按角色二次拒绝），
+  因此不能提供背书。
+- bridge 已观测到的已知 transport/route 永远优先，背书不能覆盖；`UNKNOWN` 不能解锁完整
+  环境。
+- 写入响应的 `operatorAttestation` 为 `{operatorAttested, transport, route}`；只有确实由
+  root 背书、且对应观测值为 UNKNOWN 时才标记 `operatorAttested=true`。
+- `calibration.read`/status/diagnose 的校准视图同样暴露 `operatorAttestation` 与
+  `effectiveEnvironment`，避免把“服务端观测”与“操作员背书”混为一谈。
+
+**`shutdown` 结果语义（11D2a/11D2b/11E）**：响应固定为
 `{"stopping":true,"clean":<bool>,"shutdownCode":<string|null>,"supervision":
 {"clean":...,"ownedSession":...,"termination":...,"ownershipResolved":...,
-"disconnected":...,"microphoneIsolated":...,"code":...}}`。
-`clean=true` 等价于 `shutdownCode=null`。拥有中的通话只有在终止/交还并确认断开、且
-恢复读回为未隔离时才得到 `null`；但**没有**拥有中的通话时桥接不执行终止/交还，可能
-原样返回 `microphoneIsolated=true` 而仍是 `clean=true`——所以读回时必须同时检查
-`supervision.microphoneIsolated=false`，不能只看 `clean`。
+"disconnected":...,"microphoneIsolated":...,"code":...}}`。三个顶层字段是
+`clean` / `shutdownCode` / `supervision.microphoneIsolated`；`clean=true` 等价于
+`shutdownCode=null`。拥有中的通话只有在终止/交还并确认断开、且恢复读回为未隔离时才得到
+`null`。
+
+11E 起 **没有拥有中的通话时也会处理观测到的隔离**：恢复成功才是 `clean=true`；仍隔离
+返回 `clean=false` + `shutdown_microphone_still_isolated`（不再出现“`clean=true` 但
+`microphoneIsolated=true`”的矛盾形状）。调用方仍应同时检查
+`mic = supervision.microphoneIsolated`，不能只看 `clean`（旧版 bridge 可能仍有该形状）。
 `shutdown_call_unresolved` = 期限内无法确认断开，保持隔离并保留粘性所有权标记；
 `shutdown_microphone_restore_failed` = 已确认断开但恢复读回失败并进入 `BLOCKED`；
+`shutdown_microphone_still_isolated` = 没有可恢复/未取得未隔离读回，隔离保持；
 `shutdown_failed` = 监督端关闭自身抛异常。`status` 同时暴露 `shutdownCode`、
-`supervisionPhase`（IDLE/…/ENDED/BLOCKED）与 `microphoneIsolated`。卸载脚本据此读回
+`supervisionPhase`（IDLE/…/ENDED/BLOCKED）与 `microphoneIsolated`。模块脚本据此读回
 裁决：只有 `clean=true` + `shutdownCode=null` + `microphoneIsolated=false` + phase
 `IDLE`/`ENDED`（或进程/socket 已退出）才宣称“已确认干净关闭”；否则打印机器可读警告。
+`service.sh` 在关闭响应之外，只要桥接在退出等待后仍存活就再做一次最终 `status` 探测；
+隔离仍为 true 时打印 `! microphone_still_isolated ...` 与 `bridge_stop_unclean`。
 
-**停止顺序（模块侧硬契约）**：`service.sh` 的停止/退出路径与 `uninstall.sh` 都先发固定
-CLI `shutdown` 并等待桥接退出，再停音频工作进程，最后对有界升级 TERM→KILL。顺序颠倒会
-让桥接的麦克风恢复请求不可达（音频工作进程已死），麦克风保持全局静音。
+**停止顺序（模块侧硬契约）**：`service.sh` 的停止/退出路径与 `uninstall.sh` 都先取
+`/data/adb/agentcall/stop.lock`（`flock`，最多等待 40 s；无 flock 时退回 `mkdir` 原子目录锁），
+再发固定 CLI `shutdown` 并等待桥接退出，再停音频工作进程，最后有界升级 TERM→KILL。
+锁使两个脚本的优雅关闭序列串行化：没有它，第二个 CLI shutdown 可能在第一个的恢复窗口内
+杀音频工作进程（11F / I4）。等待预算与 11E 的 20 s CLI socket 超时对齐：`service.sh` 等
+CLI 结果最多 25 s、等桥接退出最多 10 s；`uninstall.sh` 相同，最终 status 探测单独最多 5 s。
+顺序颠倒会让桥接的麦克风恢复请求不可达（音频工作进程已死），麦克风保持全局静音。
 
 ---
 
@@ -380,7 +416,7 @@ CLI `shutdown` 并等待桥接退出，再停音频工作进程，最后对有�
 
 | 状态 | 条件 | 能力 |
 | --- | --- | --- |
-| `kernelsu` | 有 `ksu.exec`、`ksu.io()` ≥ v1、模块目录可信（`moduleInfo` 缺少 `moduleDir` 时回退固定路径） | 全部固定命令（WebUI 使用其中六条，不含 `calibrate`）；保存可用 |
+| `kernelsu` | 有 `ksu.exec`、`ksu.io()` ≥ v1、模块目录可信（`moduleInfo` 缺少 `moduleDir` 时回退固定路径） | 全部固定操作（WebUI 使用其中七条：status/config-get/config-set/pair/diagnose/shutdown/restart；不含 root-only `calibrate`）；保存可用 |
 | `readonly`（`io_missing`） | 有 `ksu.exec`，但没有 `ksu.io()`（或 `version()<1`） | 读取/诊断/配对/关闭可用；**保存一律拒绝**（`secret_transport_unsupported`），绝不降级为 base64/echo 命令行参数 |
 | `readonly`（`module_dir_unresolved`） | `moduleInfo()` **明确给出**不可信的 `moduleDir` | 需要执行 CLI 的命令禁用；固定路径日志读取仍可用（日志不依赖模块目录）；保存拒绝 |
 | `demo` | 普通浏览器，没有管理器注入 | 明确标注“演示数据”，保存、配对、日志均不可用；不发起任何网络请求 |
@@ -439,21 +475,25 @@ WebUI 不加载任何在线 CDN、不发起 fetch/XHR、不用 `innerHTML` 渲�
 - 卸载：`uninstall.sh` 分开探测 abstract socket 是否存在与固定 CLI 是否可执行
   （socket 存在不等于 CLI 可执行），并固定以下顺序（任务 11D2b）：
   1. 收回待处理的 `restart.requested`；
-  2. 两者都可用 → 固定 CLI `shutdown`，分别有界等待 CLI 返回（`STOP_WAIT_SECONDS`，
-     默认 15 s）与桥接进程/socket 消失；桥接在响应前完成终止/交还 + 麦克风读回；
-  3. 读回关闭裁决：shutdown 响应的 `clean`/`shutdownCode`/`supervision.microphoneIsolated`，
-     桥接仍可响应时再读 `status` 的 `supervisionPhase`/`microphoneIsolated`。只有
-     `clean=true`、`shutdownCode=null`、`microphoneIsolated=false` 且 phase 为
+  2. 取 `/data/adb/agentcall/stop.lock`（`flock`，最多等 40 s）与 `service.sh` 串行化；
+     拿不到锁时打印 `stop_lock_timeout` 并跳过重复的关闭请求，只做有界 PID 回退；
+  3. 两者都可用 → 固定 CLI `shutdown`，分别有界等待 CLI 返回（`STOP_WAIT_SECONDS`，
+     默认 25 s，覆盖 11E 的 20 s socket 超时）与桥接进程/socket 消失（`BRIDGE_EXIT_WAIT_SECONDS`，
+     默认 10 s）；桥接在响应前完成终止/交还 + 麦克风读回；
+  4. 读回关闭裁决：shutdown 响应的 `clean`/`shutdownCode`/`supervision.microphoneIsolated`，
+     桥接仍可响应时再读 `status` 的 `supervisionPhase`/`microphoneIsolated`（最多 5 s）。
+     只有 `clean=true`、`shutdownCode=null`、`microphoneIsolated=false` 且 phase 为
      `IDLE`/`ENDED`（或进程/socket 已退出）才输出“已确认干净关闭”；否则输出机器可读
      警告 `! shutdown_result clean=... shutdownCode=... phase=... microphoneIsolated=... owned=... cli=...`
      并明确“未确认通话已终止或交还；麦克风可能仍被隔离”，绝不宣称已交还；
-  4. 音频工作进程（`/data/adb/agentcall/audio-worker.pid`，由 `service.sh` 写入单个
+  5. 音频工作进程（`/data/adb/agentcall/audio-worker.pid`，由 `service.sh` 写入单个
      数字 PID）在优雅关闭请求**之后**才处理：核验 `AudioWorkerMain`/`agentcall-audio-worker`
      后 TERM → 有界等待 → KILL。顺序不能颠倒：先杀它会让恢复请求不可达；
-  5. 残留桥接（`/data/adb/agentcall/bridge.pid`）同样核验 `BridgeMain`/`agentcall-bridge`
+  6. 残留桥接（`/data/adb/agentcall/bridge.pid`）同样核验 `BridgeMain`/`agentcall-bridge`
      后 TERM → 有界等待 → KILL；任一 PID 文件缺失/不可核验时**不猜测 PID**，显式警告；
-  6. 最后才删除 `/data/adb/agentcall`（连同“所有权可能仍在”的粘性标记）。两个 PID
-     文件的写/读格式由 `module-scripts.test.mjs` 绑定到 `service.sh`（首行 + 仅十进制数字）。
+  7. 释放停止锁，最后才删除 `/data/adb/agentcall`（连同“所有权可能仍在”的粘性标记）。
+     两个 PID 文件的写/读格式由 `module-scripts.test.mjs` 绑定到 `service.sh`
+     （首行 + 仅十进制数字）。
 
   脚本能保证：有界地停止进程、读回并打印关闭裁决。脚本不能保证：桥接不响应时的
   通话终止/交还、麦克风隔离解除，或重启后的系统静音状态（重启会重新初始化系统音频，
@@ -475,25 +515,32 @@ WebUI 不加载任何在线 CDN、不发起 fetch/XHR、不用 `innerHTML` 渲�
      按 `/proc/<pid>/cmdline` 核验它确实是 `service.sh`；缺失/不可核验返回
      `service_not_running`（本次开机没有重启循环，只能重启设备）。
   3. 写 `/data/adb/agentcall/restart.requested`（内容为 `service.sh` 的 PID，0600，
-     先写临时文件再 rename），随后只执行固定 CLI `shutdown`（该 `shutdown` 现在会先
-     优雅终止/交还通话并读回恢复麦克风；失败返回 `restart_unconfirmed` 并收回标记）。
-  4. `service.sh` 在桥接**干净退出（退出码 0）**后消费标记：内容必须等于本实例 PID，
+     先写临时文件再 rename），随后只执行固定 CLI `shutdown`（该 `shutdown` 会先优雅
+     终止/交还通话并读回恢复麦克风）。
+  4. 关闭裁决必须可核验：只有 `clean=true` + `shutdownCode=null` +
+     `microphoneIsolated=false` 才继续重启；`clean=false`、麦克风仍隔离（包括没有拥有
+     会话但隔离仍为 true 的旧形状）或裁决缺失都收回标记并返回 `restart_refused`，
+     消息带 `clean=... shutdownCode=... microphoneIsolated=...` 或 `verdict_missing`。
+     CLI 未接受关闭（退出码非 0）仍返回 `restart_unconfirmed`。
+  5. `service.sh` 在桥接**干净退出（退出码 0）**后消费标记：内容必须等于本实例 PID，
      否则视为跨实例/跨开机的过期标记，记录 `bridge_restart_stale` 后丢弃；
      `remove`/`disable` 标记存在时记录 `bridge_restart_skipped reason=marked_stopped`
      并退出（不复活）。每次请求只允许一次重启，另有 `MAX_REQUESTED_RESTARTS` 上限；
      主动重启不消耗故障重启预算。
-  5. 成功输出只有 `{"restart":"requested"}`：表示请求已被接受，不宣称阻塞条件已修复；
-     WebUI 在真实桥接时启用该动作，演示态/模块目录不可信时保持禁用。
-  6. 卸载时 `uninstall.sh` 先收回待处理的 `restart.requested`，避免 `shutdown` 后
+  6. 成功输出只有 `{"restart":"requested"}`：表示请求已被接受，不宣称阻塞条件已修复；
+     WebUI 在真实桥接时启用该动作，演示态/模块目录不可信时保持禁用；`restart_refused`
+     时 WebUI 明确显示“关闭未确认干净/麦克风可能仍被隔离，本次没有重启”。
+  7. 卸载时 `uninstall.sh` 先收回待处理的 `restart.requested`，避免 `shutdown` 后
      又被重启循环拉起。
 
   **诚实边界**：桥接已实现会话/租约（`session.request`、`session.command`、
   `session.heartbeat`、`session.events`、`session.handover` 与租约管理）与优雅关闭
   （11D2a）：`shutdown` 会先尝试终止/交还拥有的通话，取得“已断开/已不归 AI”的事实后
   才读回恢复麦克风；期限内无法确认时保持隔离并以 `shutdown_call_unresolved`
-  （`clean=false`）失败关闭，恢复读回失败时为 `shutdown_microphone_restore_failed`。
-  模块侧（11D2b）只在音频工作进程仍存活时请求该关闭，并在卸载时读回裁决、失败时显式
-  警告。**脚本不能替代手动结束通话**：桥接已退出/不响应时优雅路径不可达，脚本也无法
+  （`clean=false`）失败关闭，恢复读回失败时为 `shutdown_microphone_restore_failed`，
+  没有拥有会话但隔离仍保持时为 `shutdown_microphone_still_isolated`（`clean=false`）。
+  模块侧（11D2b/11F）只在音频工作进程仍存活时请求该关闭，并用 stop.lock 串行化
+  service.sh/uninstall.sh 的停止序列；读回仍隔离时显式警告，不宣称干净停止。**脚本不能替代手动结束通话**：桥接已退出/不响应时优雅路径不可达，脚本也无法
   自行解除麦克风隔离。不修改 Google 电话默认角色、vendor 音频配置或 SELinux。
 
   **未验证**：上述 PID 核验/终止分支只有 `sh -n` 与宿主脚本断言/进程替身证据，
@@ -518,9 +565,11 @@ WebUI 不加载任何在线 CDN、不发起 fetch/XHR、不用 `innerHTML` 渲�
   再停音频工作进程、最后 TERM→KILL”只有宿主进程替身证据（`shutdown-order.test.mjs`、
   `module-scripts.test.mjs`）。真机 KernelSU 卸载时序、`app_process` 在停止/重启窗口内
   能否及时响应 `shutdown`、以及卸载时读到的 `supervisionPhase` 均**未验证**。
-- **`calibrate` 包装器未上机**：stdin 逐字节透传与 argv 拒绝只有宿主 `sh` 替身证据；
-  真机 `app_process` 的 stdin 继承与校准环境探针**未验证**。当前环境 `transport`/`route`
-  仍为 UNKNOWN 时桥接会按 `calibration_environment_unknown` 拒绝，不会伪造环境事实。
+- **`calibrate` 包装器/背书未上机**：stdin 逐字节透传、argv 拒绝、`operatorAttestation`
+  词表与角色拒绝只有宿主/JVM 证据；真机 `app_process` 的 stdin 继承与校准环境探针
+  **未验证**。`transport`/`route` 观测为 UNKNOWN 时，只有 root 操作员用固定词表背书
+  才能补齐；`UNKNOWN` 背书不完整时仍按 `calibration_environment_unknown` 拒绝，不会
+  伪造环境事实。APP/HOOK 不能背书。
 - **概览实时字段**：`hookConnected`/`dialerDefaultRole` 已由桥接 status 提供，但只有
   JVM 假替身证据（`BridgeStatusLiveValuesTest`、`DialerDefaultRoleProbeTest`）。真机上
   `RoleManager` 隐藏方法（`getRoleHolders`）的反射可用性、root 的权限判定与真实取值

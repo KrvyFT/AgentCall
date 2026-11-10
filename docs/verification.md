@@ -3,9 +3,11 @@
 本文件记录 AgentCall 在交付提交上的实际执行结果。只写可复现命令与原始结果；
 没有执行的项一律进入「未运行」清单，不用静态阅读或 JVM 测试代替真机结论。
 
-- 记录时间：2026-11-10（Asia/Shanghai）
+- 记录时间：2026-11-11（Asia/Shanghai）
 - 仓库：`/home/krvy/Projects/AgentCall`
-- 分支 / HEAD：`master` / `1ee7277`
+- 分支 / HEAD：`master` / `2d924f4`（11E 已合入：关闭预算 + root 校准背书）
+- 11E 只改 bridge/core；app 结果沿用 11E 之前的 337。产物尚未在 11E 后重新打包，
+  最终 `dist/` 哈希需按第 9 节重跑替换。
 - 远程仓库：`https://github.com/KrvyFT/AgentCall`（public，默认分支 `master`）；文档中不含任何令牌或凭据。
 - 验收执行者：控制器（controller）；本文件在交付时重新读取测试 XML、重跑 `make test` 与
   `make package-check`，并核对产物哈希、签名与工具链版本。
@@ -39,7 +41,8 @@
 
 ## 3. 最终验收矩阵
 
-在 HEAD `1ee7277` 上由控制器执行：
+最近一次矩阵（HEAD `2d924f4`；11E 在最后两个提交上重跑 core/bridge，app 未受 11E 影响；
+产物仍是 11E 之前的构建，最终重新打包/哈希替换见 4.5）：
 
 ```sh
 flock /tmp/agentcall-gradle.lock ./gradlew \
@@ -47,14 +50,16 @@ flock /tmp/agentcall-gradle.lock ./gradlew \
   :app:lintDebug :app:assembleRelease :bridge:packageRuntime --rerun-tasks
 ```
 
-结果：`BUILD SUCCESSFUL`，**225 个 actionable task 实际执行**（`--rerun-tasks`，没有复用旧结果）。
+结果：`BUILD SUCCESSFUL`（原完整矩阵 225 个 actionable task；11E 在 `2d924f4` 以
+`:core:testDebugUnitTest :bridge:testDebugUnitTest :bridge:assembleDebug --rerun-tasks`
+重跑 core/bridge，68 个 task 实际执行，没有复用旧结果）。
 
 | 验证面 | 实际结果 |
 | --- | --- |
-| `:core:testDebugUnitTest` | 125 tests，0 failures / 0 errors / 0 skipped |
-| `:bridge:testDebugUnitTest` | 283 tests，0 failures / 0 errors / 0 skipped |
-| `:app:testDebugUnitTest` | 323 tests，0 failures / 0 errors / 0 skipped |
-| 合计 JVM | **731 tests，全部通过** |
+| `:core:testDebugUnitTest` | 126 tests，0 failures / 0 errors / 0 skipped |
+| `:bridge:testDebugUnitTest` | 343 tests，0 failures / 0 errors / 0 skipped（11E 关闭预算修复后重跑） |
+| `:app:testDebugUnitTest` | 337 tests，0 failures / 0 errors / 0 skipped（11E 未改 app） |
+| 合计 JVM | **806 tests，全部通过**（11E 最后重跑 core/bridge；app 未受 11E 影响） |
 | `:app:lintDebug` | SUCCESSFUL；0 errors，14 warnings（明细见 4.2） |
 | `:app:assembleRelease` | SUCCESSFUL |
 | `:bridge:packageRuntime` | SUCCESSFUL |
@@ -71,10 +76,10 @@ flock /tmp/agentcall-gradle.lock ./gradlew \
 
 | 模块 | 测试类 XML 数 | tests | failures | errors | skipped |
 | --- | --- | --- | --- | --- | --- |
-| `:core` | 7 | 125 | 0 | 0 | 0 |
-| `:bridge` | 44 | 283 | 0 | 0 | 0 |
-| `:app` | 26 | 323 | 0 | 0 | 0 |
-| 合计 | 77 | **731** | 0 | 0 | 0 |
+| `:core` | 7 | 126 | 0 | 0 | 0 |
+| `:bridge` | 49 | 343 | 0 | 0 | 0 |
+| `:app` | 28 | 337 | 0 | 0 | 0 |
+| 合计 | 84 | **806** | 0 | 0 | 0 |
 
 这些是宿主 JVM 上的逻辑测试，**不能**代替任何真机结论（见第 5 节）。
 
@@ -101,8 +106,8 @@ flock /tmp/agentcall-gradle.lock ./gradlew \
 
 交付时重跑 `make test` 通过（退出码 0）：
 
-- JVM 单测：同上 731 项。
-- WebUI node 测试：`node --test module/webroot/tests/*.test.mjs`，79 tests / 79 pass / 0 fail / 0 skipped。
+- JVM 单测：同上 806 项（HEAD `2d924f4`，11E 最后重跑 core/bridge）。
+- WebUI node 测试：`node --test module/webroot/tests/*.test.mjs`，113 tests / 113 pass / 0 fail / 0 skipped（11F 新增停止锁、隔离读回与 restart 裁决用例）。
 - Python 打包测试：`python3 -m unittest discover -s tools/tests -v`，52 tests，OK；`py_compile` 通过。
 - 模块脚本语法：`sh -n` 检查 `customize.sh`、`service.sh`、`uninstall.sh`、`bin/agentcallctl`。
 - `make package-check` 重跑：`Status: PASS`（结构、版本、签名、SHA-256 见 4.5）。
@@ -113,9 +118,13 @@ flock /tmp/agentcall-gradle.lock ./gradlew \
 
 | 文件 | 大小 | SHA-256 |
 | --- | --- | --- |
-| `dist/agentcall-1.0.zip` | 1,362,660 B | `a1ff82fd5cf87f4e70d824ac6740a3f714ec1bb735a933e1473c5e84ece02f67` |
-| `dist/agentcall-1.0.apk` | 6,435,668 B | `cf479056686b262f9f2c005e43e53fad56f9364b24d048d71580122915942003` |
+| `dist/agentcall-1.0.zip` | 1,389,833 B | `01f5a22da46b27f0d60de5f17b2076add74ee5ffc46b6e7fb079d885312e8be7` |
+| `dist/agentcall-1.0.apk` | 2,266,580 B | `f5ac5b3ed55b9d092e188c10c549f56b9f3d68829a1e3d307019f5a8f66b94a6` |
 | `dist/SHA256SUMS` | 168 B | 两行，分别匹配上面两个摘要 |
+
+这些哈希对应**最近一次已完成打包**（代码 HEAD `0073cfe`，11E 之前）。11E（`cd2f4e5` /
+`2d924f4`）改了 bridge（关闭预算 / 校准背书），但尚未重新打包；必须按第 9 节重新构建并
+替换本节哈希，在那之前不要把本表当作最终产物。
 
 模块 ZIP 共 **11 个条目**（`bin/agentcallctl`、`bridge/agentcall-bridge.jar`、
 `bridge/agentcall-bridge.dex-manifest.json`、`customize.sh`、`module.prop`、`service.sh`、
@@ -135,7 +144,7 @@ flock /tmp/agentcall-gradle.lock ./gradlew \
   （`BridgeInfo.VERSION`），不另写一份版本号。
 - 运行时容器携带 **dex manifest（schema 2）**：记录每个 dex 的 name/SHA-256/size、
   来源 bridge APK 摘要与 `bridgeVersion`；本次容器内为 `classes.dex`
-  （sha256 `b72391c09b24e05be396fe2aa6b144f943164601bf76989959ef206dcb3c5401`）。
+  （sha256 `8228dad5888b2a9baa3aff9cf834451c98625ffbc4dacffefa46a9e07e31170f`）。
 - 模块 `module.prop` 为 `1.0` / `1`，与 APK 版本一致；不一致时打包直接失败。
 - DEX 覆盖只用容器 manifest 校验，不用 app APK（两者是不同产物）。
 
@@ -143,11 +152,11 @@ flock /tmp/agentcall-gradle.lock ./gradlew \
 
 ### 5.1 本地已验证（宿主环境）
 
-- 最终验收矩阵：225 个任务执行，BUILD SUCCESSFUL。
-- JVM 单测：core 125 / bridge 283 / app 323，合计 731，0 failures / 0 errors / 0 skipped。
+- 最近一次矩阵：BUILD SUCCESSFUL（11E 在 `2d924f4` 重跑 core/bridge）。
+- JVM 单测：core 126 / bridge 343 / app 337，合计 806，0 failures / 0 errors / 0 skipped。
 - Lint：`:app:lintDebug` SUCCESSFUL，0 errors、14 warnings（全部 warning）。
 - Release APK 与 bridge 运行时容器均构建成功。
-- `make test` PASS：JVM + WebUI node（79）+ Python（52）+ 4 个模块脚本语法。
+- `make test` PASS：JVM + WebUI node（113）+ Python（52）+ 4 个模块脚本语法。
 - `make build` PASS；`make package-check` PASS。
 - 产物结构、版本一致性、DEX manifest 覆盖、debug 签名类型、密钥泄漏检查与 SHA-256 均已核对。
 - 容器 manifest 的版本、每个 dex 的哈希与大小、来源 APK 摘要已核对。
@@ -169,11 +178,13 @@ flock /tmp/agentcall-gradle.lock ./gradlew \
 
 ### 5.3 阻塞项（保持失败关闭，不伪造）
 
-1. **校准证据写入通道缺失（端到端）**：APK 校准页只能写自身
-   SharedPreferences；bridge 的 `CalibrationStore` 没有读/写 RPC，固定 CLI 命令表也没有校准
-   写操作。因此没有任何客户端能写入「五项人工测试」事实。生产就绪**有意保持
-   NOT_READY（`calibration_not_verified`）**，自动接听在真机上无法被启用，直到出现可验证的
-   运营者写入路径。必须继续 fail closed，不能在本机记录层面伪造授权。
+1. **校准证据仍缺真机验证（不是缺写入通道）**：root CLI `calibrate` 经
+   `calibration.record`（仅 CLI_ROOT）写入五项人工测试证据；APK 校准页只写自身
+   SharedPreferences，WebUI 不写校准。11E 增加 root 操作员对 bridge 观测不到的
+   transport/route 的显式背书（固定词表，服务端构建其余环境与时间戳）。当前没有真机
+   执行过任何一项人工测试，也没有设备可做 operator attestation，因此生产就绪**有意保持
+   NOT_READY（`calibration_not_verified`）**。必须继续 fail closed，不能在本机记录层面
+   伪造授权。
 2. **APK 只有 debug 签名**：不可分发；需发布密钥重签并重生成 `SHA256SUMS`。
 3. **交付时没有连接设备**：`adb devices` 为空。此前实现期间曾只读观察到一台
    XQ-DQ72（API 37），但 `adb shell` 是 uid 2000，`su` 不可用，所以**没有在设备上运行
@@ -212,7 +223,9 @@ WebUI 在保存/读取失败时显示「配对已失效」横幅，并给出「�
 - 没有发起任何真实付费 API 请求（ASR/LLM/TTS）。
 - 没有写入任何校准证据；没有启用自动接听。
 - 没有用发布密钥重签 APK。
-- 没有重跑完整验收矩阵之外的设备检查；本文件中的矩阵结果来自控制器在 HEAD `1ee7277` 的执行。
+- 没有重跑完整验收矩阵之外的设备检查；本文件中的矩阵结果来自最近一次本地执行
+  （HEAD `2d924f4`；11E 在最后两个提交上重跑 core/bridge，app 沿用未受影响的 337）。
+  11E 之后尚未重新打包，最终产物哈希必须重跑替换。
 
 ## 9. 复现入口
 

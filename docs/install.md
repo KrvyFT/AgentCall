@@ -2,9 +2,9 @@
 
 本文描述 AgentCall 的安装范围、配对、配置、校准、升级与卸载。**所有真机步骤均为「未验证」**：
 交付时 `adb devices` 为空，本仓库没有真机 Google 电话、KernelSU WebView 或音频证据。
-最终验收矩阵（HEAD `1ee7277`，225 个任务）只在本地通过：JVM 单测 731
-（core 125 / bridge 283 / app 323）、lint 0 error、release APK 与模块 ZIP 已打包；
-标注「未验证」的条目仍不能当作已可用。
+最近一次本地矩阵（HEAD `2d924f4`，11E 已合入）通过：JVM 单测 806
+（core 126 / bridge 343 / app 337）、lint 0 error；release APK 与模块 ZIP 仍是 11E 之前的
+产物，需重新打包并替换哈希。标注「未验证」的条目仍不能当作已可用。
 
 ## 1. 产物与前提
 
@@ -16,10 +16,11 @@
 | `dist/agentcall-<version>.apk` | AgentCall APK（Xposed 模块 + 远程语音回合） |
 | `dist/SHA256SUMS` | 两个产物的 SHA-256 |
 
-本次交付（HEAD `1ee7277`）：`agentcall-1.0.zip` 1,362,660 B，SHA-256
-`a1ff82fd5cf87f4e70d824ac6740a3f714ec1bb735a933e1473c5e84ece02f67`；
-`agentcall-1.0.apk` 6,435,668 B，SHA-256
-`cf479056686b262f9f2c005e43e53fad56f9364b24d048d71580122915942003`。
+最近一次打包（代码 HEAD `0073cfe`；11E 的 bridge 改动尚未重新打包，最终以 11E 重跑后的
+`dist/SHA256SUMS` 为准）：`agentcall-1.0.zip` 1,389,833 B，SHA-256
+`01f5a22da46b27f0d60de5f17b2076add74ee5ffc46b6e7fb079d885312e8be7`；
+`agentcall-1.0.apk` 2,266,580 B，SHA-256
+`f5ac5b3ed55b9d092e188c10c549f56b9f3d68829a1e3d307019f5a8f66b94a6`。
 以 `dist/SHA256SUMS` 为准。
 
 版本单一来源是 APK 的 `versionName/versionCode`；ZIP 内 `module.prop` 由它渲染，不一致时打包直接失败。
@@ -119,19 +120,24 @@ su -c /data/adb/modules/agentcall/bin/agentcallctl pair org.krvyft.agentcall
 ## 5. 配置与 WebUI（未验证）
 
 KernelSU 管理器里打开 AgentCall 模块的 WebUI（静态资源随模块安装，无在线 CDN）。
-WebUI 只调用模块内的固定包装器 `bin/agentcallctl` 六条命令，不接受任意 shell；
-包装器另有 root 操作员命令 `calibrate`（JSON 只从 stdin 进入）与模块侧 `restart`：
+WebUI 只调用模块内的固定包装器 `bin/agentcallctl` 的**七条**固定操作，不接受任意 shell；
+包装器另有 root 操作员命令 `calibrate`（JSON 只从 stdin 进入，WebUI 不调用）：
 
 ```
-status | config-get | config-set（JSON 从 stdin） | pair | diagnose | shutdown
-calibrate（JSON 从 stdin；只作为 root 操作员命令，WebUI 不调用） | restart（模块侧重启）
+WebUI（七条）：status | config-get | config-set（JSON 从 stdin） | pair | diagnose | shutdown | restart
+root 操作员（不供 WebUI）：calibrate（JSON 从 stdin）
 ```
+
+`restart` 是模块侧控制动作：先写重启标记，再执行固定 CLI `shutdown`；只有关闭裁决为
+`clean=true` + `shutdownCode=null` + `microphoneIsolated=false` 才继续。若关闭不干净、
+麦克风仍隔离（包括没有拥有会话但隔离仍为 true）或裁决缺失，则收回标记并返回
+`restart_refused`（带机器码/隔离原因），不盲目重启。
 
 能力状态：
 
 | 状态 | 条件 | 能力 |
 | --- | --- | --- |
-| `kernelsu` | `ksu.exec` + `ksu.io()` v1 + 模块目录可信 | WebUI 的六条命令，保存可用 |
+| `kernelsu` | `ksu.exec` + `ksu.io()` v1 + 模块目录可信 | WebUI 的七条固定操作，保存可用 |
 | `readonly` | 缺少 `ksu.io()` | 读取/诊断/配对/关闭可用，**保存被拒绝** |
 | `readonly` | `moduleInfo()` 明确给出不可信 `moduleDir` | 依赖模块目录的命令禁用，固定路径日志仍可读 |
 | `demo` | 普通浏览器无管理器注入 | 明确标注模拟数据，不发起任何请求 |
@@ -200,7 +206,8 @@ JSON 只从 stdin 进入，argv 携带负载会在启动 CLI 前以 `usage_inval
 | `manualRestoreVerified` | 人工接管能解除隔离并交还麦克风 |
 | `processFailureVerified` | 进程故障注入后仍能故障终止/保持隔离 |
 
-记录示例（先写 root 私有文件，再重定向 stdin；`calibrate` 不会自动删除该文件，写完请手动删除）：
+记录示例（先写 root 私有文件，再重定向 stdin；`calibrate` 不会自动删除该文件，写完请手动删除）。
+`operatorAttestation` 只有 root 操作员能提供，用于填补 bridge 观测不到的 transport/route：
 
 ```sh
 su -c 'cat > /data/adb/agentcall/inbox/calibration.json' <<'JSON'
@@ -211,6 +218,11 @@ su -c 'cat > /data/adb/agentcall/inbox/calibration.json' <<'JSON'
     "microphoneIsolated": true,
     "manualRestoreVerified": true,
     "processFailureVerified": true
+  },
+  "operatorAttestation": {
+    "transport": "CELLULAR",
+    "route": "EARPIECE",
+    "manualTestCompleted": true
   }
 }
 JSON
@@ -218,14 +230,23 @@ su -c '/data/adb/modules/agentcall/bin/agentcallctl calibrate < /data/adb/agentc
 su -c 'rm -f /data/adb/agentcall/inbox/calibration.json'
 ```
 
-- 成功输出 `{recorded, environment, steps, verified, blockers, calibratedAtMs}`；`verified`
-  只在五项全部为 true 且环境完整时才是 true，不要用本机勾选替代。
+- 成功输出 `{recorded, environment, operatorAttestation, steps, verified, blockers, calibratedAtMs}`；
+  `verified` 只在五项全部为 true 且环境完整时才是 true，不要用本机勾选替代。
+  `operatorAttestation` 回显 `{operatorAttested, transport, route}`：只有确实由 root 操作员
+  背书、且该字段原本是 UNKNOWN 时才为 true；bridge 已观测到的已知值永远优先，背书不能覆盖。
+- `operatorAttestation` 只允许三个键，且全部必须是字符串/true：
+  - `transport` ∈ `CELLULAR`、`VOWIFI`、`UNKNOWN`；
+  - `route` ∈ `EARPIECE`、`SPEAKER`、`HEADSET`、`BLUETOOTH`、`UNKNOWN`；
+  - `manualTestCompleted` 必须是 JSON `true`（操作员确认五项人工测试真实完成）。
+  其他形状/词表值整体拒绝（`payload_invalid`）；APP/HOOK 不能调用 `calibration.record`，
+  也不能提供背书，服务端按角色二次拒绝。`UNKNOWN` 不能解锁完整环境。
 - 可选 `expectedEnvironment` 把这些证据绑定到预期环境（`apiLevel`、`romFingerprint`、
   `kernelVersion`、`dialerPackageVersion`、`frameworkVersion`、`bridgeVersion`、
-  `audioPolicyDigest`、`simCarrier`、`transport`、`route`）；当前环境的任一字段未知时
-  返回 `calibration_environment_unknown`，与预期不一致时返回
-  `calibration_environment_mismatch`，两者都整体拒绝、绝不假装已验证。
+  `audioPolicyDigest`、`simCarrier`、`transport`、`route`）；当前环境（含 root 背书后的
+  effective environment）的任一字段未知时返回 `calibration_environment_unknown`，与预期
+  不一致时返回 `calibration_environment_mismatch`，两者都整体拒绝、绝不假装已验证。
 - 校准存储未接线时返回 `calibration_unavailable`。
+- 11E 已在 HEAD `2d924f4` 合入；字段名与词表以该提交与 `docs/config-schema.md` 为准。
 
 root 侧可查看能力/环境报告：
 
@@ -274,6 +295,9 @@ AI 会话，等待人工处理。恢复路径：
      不会复活已移除模块。
    - `restart_unconfirmed`：桥接没有接受 `shutdown`（已退出或不可达），命令会收回
      请求，本次没有重启。
+   - `restart_refused`：桥接接受了 `shutdown`，但裁决不是干净关闭（`clean=false`、
+     `shutdownCode` 非 null、`microphoneIsolated=true`，或裁决缺失）。命令会收回标记，
+     **不会重启**；消息里带机器码与隔离读回。先手动结束通话/确认麦克风恢复并重启设备。
    - 真实 BLOCKED 恢复（重启后的启动恢复是否清除阻塞）尚未在真机验证；
      `restart` 只负责“干净重启”，不代表阻塞条件已被修复。
 
@@ -291,18 +315,22 @@ AI 会话，等待人工处理。恢复路径：
 
 1. 关闭总开关并**先确认没有进行中的通话**（卸载路径不能替代手动结束通话）。
 2. KernelSU 管理器 → 模块 → 移除 AgentCall → 重启。
-   移除时 `uninstall.sh` 的固定顺序（任务 11D2b）：
+   移除时 `uninstall.sh` 的固定顺序（任务 11D2b / 11F）：
    1. 收回待处理的 `restart.requested`；
-   2. 固定 CLI `shutdown`（有界等待 CLI 返回与桥接进程/socket 消失）；桥接在响应前
-      终止/交还拥有的通话并读回恢复麦克风——此时音频工作进程仍然存活；
-   3. 读回 shutdown 响应（`clean`/`shutdownCode`/`supervision.microphoneIsolated`），
-      桥接仍可响应时再读 `status` 的 `supervisionPhase`/`microphoneIsolated`；
-   4. 只有 `clean=true`、`shutdownCode=null`、`microphoneIsolated=false` 且 phase 为
+   2. 取 `/data/adb/agentcall/stop.lock`（flock，最多等 40 s）与 `service.sh` 串行化；
+      拿不到锁时打印 `stop_lock_timeout` 并跳过重复的关闭请求，避免两个 CLI shutdown
+      在恢复窗口内互相踩踏；
+   3. 固定 CLI `shutdown`（最多等 25 s；11E 的 CLI socket 超时是 20 s），再等桥接
+      进程/socket 消失（最多 10 s）；桥接在响应前终止/交还拥有的通话并读回恢复麦克风
+      ——此时音频工作进程仍然存活；
+   4. 读回 shutdown 响应（`clean`/`shutdownCode`/`supervision.microphoneIsolated`），
+      桥接仍可响应时再读 `status` 的 `supervisionPhase`/`microphoneIsolated`（最多 5 s）；
+   5. 只有 `clean=true`、`shutdownCode=null`、`microphoneIsolated=false` 且 phase 为
       `IDLE`/`ENDED`（或进程已退出）才打印“已确认干净关闭”；否则打印机器可读警告
       `! shutdown_result clean=... shutdownCode=... phase=... microphoneIsolated=... owned=... cli=...`
       并明确“未确认通话已终止或交还；麦克风可能仍被隔离”，**不会**谎称已交还；
-   5. 之后才按 PID 文件核验并结束音频工作进程与残留桥接（cmdline 不匹配就不猜、不杀），
-      最后才删除 `/data/adb/agentcall`（连同粘性所有权标记）。
+   6. 之后才按 PID 文件核验并结束音频工作进程与残留桥接（cmdline 不匹配就不猜、不杀），
+      释放停止锁，最后才删除 `/data/adb/agentcall`（连同粘性所有权标记）。
    两个 PID 文件都是首行单个十进制 PID。按 KernelSU 的标记语义，卸载会先写
    `remove`/`disable` 标记（设备上的实际卸载时序未验证）；`service.sh` 在每次重启前
    重新检查该标记，标记存在时不会把模块重新拉起；若手动在无标记时对进程执行 TERM，
@@ -341,11 +369,12 @@ AI 会话，等待人工处理。恢复路径：
 | 步骤 | 状态 |
 | --- | --- |
 | 模块 ZIP 结构、DEX 入口、版本、SHA-256、密钥泄漏检查 | 本地已验证（`make package-check`） |
-| 最终验收矩阵（HEAD `1ee7277`，225 任务） | 本地 PASS：JVM 731、lint 0 errors、release APK、bridge 运行时容器 |
-| JVM/JS/Python/脚本检查 | 历史：JVM 731（core 125 / bridge 283 / app 323）、Python 52（`make test` PASS）。11D2b 本波只重跑 `node --test module/webroot/tests/*.test.mjs`（104 pass）与 `sh -n` 4 个脚本，未跑 Gradle |
-| 配对（WebUI/root CLI）与 APK 校准/诊断界面 | 已实现；root CLI `calibrate` 已提供桥接校准写入通道（真机环境探针与五项实测未验证，见第 7 节） |
-| 优雅关闭停止顺序（先 shutdown、后停音频工作进程、再 TERM→KILL） | 本地宿主已验证（`shutdown-order.test.mjs`、`module-scripts.test.mjs` 进程/CLI 替身）；**真机未验证** |
-| 卸载关闭结果读回与未确认警告 | 本地宿主已验证（假 CLI/status/socket）；**真机 KernelSU 卸载时序未验证** |
+| 最近一次矩阵（HEAD `2d924f4`，11E 已合入） | 本地 PASS：JVM 806（core 126 / bridge 343 / app 337）、lint 0 errors；11E 之后还需重新打包 APK/ZIP 并替换哈希 |
+| JVM/JS/Python/脚本检查 | JVM 806（11E 最后重跑）；WebUI node 113（11F 新增停止锁/隔离/重启裁决用例）；Python 52；`sh -n` 4 个脚本。11F 未跑 Gradle |
+| 配对（WebUI/root CLI）与 APK 校准/诊断界面 | 已实现；root CLI `calibrate` 经 `calibration.record` 写入五项人工证据，transport/route 需 root 操作员固定词表背书（真机环境探针与五项实测未验证，见第 7 节） |
+| 优雅关闭停止顺序（先取 stop.lock、shutdown、后停音频工作进程、再 TERM→KILL） | 本地宿主已验证（`shutdown-order.test.mjs`、`module-scripts.test.mjs` 进程/CLI 替身，含并发锁等待）；**真机未验证** |
+| 关闭裁决/隔离读回与未确认警告（service.sh + uninstall.sh） | 本地宿主已验证（shutdown 响应与最终 status 探测的隔离读回、`! microphone_still_isolated`）；**真机 KernelSU 卸载时序未验证** |
+| `agentcallctl restart` 关闭裁决拒绝 | 本地宿主已验证（clean=false、mic 仍隔离、裁决缺失都返回 `restart_refused` 并收回标记）；**真机未验证** |
 | `agentcallctl calibrate` stdin 逐字节透传与 argv 拒绝 | 本地宿主已验证（假 app_process）；**真机 app_process stdin 未验证** |
 | 模块安装、重启后 `service.sh` 拉起桥 | **未验证** |
 | LSPosed/Vector 作用域与 Hook 生效 | **未验证** |
@@ -356,7 +385,8 @@ AI 会话，等待人工处理。恢复路径：
 | 双卡、VoWiFi、蓝牙 | **未验证**，未测组合不启用 |
 
 结论：安装步骤按设计写成，但**除本地构建/打包/结构检查与宿主测试替身外，没有真机证据**；
-交付时也没有设备连接。root CLI `calibrate` 已补上桥接校准写入通道，但真实环境探针、
-五项人工测试、优雅关闭的麦克风恢复读回与 KernelSU 卸载时序都未上机；真机自动接听在
+交付时也没有设备连接。root CLI `calibrate` 已提供桥接校准写入通道（11E 的
+operatorAttestation 只补 transport/route），但真实环境探针、五项人工测试、优雅关闭的
+麦克风恢复读回与 KernelSU 卸载时序都未上机；真机自动接听在
 完成这些验证前仍不能被当作已启用（保持 fail-closed，`calibration_not_verified`）。
 在完成 spec §12 设备验收前，不要把本模块当作可用的电话助理。
