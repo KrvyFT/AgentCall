@@ -610,7 +610,9 @@ object SupervisorProductionGraph {
         } catch (t: Throwable) {
             return false
         } ?: return false
-        if (state.ownedCallMayBeLive) return true
-        return sameBootAsCurrent(state, currentBootId, clock.nowMs()) && state.ownedSession != null
+        // 只有同一开机内的重启才可能还有泄漏的音频工作进程；设备重启会连它一起结束，
+        // 此时不能让旧标记把新开机后的普通关闭永久变成“阻止新会话”。
+        if (!sameBootAsCurrent(state, currentBootId, clock.nowMs())) return false
+        return state.ownedCallMayBeLive || state.ownedSession != null
     }
 }

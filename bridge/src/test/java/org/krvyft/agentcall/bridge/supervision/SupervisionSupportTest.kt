@@ -583,6 +583,43 @@ class SupervisorProductionGraphTest {
         assertTrue(store.load()!!.ownedCallMayBeLive)
     }
 
+    /**
+     * 设备重启会结束泄漏的音频工作进程：新开机里启动恢复验证并恢复麦克风后，粘性标记
+     * 必须清掉；随后一次普通关闭不得把旧标记重新写成 true（否则下一次重启无故 BLOCKED）。
+     */
+    @Test
+    fun rebootClearsTheStickyMarkerAfterVerifiedRestore() = runBlocking {
+        val store = FakeStateStore(
+            SupervisionPersistedState(
+                phase = SupervisorPhase.ACTIVE,
+                ownedSession = null,
+                microphoneIsolated = true,
+                blockedReason = null,
+                lastFault = null,
+                updatedAtMs = 1_000,
+                bootId = "boot-a",
+                ownedCallMayBeLive = true,
+            ),
+        )
+        val audio = SupportAudio().apply { systemIsolated = true }
+        val graph = SupervisorProductionGraph.build(
+            FakePlatform(
+                audio = audio,
+                emergency = verifiedEmergency(),
+                authorization = AutoAnswerAuthorization { true },
+                store = store,
+                bootIdValue = "boot-b",
+            ),
+        )
+
+        assertEquals(BootRecoveryOutcome.RESTORED, graph.recovery.recover())
+        assertEquals("新开机必须验证并恢复麦克风", 1, audio.restoreCalls)
+        assertFalse("已验证恢复后粘性标记必须清除", store.load()!!.ownedCallMayBeLive)
+
+        graph.supervisor.block("test_block")
+        assertFalse("新开机的普通关闭不得复活旧开机的粘性标记", store.load()!!.ownedCallMayBeLive)
+    }
+
     private fun FakePlatform.heartbeat(supervisor: Supervisor, id: SessionId) {
         supervisor.heartbeat(id, PeerRole.APP, clock.nowMs())
         supervisor.heartbeat(id, PeerRole.HOOK, clock.nowMs())
