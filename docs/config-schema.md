@@ -109,11 +109,19 @@
 - `config` 含 `revision`，不含 `secrets`。
 - `secrets` 的值为 `CONFIGURED` 或 `MISSING`，没有原值、没有长度、没有前缀。
 - `status` 负载：`bridgeVersion`、`protocolVersion`、`revision`、`enabled`、`paired`、
-  `uptimeMs`、`activeConnections`、`rejectedConnections`。
-- 概览的“Google 电话默认角色”和“Hook 连通性”目前**没有**后端字段。WebUI 保留两个可选
-  字段名 `dialerDefaultRole`(boolean) 与 `hookConnected`(boolean)：只有后端真的返回时才按
-  真实值渲染，缺失时显示“未知（后端未提供）”。这是阶段 B（桥接/Task 7 诊断）需要补齐的
-  契约；本文不声称当前桥接已提供它们，也不允许前端伪造结论。
+  `uptimeMs`、`activeConnections`、`rejectedConnections`、`supervisionPhase`、
+  `supervisionOwned`、`microphoneIsolated`、`supervisionBlocked`、`supervisionLastFault`、
+  `hookConnected`、`dialerDefaultRole`。
+- `hookConnected`：boolean，或字符串 `"unknown"`。表示 HOOK 角色是否在 **5000 ms**
+  心跳窗口内报告过心跳，数据源是监督端按会话记录的内存状态（`Supervisor.peerAlive`），
+  不发远程请求、不读密钥。未接入监督状态时返回 `"unknown"`。
+- `dialerDefaultRole`：boolean，或字符串 `"unknown"`。只有系统 `ROLE_DIALER` 持有者
+  是 Google 电话时才返回 `true`；角色查询不可读（无 `RoleManager`/隐藏 API 策略/权限）
+  时，只有 `ACTION_DIAL + CATEGORY_DEFAULT` 的 `MATCH_DEFAULT_ONLY` 默认处理器明确是
+  **其它**应用才返回 `false`；解析到 Google 电话本身、系统 Resolver、无候选或任何异常
+  都返回 `"unknown"`。这是特权进程内的本地查询，不调用 Telecom、不修改角色。
+- 阶段 B 之前这两个字段不存在于 status；现在 WebUI 只按真实布尔渲染，`"unknown"` 显示
+  “未知”，缺失时同样显示未知，前端不伪造结论。
 - `diagnose` 负载：`environment`（apiLevel/romFingerprint/kernelVersion/
   dialerPackageVersion/frameworkVersion/bridgeVersion/audioPolicyDigest/simCarrier/
   transport/route）、`downlinkExtraction`、`uplinkInjection`、`microphoneIsolation`、
@@ -344,6 +352,10 @@ WebUI 的实际命令行（完整字符串，无用户数据）：
 WebUI 不加载任何在线 CDN、不发起 fetch/XHR、不用 `innerHTML` 渲染不受信任文本；
 配置与日志一律 `textContent`。
 
+**分页未保存标记**：规则页、AI 页、对话页各有独立的“未保存”chip。页内保存只提交该页
+字段，成功时只清除该页标记（其它页面的未保存编辑与 chip 保留）；重新加载配置才清除全部
+页面的标记。总开关是独立保存动作，不标记也不清除任何页面 chip。
+
 **连接测试归属（控制器裁决）**：特权桥接进程**不得**代替用户发起远程 API 请求
 （spec §6.3），WebUI 也不读取密钥。因此逐端点连接测试属于 APK 侧诊断（Task 7）：
 
@@ -370,15 +382,29 @@ WebUI 不加载任何在线 CDN、不发起 fetch/XHR、不用 `innerHTML` 渲�
 - 卸载：`uninstall.sh` 分开探测 abstract socket 是否存在与固定 CLI 是否可执行
   （socket 存在不等于 CLI 可执行），然后：
   1. 两者都可用 → 固定 CLI `shutdown`，在上限 15 秒内等待 socket 消失；
-  2. CLI 不可执行或等待超时 → 从 `/data/adb/agentcall/bridge.pid` 取 PID，
-     核验 `/proc/<pid>/cmdline` 命中 AgentCall 桥接入口后 TERM（有界等待 5 秒）→ KILL；
-  3. PID 文件缺失/不可核验时**不猜测 PID**，显式警告；
-  4. 最后才删除 `/data/adb/agentcall`。
+  2. CLI 不可执行或等待超时 → 从 `/data/adb/agentcall/bridge.pid` 取首行十进制 PID，
+     核验 `/proc/<pid>/cmdline` 命中 `BridgeMain`/`agentcall-bridge` 后
+     TERM（有界等待 `KILL_WAIT_SECONDS`）→ KILL → 再等待；
+  3. 音频工作进程（`/data/adb/agentcall/audio-worker.pid`，由 `service.sh` 写入单个
+     数字 PID）同样处理：核验 `AudioWorkerMain`/`agentcall-audio-worker` 后
+     TERM → 有界等待 → KILL，且必须早于删除数据目录（否则会残留持有麦克风隔离的
+     root 音频进程）；
+  4. 任一 PID 文件缺失/不可核验时**不猜测 PID**，显式警告；
+  5. 最后才删除 `/data/adb/agentcall`。两个 PID 文件的写/读格式由
+     `module-scripts.test.mjs` 绑定到 `service.sh`（首行 + 仅十进制数字）。
+
+  **重启语义**：`service.sh` 的重启循环默认在 `RESTART_DELAY_SECONDS=5` 后重新拉起
+  桥接/音频工作进程。KernelSU 移除模块会先写 `remove`/`disable` 标记；`service.sh`
+  在**每次重启前**重新检查该标记，标记存在时不再拉起（不会复活已移除模块）。
+  在没有标记的情况下手动对进程执行 TERM，约 5 s 后可能被重新拉起——脚本会打印这一点。
 
   **诚实边界**：当前桥接没有会话/租约实现（`session.request` 为
   `method_not_implemented`），`shutdown` 只关闭配置服务与 socket，**不能终止或交还
   正在进行的 AI 通话**；脚本会打印这一点，并提示用户先在 Google 电话中手动结束。
   不修改 Google 电话默认角色、vendor 音频配置或 SELinux。
+
+  **未验证**：上述 PID 核验/终止分支只有 `sh -n` 与宿主脚本断言/进程替身证据，
+  未在真机 KernelSU 卸载流程中执行。
 
 ---
 
@@ -395,8 +421,10 @@ WebUI 不加载任何在线 CDN、不发起 fetch/XHR、不用 `innerHTML` 渲�
   文件接口细节未逐一验证。版本为 0 时按“没有受控写入接口”处理（只读，不是保存成功）。
 - **模块目录版本偏差**：`moduleInfo()` 缺少 `moduleDir` 时回退固定路径；只有明确给出
   非法目录才 fail closed。该项由 `transport.test.mjs` 覆盖，未在真机管理器上验证。
-- **概览实时字段**：`dialerDefaultRole`/`hookConnected` 目前不由桥接提供，页面显示
-  “未知（后端未提供）”；阶段 B 后端补齐后页面无需改协议即可显示真实值。
+- **概览实时字段**：`hookConnected`/`dialerDefaultRole` 已由桥接 status 提供，但只有
+  JVM 假替身证据（`BridgeStatusLiveValuesTest`、`DialerDefaultRoleProbeTest`）。真机上
+  `RoleManager` 隐藏方法（`getRoleHolders`）的反射可用性、root 的权限判定与真实取值
+  均**未验证**；不可读时后端返回 `"unknown"`，页面显示未知，不猜测。
 - **连接测试**：WebUI 不执行连接测试，也不代发任何远程请求；真实测试只能在 AgentCall APK
   诊断页进行（会计费），当前无设备证据。
 - **WebView 存储**：`localStorage` 保存“最近错误”在 file:// 或受限 WebView 中可能

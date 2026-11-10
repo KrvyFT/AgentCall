@@ -67,6 +67,9 @@ su -c /data/adb/modules/agentcall/bin/agentcallctl status
 ```
 
 输出是单行 JSON；失败时形如 `{"error":{"code":"...","message":"..."}}`。常见码见第 8 节。
+`status` 现在包含两个概览实时字段（阶段 B）：`hookConnected`（HOOK 心跳 5000 ms 窗口）
+与 `dialerDefaultRole`（boolean，或无法在特权进程可靠确定时的字符串 `"unknown"`）。
+两者都是本地查询；真机取值**未验证**，`"unknown"` 时 WebUI 显示“未知”，不猜。
 
 ## 3. 作用域与边界
 
@@ -114,6 +117,8 @@ status | config-get | config-set（JSON 从 stdin） | pair | diagnose | shutdow
 | `demo` | 普通浏览器无管理器注入 | 明确标注模拟数据，不发起任何请求 |
 
 **总开关默认关闭**。未配对、未校准、Hook/桥未连通或无法保持 READY 时不会自动接听。
+概览的默认拨号角色/Hook 连通性来自 `status`；规则、AI、对话三页各有独立的“未保存”
+标记，保存某页只清除该页标记（不会清掉其它页面的未保存编辑）。
 密钥只写在 root 私有目录 `/data/adb/agentcall/config.json`（目录 0700），WebUI 只看到
 `CONFIGURED/MISSING`，不读取原值。
 
@@ -192,9 +197,13 @@ su -c /data/adb/modules/agentcall/bin/agentcallctl diagnose
 
 1. 关闭总开关并确认没有进行中的通话。
 2. KernelSU 管理器 → 模块 → 移除 AgentCall → 重启。
-   移除时 `uninstall.sh` 只能**请求**停止桥接进程，并做有界清理（root 私有目录、abstract socket、
-   PID 文件）；它**不能终止或交还正在进行的 AI 通话**（脚本头部已声明该边界），
-   如卸载时正在 AI 通话，请先在 Google 电话中手动结束。它不改写 Google 电话角色或系统音频配置。
+   移除时 `uninstall.sh` 只能**请求**停止桥接进程，并按 PID 文件核验后结束残留的桥接与
+   音频工作进程（两个 PID 文件都是首行单个十进制 PID；cmdline 不匹配就不猜、不杀），
+   最后才删除 `/data/adb/agentcall`。KernelSU 会先写 `remove`/`disable` 标记，
+   `service.sh` 在每次重启前重新检查该标记，因此不会在卸载过程中把模块重新拉起；
+   若手动在无标记时对进程执行 TERM，约 5 s 后可能被重启循环拉起。
+   它**不能终止或交还正在进行的 AI 通话**（脚本头部已声明该边界），如卸载时正在 AI 通话，
+   请先在 Google 电话中手动结束。它不改写 Google 电话角色或系统音频配置。
 3. 卸载 AgentCall APK：设计上模块侧会关闭会话（**未验证**）；Google 电话保持默认拨号器与原行为。
 4. 如需彻底清理：确认 `/data/adb/agentcall` 已删除、WebUI 不再被管理器加载；
    残留的 Xposed 作用域记录在框架管理器中删除。

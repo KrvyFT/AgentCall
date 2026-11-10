@@ -253,7 +253,7 @@ test("页面保存只提交本页字段：规则页保存不得夹带 AI 密钥"
   }
 });
 
-test("概览的默认拨号角色/Hook 连通性：后端未提供时显示未知，提供真实值时按值渲染", async () => {
+test("概览的默认拨号角色/Hook 连通性：真实布尔按值渲染，缺失或 unknown 一律显示未知", async () => {
   const holder = {};
   const fake = fakeManager({ handlers: defaultHandlers(holder) });
   holder.current = fake;
@@ -270,6 +270,17 @@ test("概览的默认拨号角色/Hook 连通性：后端未提供时显示未�
   assert.equal(second.doc.getElementById("ov-dialer-role").textContent, "已设为默认拨号器");
   assert.equal(second.app.state.status.hookConnected, false);
   assert.match(second.doc.getElementById("ov-hook-state").textContent, /未连接/);
+
+  // 阶段 B 契约：后端无法可靠确定时返回字符串 "unknown"；不得当作 true/false 渲染。
+  const holder3 = {};
+  const fake3 = fakeManager({
+    handlers: defaultHandlers(holder3, { dialerDefaultRole: "unknown", hookConnected: "unknown" }),
+  });
+  holder3.current = fake3;
+  const third = await boot({ fake: fake3 });
+  assert.match(third.doc.getElementById("ov-dialer-role").textContent, /未知/);
+  assert.match(third.doc.getElementById("ov-hook-state").textContent, /未知/);
+  assert.doesNotMatch(third.doc.getElementById("ov-dialer-role").textContent, /已设为|未设为/);
 });
 
 
@@ -307,6 +318,63 @@ test("连接测试归属：WebUI 只显示诚实状态，明确真实请求由 A
 });
 
 
+
+test("分页未保存标记：保存一个页面不得清除另一个页面的 chip", async () => {
+  const holder = {};
+  const fake = fakeManager({ handlers: defaultHandlers(holder) });
+  holder.current = fake;
+  const { doc } = await boot({ fake });
+
+  const chip = (id) => doc.getElementById(id);
+  assert.equal(chip("rules-dirty").hidden, true);
+  assert.equal(chip("ai-dirty").hidden, true);
+  assert.equal(chip("dlg-dirty").hidden, true);
+
+  // 规则页编辑：只有规则页出现“未保存”。
+  const rulesInput = doc.getElementById("rules-blacklist");
+  rulesInput.value = "13800138000";
+  rulesInput.dispatch("input");
+  assert.equal(chip("rules-dirty").hidden, false, "编辑规则页必须标记规则页");
+  assert.equal(chip("ai-dirty").hidden, true, "编辑规则页不得标记 AI 页");
+  assert.equal(chip("dlg-dirty").hidden, true, "编辑规则页不得标记对话页");
+
+  // AI 页密钥意图：AI 页也出现“未保存”，规则页标记保持。
+  doc.getElementById("ai-asr-secret").value = SECRET;
+  doc.getElementById("ai-asr-replace").click();
+  assert.equal(chip("ai-dirty").hidden, false, "密钥替换意图必须标记 AI 页");
+  assert.equal(chip("rules-dirty").hidden, false, "AI 页编辑不得清掉规则页标记");
+
+  // 保存规则页：只清规则页标记。
+  doc.getElementById("rules-save").click();
+  await tick(20);
+  assert.equal(fake.writes.length, 1, "规则页保存必须真的提交一次");
+  assert.equal(chip("rules-dirty").hidden, true, "保存本页后本页标记清除");
+  assert.equal(chip("ai-dirty").hidden, false, "保存规则页不得清除 AI 页的未保存标记");
+
+  // 对话页编辑后再保存 AI 页：对话页标记必须保留。
+  const speed = doc.getElementById("dlg-speed");
+  speed.value = "1.2";
+  speed.dispatch("input");
+  assert.equal(chip("dlg-dirty").hidden, false, "编辑对话页必须标记对话页");
+
+  doc.getElementById("ai-save").click();
+  await tick(20);
+  assert.equal(fake.writes.length, 2, "AI 页保存必须真的提交一次");
+  assert.equal(chip("ai-dirty").hidden, true, "保存 AI 页后只清 AI 页标记");
+  assert.equal(chip("dlg-dirty").hidden, false, "保存 AI 页不得清除对话页的未保存标记");
+
+  // 保存对话页后全部清除。
+  doc.getElementById("dlg-save").click();
+  await tick(20);
+  assert.equal(fake.writes.length, 3);
+  assert.equal(chip("dlg-dirty").hidden, true);
+
+  // 总开关是独立保存：不标记任何页面，也不清除页面标记。
+  doc.getElementById("ov-enabled").dispatch("input");
+  assert.equal(chip("rules-dirty").hidden, true);
+  assert.equal(chip("ai-dirty").hidden, true);
+  assert.equal(chip("dlg-dirty").hidden, true);
+});
 
 test("saveEnabledOnly 在 state.form 缺失时也不抛错（Minor 守卫）", async () => {
   const holder = {};

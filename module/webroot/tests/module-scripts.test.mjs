@@ -146,6 +146,15 @@ test("agentcallctl：固定六条命令，配置只从 stdin 进入，未知命�
 // 杀掉的是**音频工作进程自己的 PID**，并且干净退出也会回收它。
 // ---------------------------------------------------------------------------------------------
 
+function functionBody(source, name) {
+  // 必须从行首匹配：stop_audio_worker_supervisor 也以 audio_worker_supervisor() { 结尾。
+  const at = source.indexOf("\n" + name + "() {");
+  assert.ok(at > -1, "缺少函数 " + name);
+  const end = source.indexOf("\n}\n", at);
+  assert.ok(end > at, "函数 " + name + " 未正常结束");
+  return source.slice(at, end);
+}
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function waitFor(predicate, timeoutMs, label) {
@@ -212,10 +221,16 @@ function serviceHarness() {
       "#!/bin/sh",
       'case "$*" in',
       "  *BridgeMain*)",
-      '    if [ "${AGENTCALL_FAKE_BRIDGE_STAY:-0}" = "1" ]; then while :; do sleep 1; done; else sleep 1; fi',
+      '    if [ "${AGENTCALL_FAKE_BRIDGE_STAY:-0}" = "1" ]; then',
+      "      while :; do sleep 1; done",
+      "    else",
+      "      sleep 1",
+      '      exit "${AGENTCALL_FAKE_BRIDGE_EXIT:-0}"',
+      "    fi",
       "    exit 0",
       "    ;;",
       "esac",
+      'if [ "${AGENTCALL_FAKE_AUDIO_IGNORE_TERM:-0}" = "1" ]; then trap "" TERM; fi',
       "while :; do sleep 1; done",
       "",
     ].join("\n"),
@@ -360,6 +375,159 @@ test(
     } finally {
       killQuietly(child);
       killQuietly(stale);
+      rmSync(harness.root, { recursive: true, force: true });
+    }
+  },
+);
+
+
+// ---------------------------------------------------------------------------------------------
+// 阶段 B：模块生命周期硬化（有界停止、移除标记、音频工作进程 PID 契约）
+// ---------------------------------------------------------------------------------------------
+
+test("service.sh：停止路径有界，不在 shutdown 里裸 wait（卡死时无界阻塞）", () => {
+  const service = read("service.sh");
+  for (const name of ["stop_audio_worker_supervisor", "shutdown_children"]) {
+    assert.equal(
+      /\bwait\s+"\$/.test(functionBody(service, name)),
+      false,
+      name + " 不得直接 wait：进程卡住时会无限阻塞卸载的停止路径",
+    );
+  }
+  const reap = functionBody(service, "reap_child");
+  assert.match(reap, /KILL_WAIT_SECONDS/, "回收等待必须有上限");
+  assert.match(reap, /reap_timeout/, "回收超时必须记录并有界放弃");
+  assert.match(service, /terminate_pid "\$bridge_pid" "\$STOP_GRACE_SECONDS" bridge/);
+  assert.match(service, /terminate_pid "\$worker" "\$STOP_GRACE_SECONDS" audio_worker/);
+});
+
+test("service.sh：每次重启前重新检查 remove/disable 标记，不复活已移除模块", () => {
+  const service = read("service.sh");
+  const markedAt = service.indexOf("module_marked_stopped() {");
+  assert.ok(markedAt > -1, "必须有统一的 remove/disable 标记判定");
+  for (const name of ["bridge_container_supervisor", "audio_worker_supervisor"]) {
+    const body = functionBody(service, name);
+    const loopAt = body.indexOf("while [");
+    assert.ok(loopAt > -1, name + " 必须有有限重启循环");
+    const checkAt = body.indexOf("module_marked_stopped", loopAt);
+    assert.ok(checkAt > loopAt, name + " 必须在重启循环内重新检查 remove/disable 标记");
+    assert.ok(checkAt < body.indexOf('"$APP_PROCESS"', loopAt), name + " 必须在拉起进程之前检查标记");
+  }
+  assert.match(service, /marked_stopped/, "跳过重启时必须记录原因");
+});
+
+test("uninstall.sh：按 service.sh 的 PID 文件契约结束音频工作进程，且早于删除数据目录", () => {
+  const service = read("service.sh");
+  const uninstall = read("uninstall.sh");
+
+  assert.match(service, /^PID_FILE=\$DATA_ROOT\/bridge\.pid$/m, "service.sh 的桥接 PID 文件路径");
+  assert.match(service, /^AUDIO_PID_FILE=\$DATA_ROOT\/audio-worker\.pid$/m, "service.sh 的音频 PID 文件路径");
+  assert.match(uninstall, /^DATA_ROOT=\/data\/adb\/agentcall$/m);
+  assert.match(uninstall, /^PID_FILE=\$DATA_ROOT\/bridge\.pid$/m, "uninstall 必须读同一个桥接 PID 文件");
+  assert.match(uninstall, /^AUDIO_PID_FILE=\$DATA_ROOT\/audio-worker\.pid$/m, "uninstall 必须读同一个音频 PID 文件");
+
+  // PID 文件格式绑定：首行、只接受十进制数字（与 service.sh 的 read_pid 一致）。
+  for (const [label, source] of [["service.sh", service], ["uninstall.sh", uninstall]]) {
+    assert.match(source, /head -n 1/, label + " 必须只读 PID 文件首行");
+    assert.match(source, /tr -cd '0-9'/, label + " 必须只接受十进制数字");
+  }
+  assert.match(service, /printf '%s\\n' "\$worker_pid" > "\$AUDIO_PID_FILE"/, "service.sh 写单个音频 PID");
+  assert.match(service, /printf '%s\\n' "\$bridge_pid" > "\$PID_FILE"/, "service.sh 写单个桥接 PID");
+
+  // 同一套核验纪律：cmdline 命中固定入口/进程名才允许终止（防 PID 复用误杀）。
+  assert.match(
+    uninstall,
+    /verified_pid_from_file "\$AUDIO_PID_FILE"[\s\S]{0,180}org\.krvyft\.agentcall\.bridge\.audio\.AudioWorkerMain[\s\S]{0,120}agentcall-audio-worker/,
+    "音频 PID 必须核验 AudioWorkerMain/agentcall-audio-worker",
+  );
+  assert.match(
+    uninstall,
+    /verified_pid_from_file "\$PID_FILE"[\s\S]{0,160}org\.krvyft\.agentcall\.bridge\.BridgeMain[\s\S]{0,120}agentcall-bridge/,
+    "桥接 PID 必须核验 BridgeMain/agentcall-bridge",
+  );
+  assert.match(uninstall, /terminate_verified_pid/, "音频与桥接必须共用核验终止路径");
+  assert.match(uninstall, /kill -KILL/, "必须有有界 TERM→KILL");
+
+  const audioAt = uninstall.indexOf("AudioWorkerMain");
+  const cleanupAt = uninstall.indexOf('rm -rf "$DATA_ROOT"');
+  assert.ok(audioAt > -1 && cleanupAt > audioAt, "音频工作进程必须在删除数据目录之前结束");
+  assert.match(uninstall, /AudioWorkerMain[\s\S]*?Google 电话/, "仍保留“无法交还通话”的诚实说明");
+});
+
+test("uninstall.sh：说明 TERM 之后约 5 s 可能被 service.sh 重新拉起，remove/disable 标记存在时不复活", () => {
+  const service = read("service.sh");
+  const uninstall = read("uninstall.sh");
+  assert.match(service, /^RESTART_DELAY_SECONDS=5$/m, "重启延迟必须仍是 5 s");
+  assert.match(uninstall, /TERM[\s\S]{0,240}5 s[\s\S]{0,240}(重新拉起|重启)/, "必须说明 TERM 之后的重启延迟");
+  assert.match(uninstall, /remove\/disable|remove[\s\S]{0,40}disable/, "必须说明卸载会写 remove/disable 标记");
+});
+
+test(
+  "service.sh：停止路径对忽略 TERM 的音频工作进程仍有界升级到 KILL",
+  { timeout: 60000 },
+  async () => {
+    const harness = serviceHarness();
+    let child = null;
+    try {
+      child = spawn("sh", [harness.script], {
+        env: serviceEnv(harness, { AGENTCALL_FAKE_BRIDGE_STAY: "1", AGENTCALL_FAKE_AUDIO_IGNORE_TERM: "1" }),
+        stdio: "ignore",
+      });
+      await waitFor(
+        () => existsSync(harness.audioPidFile) && existsSync(harness.bridgePidFile),
+        20000,
+        "bridge/audio pid files",
+      );
+      const workerPid = readPidFile(harness.audioPidFile);
+
+      const startedAt = Date.now();
+      child.kill("SIGTERM");
+      await waitForExit(child, 20000);
+      assert.ok(Date.now() - startedAt < 15000, "停止路径必须有界，不能无限等待");
+
+      await waitFor(() => !processAlive(workerPid), 5000, "audio worker termination");
+      const log = readFileSync(harness.logFile, "utf8");
+      assert.match(log, /audio_worker_kill/, "TERM 无效时必须升级到 KILL（有界）");
+      assert.match(log, /audio_worker_stopped/);
+    } finally {
+      killQuietly(child);
+      rmSync(harness.root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "service.sh：remove 标记出现后不再重启桥接（卸载时不复活模块）",
+  { timeout: 60000 },
+  async () => {
+    const harness = serviceHarness();
+    let child = null;
+    try {
+      child = spawn("sh", [harness.script], {
+        env: serviceEnv(harness, { AGENTCALL_FAKE_BRIDGE_EXIT: "1" }),
+        stdio: "ignore",
+      });
+      await waitFor(
+        () => {
+          try {
+            return readFileSync(harness.logFile, "utf8").includes("bridge_exit attempt=1");
+          } catch {
+            return false;
+          }
+        },
+        25000,
+        "first bridge failure",
+      );
+
+      writeFileSync(join(harness.moduleDir, "remove"), "");
+      const { code } = await waitForExit(child, 40000);
+
+      assert.equal(code, 0, "标记移除后必须有界退出，而不是继续重启");
+      const log = readFileSync(harness.logFile, "utf8");
+      assert.match(log, /marked_stopped/, "跳过重启必须写入原因");
+      assert.equal(/bridge_start attempt=2/.test(log), false, "remove 标记存在时不得再次拉起桥接");
+    } finally {
+      killQuietly(child);
       rmSync(harness.root, { recursive: true, force: true });
     }
   },

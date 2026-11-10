@@ -59,10 +59,10 @@
     <div class="card">
       <div class="card-label">Google 电话默认角色</div>
       <div class="card-row">
-        <span id="ov-dialer-role" class="value">未知（后端未提供）</span>
+        <span id="ov-dialer-role" class="value">未知（等待 status）</span>
         <span id="ov-dialer-badge" class="badge badge-neutral">未知</span>
       </div>
-      <p class="card-hint" id="ov-dialer-note">该值由桥接/APK 后端上报；当前固定 CLI 的 status 不提供默认拨号角色。未获得真实值前只显示“未知”，不显示伪结论。</p>
+      <p class="card-hint" id="ov-dialer-note">该值来自桥接 status 的 dialerDefaultRole：true/false 是确定结论；无法在特权进程可靠确定时后端返回 unknown，页面只显示“未知”，不显示伪结论。</p>
     </div>
 
     <div class="card">
@@ -83,10 +83,10 @@
     <div class="card">
       <div class="card-label">Hook 连通性</div>
       <div class="card-row">
-        <span id="ov-hook-state" class="value">未知（后端未提供）</span>
+        <span id="ov-hook-state" class="value">未知（等待 status）</span>
         <span id="ov-hook-badge" class="badge badge-neutral">未知</span>
       </div>
-      <p class="card-hint" id="ov-hook-note">固定 CLI 的 status 只报告桥接自身的连接统计，不提供 Hook 心跳；未获得真实值前显示“未知”，不伪造“已连接/未连接”。</p>
+      <p class="card-hint" id="ov-hook-note">该值来自桥接 status 的 hookConnected（HOOK 心跳 5000 ms 窗口）；未上报或无法确定时显示“未知”，不伪造“已连接/未连接”。</p>
     </div>
 
     <div class="card">

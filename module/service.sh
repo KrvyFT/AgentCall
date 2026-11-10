@@ -157,11 +157,29 @@ terminate_pid() {
     return 0
 }
 
+# 有界回收子进程（阶段 B）：只有确认进程消失后才 wait；否则 wait 会无限阻塞停止路径
+# （进程卡在不可中断状态时，卸载的 15 s 等待会被它整个拖住）。
+reap_child() {
+    child=$1
+    [ -n "$child" ] || return 0
+    waited=0
+    while [ "$waited" -lt "$KILL_WAIT_SECONDS" ] && pid_alive "$child"; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if pid_alive "$child"; then
+        log_line "reap_timeout pid=$child"
+        return 1
+    fi
+    wait "$child" 2>/dev/null
+    return 0
+}
+
 # 先停子 shell 监督循环：否则我们在杀掉 worker 之后，它还会按重启预算再拉起一个新的。
 stop_audio_worker_supervisor() {
     if [ -n "$audio_manager_pid" ] && pid_alive "$audio_manager_pid"; then
         terminate_pid "$audio_manager_pid" "$STOP_GRACE_SECONDS" audio_worker_supervisor
-        wait "$audio_manager_pid" 2>/dev/null
+        reap_child "$audio_manager_pid"
     fi
     audio_manager_pid=
 }
@@ -180,7 +198,7 @@ shutdown_children() {
     stop_audio_worker
     if [ -n "$bridge_pid" ] && pid_alive "$bridge_pid"; then
         terminate_pid "$bridge_pid" "$STOP_GRACE_SECONDS" bridge
-        wait "$bridge_pid" 2>/dev/null
+        reap_child "$bridge_pid"
     fi
     bridge_pid=
     rm -f "$PID_FILE" "$AUDIO_PID_FILE" 2>/dev/null
@@ -220,8 +238,13 @@ reclaim_stale_worker() {
     rm -f "$PID_FILE" 2>/dev/null
 }
 
-# 模块被禁用或标记移除时不启动（KernelSU 用 disable/remove 标志文件表达状态）。
-if [ -f "$MODDIR/disable" ] || [ -f "$MODDIR/remove" ]; then
+# 模块被禁用或标记移除时不启动/不重启（KernelSU 用 disable/remove 标志文件表达状态）。
+# 重启循环每一轮都要重新检查：KernelSU 先写标记再执行卸载，在飞的循环不得复活桥接。
+module_marked_stopped() {
+    [ -f "$MODDIR/disable" ] || [ -f "$MODDIR/remove" ]
+}
+
+if module_marked_stopped; then
     log_line "module_disabled_or_removed"
     exit 0
 fi
@@ -276,6 +299,10 @@ wait_ready() {
 audio_worker_supervisor() {
     restarts=0
     while [ "$restarts" -le "$MAX_RESTARTS" ]; do
+        if module_marked_stopped; then
+            log_line "audio_worker_start_skipped marked_stopped"
+            return 0
+        fi
         attempt=$((restarts + 1))
         rotate_log
         log_line "audio_worker_start attempt=$attempt"
@@ -312,6 +339,10 @@ audio_worker_supervisor() {
 bridge_container_supervisor() {
     restarts=0
     while [ "$restarts" -le "$MAX_RESTARTS" ]; do
+        if module_marked_stopped; then
+            log_line "bridge_start_skipped marked_stopped"
+            return 0
+        fi
         attempt=$((restarts + 1))
         # 上一次尝试已退出，轮转是安全的；单次运行期间桥接只输出少量脱敏行。
         rotate_log

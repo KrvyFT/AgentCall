@@ -11,7 +11,10 @@
 # 1. 分别探测 abstract socket 是否存在、固定 CLI 是否可执行（两者不是一回事）。
 # 2. socket 存在且 CLI 可执行：执行固定 CLI 的 shutdown，并在上限内等待 socket 消失。
 # 3. CLI 不可执行或等待超时：回退到 PID 文件，核验进程身份后 TERM → 有界等待 → KILL。
-# 4. 无论是否确认停止，最后才删除 /data/adb/agentcall（配置、密钥、配对、日志、临时文件）。
+# 4. 音频工作进程是独立 app_process（PID 文件 audio-worker.pid，由 service.sh 写入）：
+#    同样核验 cmdline 后 TERM → 有界等待 → KILL，避免移除模块后残留持有麦克风隔离的
+#    root 音频进程。
+# 5. 无论是否确认停止，最后才删除 /data/adb/agentcall（配置、密钥、配对、日志、临时文件）。
 # - 不改 Google 电话默认角色，不动 vendor 音频配置，不重置系统属性；Hook 自动控制
 #   随模块移除退出，Google 电话仍是默认应用。
 
@@ -36,6 +39,7 @@ DATA_ROOT=/data/adb/agentcall
 CONTROL_SOCKET=@org.krvyft.agentcall.control
 CTL=$MODDIR/bin/agentcallctl
 PID_FILE=$DATA_ROOT/bridge.pid
+AUDIO_PID_FILE=$DATA_ROOT/audio-worker.pid
 STOP_WAIT_SECONDS=15
 KILL_WAIT_SECONDS=5
 
@@ -47,22 +51,37 @@ control_socket_present() {
     grep -q "$CONTROL_SOCKET" /proc/net/unix 2>/dev/null
 }
 
-# 只输出“可核验的 AgentCall 桥接 PID”：数字、进程存在、cmdline 命中固定入口/进程名。
-pid_from_file() {
-    [ -f "$PID_FILE" ] || return 1
-    candidate=$(cat "$PID_FILE" 2>/dev/null)
+# 只输出“可核验的 AgentCall 进程 PID”：数字、进程存在、cmdline 命中固定入口/进程名。
+# PID 文件格式与 service.sh 的 read_pid 一致：首行 + 只接受十进制数字；缺失/损坏/越界
+# 一律当作没有，绝不猜测 PID（PID 复用可能误杀无关进程）。
+verified_pid_from_file() {
+    file=$1
+    shift
+    [ -f "$file" ] || return 1
+    candidate=$(head -n 1 "$file" 2>/dev/null | tr -cd '0-9')
     case "$candidate" in
         ''|*[!0-9]*) return 1 ;;
     esac
+    [ "$candidate" -gt 1 ] || return 1
     [ -d "/proc/$candidate" ] || return 1
     cmdline=$(tr '\0' ' ' < "/proc/$candidate/cmdline" 2>/dev/null)
-    case "$cmdline" in
-        *org.krvyft.agentcall.bridge.BridgeMain*|*agentcall-bridge*)
-            printf '%s\n' "$candidate"
-            return 0
-            ;;
-    esac
+    for marker in "$@"; do
+        case "$cmdline" in
+            *"$marker"*)
+                printf '%s\n' "$candidate"
+                return 0
+                ;;
+        esac
+    done
     return 1
+}
+
+pid_from_file() {
+    verified_pid_from_file "$PID_FILE" org.krvyft.agentcall.bridge.BridgeMain agentcall-bridge
+}
+
+audio_pid_from_file() {
+    verified_pid_from_file "$AUDIO_PID_FILE" org.krvyft.agentcall.bridge.audio.AudioWorkerMain agentcall-audio-worker
 }
 
 wait_socket_gone() {
@@ -91,6 +110,27 @@ wait_pid_gone() {
     return 0
 }
 
+# 有界终止：TERM → 最多 KILL_WAIT_SECONDS 秒 → KILL → 再等待上限。
+# 只在确认进程消失后返回 0；每杀一次前都由调用方重新从 PID 文件核验身份。
+terminate_verified_pid() {
+    target=$1
+    label=$2
+    [ -n "$target" ] || return 1
+    say "- PID 回退：向 ${label} PID $target 发送 TERM"
+    kill -TERM "$target" 2>/dev/null
+    if ! wait_pid_gone "$target" "$KILL_WAIT_SECONDS"; then
+        say "! ${label} PID $target 在 ${KILL_WAIT_SECONDS}s 内未退出，发送 KILL"
+        kill -KILL "$target" 2>/dev/null
+        wait_pid_gone "$target" "$KILL_WAIT_SECONDS" || true
+    fi
+    if [ -d "/proc/$target" ]; then
+        say "! 无法确认 ${label} PID $target 已退出：可能存在仍在运行的进程，重启后会由 service.sh 重新拉起或由系统回收"
+        return 1
+    fi
+    say "- ${label} 进程 $target 已终止"
+    return 0
+}
+
 say "- AgentCall: 卸载开始"
 
 socket_present=0
@@ -98,9 +138,10 @@ control_socket_present && socket_present=1
 ctl_usable=0
 [ -x "$CTL" ] && ctl_usable=1
 bridge_pid=$(pid_from_file 2>/dev/null) || bridge_pid=""
+audio_pid=$(audio_pid_from_file 2>/dev/null) || audio_pid=""
 
-if [ "$socket_present" -eq 0 ] && [ -z "$bridge_pid" ]; then
-    say "- 桥接未运行（无控制 socket，PID 文件也不存在或不可核验），跳过停止请求"
+if [ "$socket_present" -eq 0 ] && [ -z "$bridge_pid" ] && [ -z "$audio_pid" ]; then
+    say "- 桥接与音频工作进程都未运行（无控制 socket，PID 文件也不存在或不可核验），跳过停止请求"
 else
     if [ "$socket_present" -eq 1 ] && [ "$ctl_usable" -eq 1 ]; then
         say "- 控制 socket 存在：请求桥接停止配置服务（shutdown，不执行任意 shell）"
@@ -113,7 +154,18 @@ else
     elif [ "$socket_present" -eq 1 ]; then
         say "! 控制 socket 存在，但固定 CLI 不可执行（$CTL）：跳过 shutdown，改用 PID 回退"
     else
-        say "- 无控制 socket，但发现可信 PID 文件：尝试 PID 回退终止残留桥接"
+        say "- 无控制 socket：尝试按 PID 文件终止残留的桥接/音频工作进程"
+    fi
+
+    # 音频工作进程独立于 bridge 存活：模块移除后残留会继续持有 abstract socket 与
+    # 麦克风隔离，下一次启动/重启前都难以清理，因此必须在删除数据目录之前结束。
+    audio_pid=$(audio_pid_from_file 2>/dev/null) || audio_pid=""
+    if [ -n "$audio_pid" ]; then
+        if terminate_verified_pid "$audio_pid" "音频工作"; then
+            rm -f "$AUDIO_PID_FILE" 2>/dev/null
+        fi
+    else
+        say "- 未发现可核验的音频工作进程 PID（不猜测 PID）"
     fi
 
     # 每次杀进程前重新核验 PID：bridge 退出后 PID 可能被系统复用，不能沿用旧值。
@@ -121,17 +173,7 @@ else
     if control_socket_present || [ -n "$residual_pid" ]; then
         bridge_pid=$residual_pid
         if [ -n "$bridge_pid" ]; then
-            say "- PID 回退：向 PID $bridge_pid 发送 TERM"
-            kill -TERM "$bridge_pid" 2>/dev/null
-            if ! wait_pid_gone "$bridge_pid" "$KILL_WAIT_SECONDS"; then
-                say "! PID $bridge_pid 在 ${KILL_WAIT_SECONDS}s 内未退出，发送 KILL"
-                kill -KILL "$bridge_pid" 2>/dev/null
-                wait_pid_gone "$bridge_pid" "$KILL_WAIT_SECONDS" || true
-            fi
-            if [ -d "/proc/$bridge_pid" ]; then
-                say "! 无法确认 PID $bridge_pid 已退出：可能存在仍在运行的桥接进程，重启后会由 service.sh 重新拉起或由系统回收"
-            else
-                say "- 桥接进程 $bridge_pid 已终止"
+            if terminate_verified_pid "$bridge_pid" "桥接"; then
                 rm -f "$PID_FILE" 2>/dev/null
             fi
         else
@@ -144,6 +186,9 @@ say "- 说明：桥接当前没有会话/租约实现（session.request 为 meth
 say "  本脚本无法终止或交还正在进行的 AI 通话；shutdown 只关闭配置服务与 socket。"
 say "  如卸载时正在 AI 通话，请在 Google 电话中手动结束后再清理。"
 say "! 本脚本无法确认任何 AI 通话已被交还（桥接没有会话/租约能力）；如正在通话请先在 Google 电话中手动结束"
+say "! TERM 只结束当前进程：service.sh 的重启循环默认在 5 s（RESTART_DELAY_SECONDS）后重新拉起进程。"
+say "  KernelSU 移除模块会先写 remove/disable 标记，service.sh 每次重启前重新检查标记；标记存在时不再拉起。"
+say "  若在没有 remove/disable 标记的情况下手动执行本脚本，桥接可能在约 5 s 内被重新拉起。"
 
 # 只允许删除固定的私有目录；解析后的绝对路径必须完全一致，避免误删。
 case "$DATA_ROOT" in

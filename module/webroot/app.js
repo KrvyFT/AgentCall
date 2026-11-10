@@ -19,7 +19,8 @@
     diagnose: null,
     secretState: { ASR: "MISSING", LLM: "MISSING", TTS: "MISSING" },
     secretIntent: { ASR: "keep", LLM: "keep", TTS: "keep" },
-    dirty: false,
+    // 分页未保存标记：保存某一页只清除该页的 chip，绝不连带清除其它页面。
+    dirty: { rules: false, ai: false, dialog: false },
     saving: false,
     loaded: false,
     saveEnabled: false,
@@ -493,10 +494,10 @@
   }
 
   /**
-   * 概览实时值：
-   * - 后端提供 dialerDefaultRole / hookConnected 时按真实值渲染；
-   * - 当前固定 CLI 的 status 不提供这两个字段（阶段 B 由桥接/APK 诊断补齐），
-   *   因此现在显示“未知（后端未提供）”，不显示硬编码的“未验证/无法确认”结论。
+   * 概览实时值（阶段 B 起由桥接 status 提供）：
+   * - dialerDefaultRole: boolean，或字符串 "unknown"（特权进程无法可靠确定）；
+   * - hookConnected: boolean，或字符串 "unknown"（未获得监督状态）；
+   * 只按真实布尔值渲染，其余一律显示“未知”，不显示猜测结论。
    */
   function renderLiveOverview() {
     var role = liveStatusValue("dialerDefaultRole");
@@ -509,9 +510,9 @@
       setBadge($("ov-dialer-badge"), "不满足", "warn");
       setText($("ov-dialer-note"), "自动接管需要 Google 电话为默认拨号器；该值来自桥接 status。");
     } else {
-      setText($("ov-dialer-role"), "未知（后端未提供）");
+      setText($("ov-dialer-role"), "未知（后端无法确定）");
       setBadge($("ov-dialer-badge"), "未知", "neutral");
-      setText($("ov-dialer-note"), "当前固定 CLI 的 status 不提供默认拨号角色；未获得真实值前不显示结论（该检查属于 APK 启动向导）。");
+      setText($("ov-dialer-note"), "桥接无法在特权进程可靠确定默认拨号器角色（返回 unknown）：只显示“未知”，不显示猜测结论。");
     }
 
     var hook = liveStatusValue("hookConnected");
@@ -524,9 +525,9 @@
       setBadge($("ov-hook-badge"), "未连接", "warn");
       setText($("ov-hook-note"), "桥接报告 Hook 未连接；未连接时不自动接管。");
     } else {
-      setText($("ov-hook-state"), "未知（后端未提供）");
+      setText($("ov-hook-state"), "未知（后端未上报）");
       setBadge($("ov-hook-badge"), "未知", "neutral");
-      setText($("ov-hook-note"), "固定 CLI 的 status 不报告 Hook 心跳；当前显示未知，不伪造“已连接/未连接”结论。");
+      setText($("ov-hook-note"), "桥接未返回 Hook 心跳状态（或值为 unknown）：只显示“未知”，不伪造“已连接/未连接”结论。");
     }
   }
 
@@ -638,15 +639,37 @@
       });
   }
 
-  function markDirty(show) {
-    state.dirty = show !== false;
-    ["rules-dirty", "ai-dirty", "dlg-dirty"].forEach(function (id) {
-      $(id).hidden = !state.dirty;
+  var DIRTY_PAGES = ["rules", "ai", "dialog"];
+  var DIRTY_CHIPS = { rules: "rules-dirty", ai: "ai-dirty", dialog: "dlg-dirty" };
+
+  /**
+   * 分页“未保存”标记：page 必须是本页作用域。总开关独立保存且没有 chip，
+   * 因此 page 为空时不改变任何页面标记。
+   */
+  function markDirty(page) {
+    if (!page || !Object.prototype.hasOwnProperty.call(state.dirty, page)) return;
+    state.dirty[page] = true;
+    var chip = $(DIRTY_CHIPS[page]);
+    if (chip) chip.hidden = false;
+  }
+
+  /** 无参数清除全部页面（重新加载配置后）；带 page 只清除该页。 */
+  function clearDirty(page) {
+    var pages = page ? [page] : DIRTY_PAGES;
+    pages.forEach(function (name) {
+      state.dirty[name] = false;
+      var chip = $(DIRTY_CHIPS[name]);
+      if (chip) chip.hidden = true;
     });
   }
 
-  function clearDirty() {
-    markDirty(false);
+  /** 输入控件所属页面：保存作用域与未保存 chip 的唯一映射。 */
+  function pageForInput(id) {
+    if (id.indexOf("rules-") === 0) return "rules";
+    if (id.indexOf("ai-") === 0) return "ai";
+    if (id.indexOf("dlg-") === 0) return "dialog";
+    // ov-enabled 是总开关，独立保存，没有页面 chip。
+    return null;
   }
 
   /** 串行化保存：临时文件路径固定，双击不能把两次写入交错到同一个 inbox 文件。 */
@@ -685,7 +708,7 @@
         state.form = result.form;
         state.loaded = true;
         fillSavedPage(scope, result.form);
-        clearDirty();
+        clearDirty(scope);
         renderPageIssues([], result.warnings || []);
         renderWarnings(result.warnings);
         hideBanner();
@@ -981,7 +1004,7 @@
       var element = $(id);
       if (!element) return;
       var handler = function () {
-        markDirty(true);
+        markDirty(pageForInput(id));
         if (id === "ov-enabled") renderEnabledState();
       };
       element.addEventListener("input", handler);
@@ -1000,7 +1023,7 @@
         $("ai-" + lower + "-cancel").hidden = false;
         $("ai-" + lower + "-secret").focus();
         updateSecretBadge(kind);
-        markDirty(true);
+        markDirty("ai");
       });
       $("ai-" + lower + "-clear").addEventListener("click", function () {
         state.secretIntent[kind] = "clear";
@@ -1010,11 +1033,11 @@
         $("ai-" + lower + "-clear").hidden = true;
         $("ai-" + lower + "-cancel").hidden = false;
         updateSecretBadge(kind);
-        markDirty(true);
+        markDirty("ai");
       });
       $("ai-" + lower + "-cancel").addEventListener("click", function () {
         resetSecretControls(kind);
-        markDirty(true);
+        markDirty("ai");
       });
       $("ai-" + lower + "-test").addEventListener("click", function () {
         var endpoint = endpointFromDom(kind);
