@@ -791,15 +791,18 @@ class Supervisor(
         }
         if (verified != null && verified.isolated) {
             val expired = deadline != null && nowMs >= deadline
-            synchronized(stateMonitor) {
+            val transitioned = synchronized(stateMonitor) {
                 recoveryRetryAtMs = nowMs + RECOVERY_RETRY_INTERVAL_MS
                 if (expired && blockedReason != SupervisorBootRecovery.BLOCK_STILL_ISOLATED) {
                     blockedReason = SupervisorBootRecovery.BLOCK_STILL_ISOLATED
                     phase = SupervisorPhase.BLOCKED
+                    true
+                } else {
+                    false
                 }
             }
-            if (expired) persist()
-            return if (expired) {
+            if (transitioned) persist()
+            return if (transitioned) {
                 listOf(SupervisorAction.BlockNewSessions(SupervisorBootRecovery.BLOCK_STILL_ISOLATED))
             } else {
                 emptyList()
@@ -807,16 +810,34 @@ class Supervisor(
         }
         if (probe is IsolationProbe.WorkerError) {
             // 工作进程明确回报错误：这是确定证据，保持/进入 BLOCKED。
-            block(SupervisorBootRecovery.BLOCK_RESTORE_FAILED)
-            return listOf(SupervisorAction.BlockNewSessions(SupervisorBootRecovery.BLOCK_RESTORE_FAILED))
+            return enterRecoveryBlock(nowMs, SupervisorBootRecovery.BLOCK_RESTORE_FAILED)
         }
         val expired = deadline != null && nowMs >= deadline
         if (!expired) {
             synchronized(stateMonitor) { recoveryRetryAtMs = nowMs + RECOVERY_RETRY_INTERVAL_MS }
             return emptyList()
         }
-        block(SupervisorBootRecovery.BLOCK_RESTORE_FAILED)
-        return listOf(SupervisorAction.BlockNewSessions(SupervisorBootRecovery.BLOCK_RESTORE_FAILED))
+        return enterRecoveryBlock(nowMs, SupervisorBootRecovery.BLOCK_RESTORE_FAILED)
+    }
+
+    /**
+     * 进入/维持恢复类 BLOCKED：只有状态真的改变才产生新的 BlockNewSessions 动作，
+     * 避免 1 s 重试把同一次阻塞每轮都当成新事件上报。
+     */
+    private fun enterRecoveryBlock(nowMs: Long, reason: String): List<SupervisorAction> {
+        val changed = synchronized(stateMonitor) {
+            recoveryRetryAtMs = nowMs + RECOVERY_RETRY_INTERVAL_MS
+            if (phase == SupervisorPhase.BLOCKED && blockedReason == reason) {
+                false
+            } else {
+                blockedReason = reason
+                phase = SupervisorPhase.BLOCKED
+                true
+            }
+        }
+        if (!changed) return emptyList()
+        persist()
+        return listOf(SupervisorAction.BlockNewSessions(reason))
     }
 
     /**
