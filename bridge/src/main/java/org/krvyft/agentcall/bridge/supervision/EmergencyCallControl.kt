@@ -108,29 +108,25 @@ class EmergencyCallControl(
 }
 
 /**
- * 反射调用 TelecomManager.endCall() 的薄适配（设备侧、未经真机验证）。
+ * 特权 Telecom 终止的安全默认实现：**永远返回** [RejectReason.UNSUPPORTED]。
  *
- * 本类只负责“执行已核验的终止”；身份核对与权限判定由调用方注入。没有经过真机验证的
- * 身份来源时，生产装配必须让 [CallIdentityVerifier.isAvailable] 返回 false，从而阻止
- * 自动接听，而不是尝试未经验证的 Binder 编号。
+ * I6：旧实现反射调用 TelecomManager.endCall()——那是全局操作，会结束当前所有通话，
+ * 完全忽略已核验的 [VerifiedCallIdentity]，可能替用户挂断无关电话。本实现因此绝不触碰
+ * Telecom，也不把“拿到 TelecomManager 实例”当作可用证据。
+ *
+ * 只有当目标 ROM 上存在**可按本次通话身份定位**且经真机验证的终止 API 时，才允许把本类
+ * 替换为真实实现；在那之前 [EmergencyCallControl.blocksAutoAnswer] 必须保持 true，
+ * 不允许启用自动接管（spec §8）。
+ *
+ * @param telecomManagerProvider 仅为将来按身份终止适配保留的注入点；当前实现不调用它。
  */
 class ReflectiveTelecomTermination(
-    private val telecomManagerProvider: () -> Any?,
+    @Suppress("UNUSED_PARAMETER") private val telecomManagerProvider: () -> Any? = { null },
 ) : PrivilegedTermination {
 
     override suspend fun disconnect(verified: VerifiedCallIdentity): CommandResult {
-        val telecom = try {
-            telecomManagerProvider()
-        } catch (t: Throwable) {
-            null
-        } ?: return CommandResult.Rejected(RejectReason.UNSUPPORTED)
-        return try {
-            val method = telecom.javaClass.getMethod("endCall")
-            method.invoke(telecom)
-            CommandResult.Accepted
-        } catch (t: Throwable) {
-            CommandResult.Failed("telecom_end_call_failed", t.javaClass.simpleName)
-        }
+        // 没有经过真机验证的按身份终止 API：明确不支持，绝不退化成全局 endCall。
+        return CommandResult.Rejected(RejectReason.UNSUPPORTED)
     }
 }
 

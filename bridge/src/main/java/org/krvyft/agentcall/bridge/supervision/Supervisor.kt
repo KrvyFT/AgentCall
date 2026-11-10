@@ -1,13 +1,15 @@
 package org.krvyft.agentcall.bridge.supervision
 
 import java.io.Closeable
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.krvyft.agentcall.bridge.audio.AudioUnavailableException
 import org.krvyft.agentcall.bridge.audio.BridgeProcessRole
 import org.krvyft.agentcall.bridge.audio.ProcessFaultDecision
 import org.krvyft.agentcall.bridge.audio.SupervisedAudio
 import org.krvyft.agentcall.core.model.AudioFormatSpec
 import org.krvyft.agentcall.core.model.CallCommand
+import org.krvyft.agentcall.core.model.CallState
 import org.krvyft.agentcall.core.model.CommandResult
 import org.krvyft.agentcall.core.model.PeerRole
 import org.krvyft.agentcall.core.model.RejectReason
@@ -25,7 +27,7 @@ enum class SupervisorPhase {
     /** 接听命令已下发，等待 ACTIVE。 */
     ANSWER_PENDING,
     ACTIVE,
-    /** 音频失败，等待 10 秒人工接管。 */
+    /** 音频失败/接听结果不明确，等待 10 秒人工接管。 */
     HANDOFF_PENDING,
     /** 已发出故障终止，等待断开确认。 */
     TERMINATING,
@@ -108,6 +110,7 @@ data class SupervisorSnapshot(
     val peersAlive: Map<PeerRole, Boolean>,
     val calibrationAuthorized: Boolean,
     val privilegedTerminationAvailable: Boolean,
+    /** 监督端自己持有的音频工作进程重启预算用量（不随 worker 重启清零）。 */
     val restartAttempts: Int,
     val blockedReason: String?,
     val lastFault: String?,
@@ -115,16 +118,24 @@ data class SupervisorSnapshot(
 )
 
 /**
- * 监督角色（独立 app_process，spec §6.3/§8）。
+ * 监督角色（spec §6.3/§8）。
  *
  * 强制顺序与边界：
- * - 接听前：心跳/校准/独立终止能力全部就绪 → 取得租约 → 隔离麦克风 → 才发 Answer；
+ * - 接听前：心跳/校准/独立终止能力全部就绪 → 取得租约 → 隔离麦克风并读回 → 才发 Answer；
+ * - 接听结果不明确（Failed）：先查询真实通话状态；只有确认未接听/已断开才恢复麦克风，
+ *   确认 ACTIVE 则终止精确会话，无法核验则保持隔离并开人工接管窗口；
  * - 音频失败：先停音频、保持隔离，开 10000 ms 人工接管窗口；窗口到期才故障终止；
- * - 心跳失效（默认 5000 ms）：先停音频并保持隔离，再只终止自己租约下的精确会话；
+ * - 心跳失效（默认 5000 ms）按 SessionId 归属判定：外来会话心跳不能给拥有的旧通话续命；
  * - 撤销租约后绝不下发挂断（不能杀用户已接管的电话）；
- * - Hook 挂断失败时走独立特权 Telecom 路径；身份/权限不可用则明确不支持并阻止新会话；
+ * - 只有 ANSWER_PENDING/ARMED 允许打开音频；BLOCKED/TERMINATING 之后迟到的 ACTIVE
+ *   一律拒绝，绝不覆盖阻塞状态；
  * - 断开确认前绝不恢复麦克风；[stopKeepingIsolation] 不会解除隔离；
- * - 音频工作进程重启有界，超预算即故障终止。
+ * - 隔离状态每轮轮询/打开前都读回系统状态，读回失败立即停止 AI 并阻止新会话；
+ * - 音频工作进程重启预算在本监督端（进程重启不清零），耗尽即故障终止。
+ *
+ * 并发模型：字段由 [stateMonitor] 保护；所有挂起迁移由 [transitions] 串行化（I4）。
+ * [transitions] 不是状态锁：授权/Telecom 检查在状态锁之外执行（M1），
+ * 只有纯状态读写与端口调用发生在 monitor 之外/之内按各自 KDoc 说明。
  *
  * 本类不执行全局 endCall，也不接受没有 [SessionId] 的终止请求。
  */
@@ -138,14 +149,16 @@ class Supervisor(
     private val heartbeatTimeoutMs: Long = SessionLimits.HEARTBEAT_TIMEOUT_MS,
     private val handoffWindowMs: Long = SessionLimits.FAILURE_HANDOFF_WINDOW_MS,
     val role: BridgeProcessRole = BridgeProcessRole.SUPERVISOR,
+    private val callState: CallStateProbe = CallStateProbe { null },
+    private val stateSink: (SupervisionPersistedState) -> Unit = {},
+    maxRestarts: Int = RestartBudget.DEFAULT_MAX_RESTARTS,
+    restartWindowMs: Long = RestartBudget.DEFAULT_WINDOW_MS,
 ) : Closeable {
 
     init {
         require(heartbeatTimeoutMs > 0L) { "heartbeatTimeoutMs must be positive" }
         require(handoffWindowMs > 0L) { "handoffWindowMs must be positive" }
     }
-
-    private data class PeerPresence(val sessionId: SessionId, val atMs: Long)
 
     private data class StateView(
         val phase: SupervisorPhase,
@@ -154,151 +167,292 @@ class Supervisor(
         val fault: String?,
     )
 
-    private val lock = Any()
+    private val stateMonitor = Any()
+    private val transitions = Mutex()
+    private val restartBudget = RestartBudget(maxRestarts, restartWindowMs)
+    private val pendingActions = ArrayDeque<SupervisorAction>()
+
     private var started = false
     private var phase = SupervisorPhase.IDLE
     private var ownedSession: SessionId? = null
     private var handoffDeadlineMs: Long? = null
     private var blockedReason: String? = null
     private var lastFault: String? = null
-    private val heartbeats = LinkedHashMap<PeerRole, PeerPresence>()
+
+    /**
+     * 每个心跳角色最近一次按会话记录的存活时间（LRU 有界）。
+     *
+     * I1：存活判定必须绑定 SessionId；旧实现只按角色记录，APP 进程重建后新代次的
+     * 心跳会让旧会话永远“活着”，该拥有的通话永远不会超时。
+     */
+    private val presence = LinkedHashMap<PeerRole, LinkedHashMap<SessionId, Long>>()
     private val lostRoles = mutableSetOf<PeerRole>()
 
-    /** 幂等的监督角色启动入口；由 app_process 容器调用。 */
+    /** 幂等的监督角色启动入口；由 app_process 容器在启动恢复之后调用。 */
     fun start() {
-        synchronized(lock) { started = true }
+        synchronized(stateMonitor) { started = true }
     }
 
-    fun isStarted(): Boolean = synchronized(lock) { started }
+    fun isStarted(): Boolean = synchronized(stateMonitor) { started }
 
     /**
      * 记录一次对端心跳。只有 APP/HOOK 参与监督；CLI_ROOT 不是心跳角色。
      *
-     * @param id 心跳所属会话（监督端只信任与租约/精确通话核验配合的会话标识）。
+     * @param id 心跳所属会话；存活只对同一 SessionId 生效。
      */
     fun heartbeat(id: SessionId, role: PeerRole, atMs: Long = clock.nowMs()) {
         if (role != PeerRole.APP && role != PeerRole.HOOK) return
-        synchronized(lock) {
+        synchronized(stateMonitor) {
             started = true
-            heartbeats[role] = PeerPresence(id, atMs)
+            val byId = presence.getOrPut(role) { LinkedHashMap() }
+            byId.remove(id)
+            byId[id] = atMs
+            while (byId.size > MAX_PRESENCE_SESSIONS) {
+                val eldest = byId.keys.first()
+                byId.remove(eldest)
+            }
             lostRoles.remove(role)
         }
     }
 
-    /** 该角色当前是否在 [heartbeatTimeoutMs] 内报告过心跳（未报告过一律 false）。 */
-    fun peerAlive(role: PeerRole, atMs: Long = clock.nowMs()): Boolean {
-        val presence = synchronized(lock) { heartbeats[role] } ?: return false
-        return atMs - presence.atMs <= heartbeatTimeoutMs
+    /** 该角色当前是否有任一会话在 [heartbeatTimeoutMs] 内报告过心跳（诊断/就绪预检用）。 */
+    fun peerAlive(role: PeerRole, atMs: Long = clock.nowMs()): Boolean = synchronized(stateMonitor) {
+        presence[role]?.values?.any { atMs - it <= heartbeatTimeoutMs } == true
     }
 
-    /** 自动接听就绪：双端心跳、校准授权、独立终止能力、未被阻止。 */
-    fun isReady(atMs: Long = clock.nowMs()): Boolean =
-        synchronized(lock) { started } &&
-            peerAlive(PeerRole.APP, atMs) &&
-            peerAlive(PeerRole.HOOK, atMs) &&
-            authorization.isAuthorized() &&
-            !emergency.blocksAutoAnswer() &&
-            synchronized(lock) { blockedReason == null }
+    /** 只有与 [id] 完全同一会话的心跳才算拥有通话的存活证据（I1）。 */
+    fun peerAliveFor(id: SessionId, role: PeerRole, atMs: Long = clock.nowMs()): Boolean =
+        synchronized(stateMonitor) {
+            val at = presence[role]?.get(id) ?: return false
+            atMs - at <= heartbeatTimeoutMs
+        }
+
+    /** 拥有的通话在当前是否仍被该角色自己的心跳支撑。 */
+    fun ownedPeerAlive(role: PeerRole, atMs: Long = clock.nowMs()): Boolean {
+        val id = synchronized(stateMonitor) { ownedSession } ?: return false
+        return peerAliveFor(id, role, atMs)
+    }
+
+    /** 就绪（角色级）：双端任一当前会话心跳、校准授权、独立终止能力、未被阻止。 */
+    fun isReady(atMs: Long = clock.nowMs()): Boolean {
+        val startedNow = synchronized(stateMonitor) { started }
+        if (!startedNow) return false
+        if (synchronized(stateMonitor) { blockedReason != null }) return false
+        if (!peerAlive(PeerRole.APP, atMs) || !peerAlive(PeerRole.HOOK, atMs)) return false
+        // M1：授权/Telecom 检查不在状态锁内执行。
+        if (!authorization.isAuthorized()) return false
+        return !emergency.blocksAutoAnswer()
+    }
+
+    /** 针对候选会话的就绪：必须是该 SessionId 自己的 APP/HOOK 心跳（I1）。 */
+    fun isReadyFor(id: SessionId, atMs: Long = clock.nowMs()): Boolean {
+        val startedNow = synchronized(stateMonitor) { started }
+        if (!startedNow) return false
+        if (synchronized(stateMonitor) { blockedReason != null }) return false
+        if (!peerAliveFor(id, PeerRole.APP, atMs) || !peerAliveFor(id, PeerRole.HOOK, atMs)) return false
+        // M1：授权/Telecom 检查不在状态锁内执行。
+        if (!authorization.isAuthorized()) return false
+        return !emergency.blocksAutoAnswer()
+    }
 
     /**
-     * 接听前准备：就绪检查 → 取租约 → 隔离麦克风 → 下发 Answer。
+     * 接听前准备：就绪（按会话心跳）→ 取租约 → 隔离并读回 → 下发 Answer。
      * 任一步失败都不会自动接听，也不会留下有效租约。
      */
     suspend fun prepareAnswer(id: SessionId): CommandResult {
-        // 上一通话仍在 ARMED/ANSWER_PENDING/ACTIVE/HANDOFF_PENDING/TERMINATING 时，
-        // 绝不能让新通话覆盖 ownedSession：旧通话的断开确认会因此丢失，麦克风可能
-        // 永久保持隔离。只有彻底空闲（IDLE/ENDED）才允许准备下一次接听。
-        val reusable = synchronized(lock) {
-            ownedSession == null &&
-                (phase == SupervisorPhase.IDLE || phase == SupervisorPhase.ENDED)
+        val reusable = synchronized(stateMonitor) {
+            ownedSession == null && (phase == SupervisorPhase.IDLE || phase == SupervisorPhase.ENDED)
         }
         if (!reusable) return CommandResult.Rejected(RejectReason.NOT_OWNED)
-        if (!isReady()) return CommandResult.Rejected(RejectReason.UNSUPPORTED)
-        leases.acquire(id) ?: return CommandResult.Rejected(RejectReason.NOT_OWNED)
+        // M1：校准授权/Telecom 能力检查在状态锁与迁移串行化之外执行，绝不占用状态锁。
+        if (!isReadyFor(id)) return CommandResult.Rejected(RejectReason.UNSUPPORTED)
+        return transitions.withLock { prepareAnswerLocked(id) }
+    }
+
+    private suspend fun prepareAnswerLocked(id: SessionId): CommandResult {
+        // 取得串行化后只复核内存状态；外部授权检查已在上方无锁完成。
+        val stillReusable = synchronized(stateMonitor) {
+            ownedSession == null && (phase == SupervisorPhase.IDLE || phase == SupervisorPhase.ENDED)
+        }
+        if (!stillReusable) return CommandResult.Rejected(RejectReason.NOT_OWNED)
+        if (synchronized(stateMonitor) { !started || blockedReason != null }) {
+            return CommandResult.Rejected(RejectReason.UNSUPPORTED)
+        }
+        if (leases.acquire(id) == null) return CommandResult.Rejected(RejectReason.NOT_OWNED)
 
         if (!audio.isolateMicrophone()) {
             leases.revoke(id)
-            synchronized(lock) { blockedReason = "microphone_isolation_unavailable" }
+            block(BLOCKER_ISOLATION_UNAVAILABLE)
+            return CommandResult.Rejected(RejectReason.UNSUPPORTED)
+        }
+        // I7：隔离成功也要读回系统状态，不能只信返回值/缓存。
+        if (!audio.verifyIsolation()) {
+            leases.revoke(id)
+            audio.stopKeepingIsolation()
+            block(BLOCKER_ISOLATION_LOST)
             return CommandResult.Rejected(RejectReason.UNSUPPORTED)
         }
 
-        synchronized(lock) {
+        synchronized(stateMonitor) {
             ownedSession = id
             phase = SupervisorPhase.ARMED
+            handoffDeadlineMs = null
             lastFault = null
         }
+        persist()
 
-        val result = try {
-            calls.send(id, CallCommand.Answer)
-        } catch (t: Throwable) {
-            CommandResult.Failed("answer_failed", t.javaClass.simpleName)
-        }
-        if (result !is CommandResult.Accepted) {
-            leases.revoke(id)
-            audio.stopKeepingIsolation()
-            // AI 从未接听该通话，恢复麦克风不涉及 AI 通话；失败也必须清空所有权。
-            audio.restoreMicrophone()
-            synchronized(lock) {
-                ownedSession = null
-                phase = SupervisorPhase.IDLE
-                handoffDeadlineMs = null
+        val result = sendAnswer(id)
+        return when (result) {
+            is CommandResult.Accepted -> {
+                synchronized(stateMonitor) { phase = SupervisorPhase.ANSWER_PENDING }
+                persist()
+                result
             }
-            return result
+            is CommandResult.Rejected -> {
+                // 契约保证 Rejected 没有副作用：可以确定未接听，恢复麦克风。
+                releaseAfterConfirmedNonAnswer(id)
+                result
+            }
+            is CommandResult.Failed -> {
+                // 响应丢失/执行失败：不明确，先核验真实状态再决定（I2）。
+                handleAmbiguousAnswer(id, result)
+                result
+            }
         }
-        synchronized(lock) { phase = SupervisorPhase.ANSWER_PENDING }
-        return result
+    }
+
+    private suspend fun sendAnswer(id: SessionId): CommandResult = try {
+        calls.send(id, CallCommand.Answer)
+    } catch (t: Throwable) {
+        CommandResult.Failed("answer_failed", t.javaClass.simpleName)
     }
 
     /**
-     * ACTIVE 后打开真实双向流。打开失败走音频故障路径（保持隔离 + 10 秒窗口），
-     * 绝不退回环境麦克风。
+     * 接听结果不明确。/Rejected/ 是确定性的“未执行”；/Failed/ 必须查询真实状态：
+     * - RINGING/DISCONNECTED：确认未接听或已断开 → 恢复麦克风；
+     * - ACTIVE/HOLDING：电话可能已被 AI 接起 → 立即终止精确会话，保持隔离；
+     * - null：无法核验 → 保持隔离与所有权，进入人工接管窗口（到期故障终止）。
+     */
+    private suspend fun handleAmbiguousAnswer(id: SessionId, failure: CommandResult.Failed) {
+        val state = try {
+            callState.state(id)
+        } catch (t: Throwable) {
+            null
+        }
+        when (state) {
+            CallState.RINGING, CallState.DISCONNECTED -> releaseAfterConfirmedNonAnswer(id)
+            CallState.ACTIVE, CallState.HOLDING -> {
+                enterHandoff(id, failure.code)
+                terminateOwnedLocked(id, "answer_ambiguous")
+            }
+            null -> enterHandoff(id, failure.code)
+        }
+    }
+
+    private suspend fun releaseAfterConfirmedNonAnswer(id: SessionId) {
+        audio.stopKeepingIsolation()
+        leases.revoke(id)
+        val restored = try {
+            audio.restoreMicrophone()
+        } catch (t: Throwable) {
+            false
+        }
+        synchronized(stateMonitor) {
+            ownedSession = null
+            handoffDeadlineMs = null
+            if (restored) {
+                phase = SupervisorPhase.IDLE
+            } else {
+                phase = SupervisorPhase.BLOCKED
+                blockedReason = BLOCKER_RESTORE_FAILED
+            }
+        }
+        persist()
+    }
+
+    private fun enterHandoff(id: SessionId, code: String) {
+        synchronized(stateMonitor) {
+            if (ownedSession != id) return
+            phase = SupervisorPhase.HANDOFF_PENDING
+            handoffDeadlineMs = clock.nowMs() + handoffWindowMs
+            lastFault = code
+        }
+        pendingActions.addLast(SupervisorAction.PromptManualTakeover(id, handoffWindowMs))
+        persist()
+    }
+
+    /**
+     * ACTIVE 后打开真实双向流。只有 ANSWER_PENDING/ARMED 允许打开；重复 ACTIVE 幂等，
+     * BLOCKED/TERMINATING/HANDOFF_PENDING 之后迟到的 ACTIVE 一律拒绝（I3）。
      */
     suspend fun onCallActive(
         id: SessionId,
         format: AudioFormatSpec = AudioFormatSpec(),
-    ): CommandResult {
-        if (synchronized(lock) { ownedSession } != id) {
+    ): CommandResult = transitions.withLock {
+        val currentPhase = synchronized(stateMonitor) { phase }
+        val owned = synchronized(stateMonitor) { ownedSession }
+        if (owned != id) return CommandResult.Rejected(RejectReason.STALE_SESSION)
+        if (currentPhase == SupervisorPhase.ACTIVE) return CommandResult.Accepted
+        if (currentPhase != SupervisorPhase.ANSWER_PENDING && currentPhase != SupervisorPhase.ARMED) {
             return CommandResult.Rejected(RejectReason.STALE_SESSION)
         }
         if (!leases.isLive(id)) {
             audio.stopKeepingIsolation()
             return CommandResult.Rejected(RejectReason.NOT_OWNED)
         }
+        // I7：打开前必须读回系统隔离状态。
+        if (!audio.verifyIsolation()) {
+            audio.stopKeepingIsolation()
+            block(BLOCKER_ISOLATION_LOST)
+            terminateOwnedLocked(id, BLOCKER_ISOLATION_LOST)
+            return CommandResult.Failed(BLOCKER_ISOLATION_LOST, "microphone isolation read-back failed")
+        }
         return try {
             audio.open(id, format)
-            synchronized(lock) { phase = SupervisorPhase.ACTIVE }
+            synchronized(stateMonitor) { phase = SupervisorPhase.ACTIVE }
+            persist()
             CommandResult.Accepted
         } catch (error: AudioUnavailableException) {
-            onAudioFailure(id, error.code)
+            onAudioFailureLocked(id, error.code)
             CommandResult.Failed(error.code, error.message ?: error.code)
         } catch (t: Throwable) {
-            onAudioFailure(id, "audio_open_failed")
+            onAudioFailureLocked(id, "audio_open_failed")
             CommandResult.Failed("audio_open_failed", t.javaClass.simpleName)
         }
     }
 
     /**
-     * 音频建立/运行失败：先停音频，保持隔离；无法维持隔离时立即终止；否则开人工接管窗口。
+     * 音频建立/运行失败：先停音频，保持隔离；隔离已丢失时立即终止并阻止新会话；
+     * 否则开人工接管窗口。
      */
-    suspend fun onAudioFailure(id: SessionId, code: String): List<SupervisorAction> {
-        if (synchronized(lock) { ownedSession } != id) return emptyList()
+    suspend fun onAudioFailure(id: SessionId, code: String): List<SupervisorAction> =
+        transitions.withLock { onAudioFailureLocked(id, code) }
+
+    private suspend fun onAudioFailureLocked(id: SessionId, code: String): List<SupervisorAction> {
+        if (synchronized(stateMonitor) { ownedSession } != id) return emptyList()
         val actions = mutableListOf<SupervisorAction>()
-        val stillIsolated = audio.microphoneIsolated
+        // I7：读回系统状态，不用缓存布尔值。
+        val stillIsolated = try {
+            audio.verifyIsolation()
+        } catch (t: Throwable) {
+            false
+        }
         audio.stopKeepingIsolation()
         actions += SupervisorAction.StopAudioKeepingIsolation(id, code)
-        synchronized(lock) { lastFault = code }
+        synchronized(stateMonitor) { lastFault = code }
 
         if (!stillIsolated) {
-            synchronized(lock) { blockedReason = "microphone_isolation_lost" }
-            actions += SupervisorAction.BlockNewSessions("microphone_isolation_lost")
-            actions += terminateOwned(id, "microphone_isolation_lost").actions
+            block(BLOCKER_ISOLATION_LOST)
+            actions += SupervisorAction.BlockNewSessions(BLOCKER_ISOLATION_LOST)
+            actions += terminateOwnedLocked(id, BLOCKER_ISOLATION_LOST).actions
             return actions
         }
 
-        synchronized(lock) {
+        synchronized(stateMonitor) {
             phase = SupervisorPhase.HANDOFF_PENDING
             handoffDeadlineMs = clock.nowMs() + handoffWindowMs
         }
+        persist()
         actions += SupervisorAction.PromptManualTakeover(id, handoffWindowMs)
         return actions
     }
@@ -307,8 +461,8 @@ class Supervisor(
      * 人工接管：撤销 AI 所有权 → 停音频 → 恢复麦克风。撤销失败不报成功。
      * 会话已不在本监督端名下时返回 [TakeoverOutcome.NotOwned]。
      */
-    suspend fun onManualTakeover(id: SessionId): TakeoverOutcome {
-        val current = synchronized(lock) { ownedSession }
+    suspend fun onManualTakeover(id: SessionId): TakeoverOutcome = transitions.withLock {
+        val current = synchronized(stateMonitor) { ownedSession }
         if (current == null || current != id) return TakeoverOutcome.NotOwned
 
         val live = leases.isLive(id)
@@ -317,40 +471,50 @@ class Supervisor(
         }
 
         audio.stopKeepingIsolation()
-        val restored = audio.restoreMicrophone()
-        synchronized(lock) {
+        val restored = try {
+            audio.restoreMicrophone()
+        } catch (t: Throwable) {
+            false
+        }
+        synchronized(stateMonitor) {
             ownedSession = null
             handoffDeadlineMs = null
             phase = if (restored) SupervisorPhase.IDLE else SupervisorPhase.BLOCKED
-            if (!restored) blockedReason = "microphone_restore_failed"
+            if (!restored) blockedReason = BLOCKER_RESTORE_FAILED
         }
+        persist()
         return if (restored) {
             TakeoverOutcome.Confirmed
         } else {
-            TakeoverOutcome.RestoreFailed("microphone_restore_failed")
+            TakeoverOutcome.RestoreFailed(BLOCKER_RESTORE_FAILED)
         }
     }
 
     /**
      * 通话断开确认回调。只有精确拥有的会话才会停音频并恢复麦克风；外部会话一律忽略。
      */
-    suspend fun onCallDisconnected(id: SessionId): List<SupervisorAction> {
-        if (synchronized(lock) { ownedSession } != id) return emptyList()
+    suspend fun onCallDisconnected(id: SessionId): List<SupervisorAction> = transitions.withLock {
+        if (synchronized(stateMonitor) { ownedSession } != id) return emptyList()
         val actions = mutableListOf<SupervisorAction>()
         audio.stopKeepingIsolation()
         actions += SupervisorAction.StopAudioKeepingIsolation(id, "call_disconnected")
         leases.revoke(id)
-        val restored = audio.restoreMicrophone()
-        synchronized(lock) {
+        val restored = try {
+            audio.restoreMicrophone()
+        } catch (t: Throwable) {
+            false
+        }
+        synchronized(stateMonitor) {
             ownedSession = null
             handoffDeadlineMs = null
             phase = if (restored) SupervisorPhase.ENDED else SupervisorPhase.BLOCKED
-            if (!restored) blockedReason = "microphone_restore_failed"
+            if (!restored) blockedReason = BLOCKER_RESTORE_FAILED
         }
+        persist()
         actions += if (restored) {
             SupervisorAction.RestoreMicrophone(id)
         } else {
-            SupervisorAction.BlockNewSessions("microphone_restore_failed")
+            SupervisorAction.BlockNewSessions(BLOCKER_RESTORE_FAILED)
         }
         return actions
     }
@@ -359,20 +523,24 @@ class Supervisor(
      * 只终止本监督端租约下的精确会话。
      *
      * 顺序：停音频（保持隔离）→ 验证租约 → Hook 挂断 → 失败则独立特权 Telecom 终止。
-     * 租约已撤销时不发任何命令；这是“用户已接管/已撤销”时必须遵守的边界。
+     * 租约已撤销时不发任何命令；这是用户已接管/已撤销时必须遵守的边界。
      */
-    suspend fun terminateOwned(id: SessionId, reason: String): TerminationResult {
-        if (synchronized(lock) { ownedSession } != id) {
+    suspend fun terminateOwned(id: SessionId, reason: String): TerminationResult =
+        transitions.withLock { terminateOwnedLocked(id, reason) }
+
+    private suspend fun terminateOwnedLocked(id: SessionId, reason: String): TerminationResult {
+        if (synchronized(stateMonitor) { ownedSession } != id) {
             return TerminationResult(TerminationOutcome.NOT_OWNED, emptyList())
         }
         val actions = mutableListOf<SupervisorAction>()
         audio.stopKeepingIsolation()
         actions += SupervisorAction.StopAudioKeepingIsolation(id, reason)
-        synchronized(lock) {
+        synchronized(stateMonitor) {
             lastFault = reason
             phase = SupervisorPhase.TERMINATING
             handoffDeadlineMs = null
         }
+        persist()
 
         if (!leases.isLive(id)) {
             return TerminationResult(TerminationOutcome.NO_LEASE, actions)
@@ -386,9 +554,11 @@ class Supervisor(
         if (hookResult is CommandResult.Accepted) {
             leases.revoke(id)
             actions += SupervisorAction.TerminateCall(id, reason, TerminationPath.HOOK)
+            persist()
             return TerminationResult(TerminationOutcome.HOOK_ACCEPTED, actions)
         }
 
+        // M1：Telecom 检查/调用不持有状态 monitor；只由 transitions 串行化。
         val emergencyResult = try {
             emergency.disconnectOwned(id)
         } catch (t: Throwable) {
@@ -398,82 +568,123 @@ class Supervisor(
             is CommandResult.Accepted -> {
                 leases.revoke(id)
                 actions += SupervisorAction.TerminateCall(id, reason, TerminationPath.PRIVILEGED_TELECOM)
+                persist()
                 TerminationResult(TerminationOutcome.TELECOM_ACCEPTED, actions)
             }
             is CommandResult.Rejected -> {
-                synchronized(lock) {
-                    phase = SupervisorPhase.BLOCKED
-                    blockedReason = "privileged_termination_unsupported"
-                }
-                actions += SupervisorAction.BlockNewSessions("privileged_termination_unsupported")
+                block(BLOCKER_PRIVILEGED_TERMINATION)
+                actions += SupervisorAction.BlockNewSessions(BLOCKER_PRIVILEGED_TERMINATION)
                 TerminationResult(TerminationOutcome.TELECOM_UNSUPPORTED, actions)
             }
             else -> {
-                synchronized(lock) {
-                    phase = SupervisorPhase.BLOCKED
-                    blockedReason = "termination_unconfirmed"
-                }
-                actions += SupervisorAction.BlockNewSessions("termination_unconfirmed")
+                block(BLOCKER_TERMINATION_UNCONFIRMED)
+                actions += SupervisorAction.BlockNewSessions(BLOCKER_TERMINATION_UNCONFIRMED)
                 TerminationResult(TerminationOutcome.FAILED, actions)
             }
         }
     }
 
     /**
-     * 周期性故障检查：人工接管窗口到期、已报告过的对端心跳失效。
-     * 未报告过心跳的对端不会被“判定失联”（那是未就绪，不是故障）。
+     * 周期性故障检查：人工接管窗口到期、拥有的会话心跳失效、ACTIVE 期间隔离读回。
+     * 同一轮最多终止同一 SessionId 一次（M4）。
      */
-    suspend fun poll(nowMs: Long = clock.nowMs()): List<SupervisorAction> {
+    suspend fun poll(nowMs: Long = clock.nowMs()): List<SupervisorAction> = transitions.withLock {
         val actions = mutableListOf<SupervisorAction>()
-        val snapshot = synchronized(lock) {
+        drainPendingInto(actions)
+        val handled = mutableSetOf<SessionId>()
+
+        val handoff = synchronized(stateMonitor) {
             Triple(phase, handoffDeadlineMs, ownedSession)
         }
-        val currentPhase = snapshot.first
-        val deadline = snapshot.second
-        val id = snapshot.third
-        if (currentPhase == SupervisorPhase.HANDOFF_PENDING && deadline != null && id != null && nowMs >= deadline) {
-            actions += terminateOwned(id, "manual_takeover_window_expired").actions
+        if (handoff.first == SupervisorPhase.HANDOFF_PENDING &&
+            handoff.second != null &&
+            handoff.third != null &&
+            nowMs >= handoff.second!!
+        ) {
+            val id = handoff.third!!
+            if (handled.add(id)) {
+                actions += terminateOwnedLocked(id, "manual_takeover_window_expired").actions
+            }
         }
 
-        val roles = synchronized(lock) { heartbeats.keys.toList() }
-        for (peerRole in roles) {
-            val handled = synchronized(lock) { peerRole in lostRoles }
-            if (handled) continue
-            if (peerAlive(peerRole, nowMs)) continue
-            synchronized(lock) {
-                lostRoles += peerRole
-                lastFault = "peer_lost_" + peerRole.name
+        // I7：拥有的通话在 ACTIVE/等待阶段每轮都读回系统隔离状态。
+        val liveOwner = synchronized(stateMonitor) { phase to ownedSession }
+        val isolatedOwner = liveOwner.second
+        if (isolatedOwner != null &&
+            isolatedOwner !in handled &&
+            liveOwner.first in AUDIO_OWNER_PHASES
+        ) {
+            val stillIsolated = try {
+                audio.verifyIsolation()
+            } catch (t: Throwable) {
+                false
             }
-            val owned = synchronized(lock) { ownedSession }
-            if (owned != null) {
-                actions += terminateOwned(owned, "peer_lost_" + peerRole.name).actions
+            if (!stillIsolated) {
+                audio.stopKeepingIsolation()
+                block(BLOCKER_ISOLATION_LOST)
+                actions += SupervisorAction.BlockNewSessions(BLOCKER_ISOLATION_LOST)
+                if (handled.add(isolatedOwner)) {
+                    actions += terminateOwnedLocked(isolatedOwner, BLOCKER_ISOLATION_LOST).actions
+                }
+            }
+        }
+
+        // I1：只检查拥有会话自己的心跳；外来会话心跳不参与。
+        val owned = synchronized(stateMonitor) { ownedSession }
+        if (owned != null && owned !in handled) {
+            for (peerRole in HEARTBEAT_ROLES) {
+                if (synchronized(stateMonitor) { peerRole in lostRoles }) continue
+                if (peerAliveFor(owned, peerRole, nowMs)) continue
+                synchronized(stateMonitor) {
+                    lostRoles += peerRole
+                    lastFault = "peer_lost_" + peerRole.name
+                }
+                if (handled.add(owned)) {
+                    actions += terminateOwnedLocked(owned, "peer_lost_" + peerRole.name).actions
+                }
+                break
             }
         }
         return actions
     }
 
+    private fun drainPendingInto(actions: MutableList<SupervisorAction>) {
+        while (true) {
+            val next = pendingActions.removeFirstOrNull() ?: return
+            actions += next
+        }
+    }
+
     /**
-     * 音频工作进程故障：有界重启；预算耗尽则故障终止当前拥有的会话。
+     * 音频工作进程故障：重启预算在本监督端（I5）；预算耗尽则故障终止当前拥有的会话。
      * 监督进程自身的重启由模块 service.sh 负责，这里返回 [ProcessFaultDecision.NotManaged]。
      */
-    suspend fun onProcessFault(role: BridgeProcessRole, code: String): ProcessFaultDecision {
+    suspend fun onProcessFault(
+        role: BridgeProcessRole,
+        code: String,
+        nowMs: Long = clock.nowMs(),
+    ): ProcessFaultDecision = transitions.withLock {
         if (role != BridgeProcessRole.AUDIO_WORKER || this.role != BridgeProcessRole.SUPERVISOR) {
-            return ProcessFaultDecision.NotManaged
+            return@withLock ProcessFaultDecision.NotManaged
         }
-        val decision = audio.onProcessFault(code, clock.nowMs())
+        val decision = restartBudget.record(nowMs)
+        synchronized(stateMonitor) { lastFault = code }
         if (decision is ProcessFaultDecision.RestartExhausted) {
-            val owned = synchronized(lock) { ownedSession }
+            val owned = synchronized(stateMonitor) { ownedSession }
             if (owned != null) {
-                terminateOwned(owned, "audio_restart_exhausted")
+                terminateOwnedLocked(owned, "audio_restart_exhausted")
             }
         }
-        return decision
+        decision
     }
 
     fun snapshot(nowMs: Long = clock.nowMs()): SupervisorSnapshot {
-        val state = synchronized(lock) {
+        val state = synchronized(stateMonitor) {
             StateView(phase, ownedSession, blockedReason, lastFault)
         }
+        // M1：授权/Telecom 检查不在状态锁内。
+        val authorized = authorization.isAuthorized()
+        val privilegedAvailable = !emergency.blocksAutoAnswer()
         return SupervisorSnapshot(
             role = role,
             phase = state.phase,
@@ -483,9 +694,9 @@ class Supervisor(
                 PeerRole.APP to peerAlive(PeerRole.APP, nowMs),
                 PeerRole.HOOK to peerAlive(PeerRole.HOOK, nowMs),
             ),
-            calibrationAuthorized = authorization.isAuthorized(),
-            privilegedTerminationAvailable = !emergency.blocksAutoAnswer(),
-            restartAttempts = audio.snapshot().restartAttempts,
+            calibrationAuthorized = authorized,
+            privilegedTerminationAvailable = privilegedAvailable,
+            restartAttempts = restartBudget.used(nowMs),
             blockedReason = state.blocked,
             lastFault = state.fault,
             updatedAtMs = nowMs,
@@ -493,22 +704,95 @@ class Supervisor(
     }
 
     /**
-     * 关闭监督角色：停音频、撤销租约，但**不恢复麦克风**。
-     * 模块停用必须先显式终止或交还（由调用方在关闭前完成），不能静默开麦。
+     * 启动恢复失败时由运行时调用：阻止新的 AI 会话，保留隔离，等待人工处理。
+     */
+    fun block(reason: String) {
+        synchronized(stateMonitor) {
+            blockedReason = reason
+            phase = SupervisorPhase.BLOCKED
+        }
+        persist()
+    }
+
+    /**
+     * 有序关闭（挂起）：停音频、撤销租约，但**不恢复麦克风**。
+     * 模块停用必须先显式终止或交还，不能静默开麦。
+     */
+    suspend fun shutdown() = transitions.withLock {
+        val id = synchronized(stateMonitor) { ownedSession }
+        if (id != null) {
+            audio.stopKeepingIsolation()
+            leases.revoke(id)
+        }
+        markClosed()
+    }
+
+    /**
+     * 关闭监督角色。**不执行 runBlocking**（M8）：在受限期协程线程上阻塞等待挂起音频操作
+     * 可能死锁。调用方应先调用 [shutdown] 停音频；本方法只收束内存状态并撤销租约，
+     * 绝不恢复麦克风。
      */
     override fun close() {
-        runBlocking {
-            val id = synchronized(lock) { ownedSession }
-            if (id != null) {
-                audio.stopKeepingIsolation()
-                leases.revoke(id)
-            }
+        val id = synchronized(stateMonitor) { ownedSession }
+        if (id != null) {
+            leases.revoke(id)
         }
-        synchronized(lock) {
+        markClosed()
+    }
+
+    private fun markClosed() {
+        synchronized(stateMonitor) {
             ownedSession = null
             handoffDeadlineMs = null
             phase = SupervisorPhase.ENDED
             started = false
         }
+        persist()
+    }
+
+    private fun persist() {
+        val state = synchronized(stateMonitor) {
+            SupervisionPersistedState(
+                phase = phase,
+                ownedSession = ownedSession,
+                microphoneIsolated = audio.microphoneIsolated,
+                blockedReason = blockedReason,
+                lastFault = lastFault,
+                updatedAtMs = clock.nowMs(),
+            )
+        }
+        try {
+            stateSink(state)
+        } catch (t: Throwable) {
+            // 状态写不进去就不能保证重启后 fail closed：阻止新会话。
+            synchronized(stateMonitor) {
+                if (blockedReason == null) {
+                    blockedReason = BLOCKER_STATE_WRITE_FAILED
+                    phase = SupervisorPhase.BLOCKED
+                }
+            }
+        }
+    }
+
+    companion object {
+        /** 每个心跳角色最多记住多少个会话（有界，防止伪造会话撑爆内存）。 */
+        const val MAX_PRESENCE_SESSIONS: Int = 8
+
+        private val HEARTBEAT_ROLES = listOf(PeerRole.APP, PeerRole.HOOK)
+
+        /** 这些阶段拥有通话且预期隔离；每轮都会读回系统隔离状态。 */
+        private val AUDIO_OWNER_PHASES = setOf(
+            SupervisorPhase.ARMED,
+            SupervisorPhase.ANSWER_PENDING,
+            SupervisorPhase.ACTIVE,
+            SupervisorPhase.HANDOFF_PENDING,
+        )
+
+        const val BLOCKER_ISOLATION_UNAVAILABLE: String = "microphone_isolation_unavailable"
+        const val BLOCKER_ISOLATION_LOST: String = "microphone_isolation_lost"
+        const val BLOCKER_RESTORE_FAILED: String = "microphone_restore_failed"
+        const val BLOCKER_PRIVILEGED_TERMINATION: String = "privileged_termination_unsupported"
+        const val BLOCKER_TERMINATION_UNCONFIRMED: String = "termination_unconfirmed"
+        const val BLOCKER_STATE_WRITE_FAILED: String = "supervision_state_write_failed"
     }
 }
