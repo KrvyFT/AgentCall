@@ -22,6 +22,7 @@
 | `/data/adb/agentcall/config.json` | 公开配置 + 密钥 + schema + revision | 0600 |
 | `/data/adb/agentcall/pairing.json` | 配对记录（包名/UID/签名摘要/版本） | 0600 |
 | `/data/adb/agentcall/config.schema-<n>.json.bak` | 迁移前旧 schema 备份 | 0600 |
+| `/data/adb/agentcall/supervisor-state.json` | 监督端持久状态（schema 3，见 §8） | 0600 |
 | `/data/adb/agentcall/inbox` | WebUI 写入的 `config-set` 一次性负载 | 0700（WebUI 创建时显式 ownerOnly rwx，不依赖 umask；`customize.sh` 预创建） |
 | `/data/adb/agentcall/inbox/config-set.<token>-<seq>.json` | 单次写入负载（每次保存唯一文件名）；正常路径读写后立即删除 | 写入后收紧为 0000 |
 | `/data/adb/agentcall/logs/service.log` | 服务日志（有大小上限） | 0700 目录，服务自身轮转 |
@@ -113,12 +114,18 @@ inbox 中的一次性明文负载只在一次保存期间存在：正常路径�
 
 - `config` 含 `revision`，不含 `secrets`。
 - `secrets` 的值为 `CONFIGURED` 或 `MISSING`，没有原值、没有长度、没有前缀。
-- `status` 负载（17 个键，11E 起含 `shutdownCode`）：`bridgeVersion`、`protocolVersion`、
-  `revision`、`enabled`、`paired`、`uptimeMs`、`processId`、`activeConnections`、
-  `rejectedConnections`、`supervisionPhase`、`supervisionOwned`、`microphoneIsolated`、
-  `supervisionBlocked`、`supervisionLastFault`、`shutdownCode`、`hookConnected`、
-  `dialerDefaultRole`。`shutdownCode` 是最近一次优雅关闭的机器码；未关闭或干净关闭为
-  JSON `null`。
+- `status` 负载（**18 个顶层键**：17 个标量/布尔 + 1 个 `calibration` 对象）：
+  `bridgeVersion`、`protocolVersion`、`revision`、`enabled`、`paired`、`uptimeMs`、
+  `processId`、`activeConnections`、`rejectedConnections`、`supervisionPhase`、
+  `supervisionOwned`、`microphoneIsolated`、`supervisionBlocked`、`supervisionLastFault`、
+  `shutdownCode`、`hookConnected`、`dialerDefaultRole`、`calibration`。
+  `shutdownCode` 是最近一次优雅关闭的机器码；未关闭或干净关闭为 JSON `null`。
+- `calibration`：与 `calibration.read` 完全相同的只读校准视图（`available`、
+  `supportedApiLevel`、`environment`、`effectiveEnvironment`、`environmentComplete`、
+  `verified`、`blockers`、`environmentMatchesEvidence`、`evidenceEnvironment`、
+  `operatorAttestation`、`steps`、`calibratedAtMs`）；存储未接线时为
+  `{"available":false}`，读取失败时附 `error` 机器码。APP/HOOK 只读，写入只经
+  `calibrate`（§8）。
 - `processId`：桥接进程每次启动生成的随机字符串，是判断“桥接是否重启过”的唯一信标。
   缺失、非字符串、含空白/控制字符或超长时，调用方必须按“代次未知”处理，不得当成同一进程；
   `uptimeMs` 只作展示，不能替代它。
@@ -135,7 +142,8 @@ inbox 中的一次性明文负载只在一次保存期间存在：正常路径�
 - `diagnose` 负载：`environment`（apiLevel/romFingerprint/kernelVersion/
   dialerPackageVersion/frameworkVersion/bridgeVersion/audioPolicyDigest/simCarrier/
   transport/route）、`downlinkExtraction`、`uplinkInjection`、`microphoneIsolation`、
-  `privilegedTermination`、`checkedAtMs`、`notes`（已脱敏）。
+  `privilegedTermination`、`checkedAtMs`、`notes`（已脱敏），以及**与 status 相同的
+  `calibration` 对象**（同一份只读校准视图）。
 
 ---
 
@@ -305,7 +313,7 @@ inbox 中的一次性明文负载只在一次保存期间存在：正常路径�
 | `status` | 无 | 不用 | status JSON（见 §3） | 0 | CLI_ROOT |
 | `config-get` | 无 | 不用 | `{config, secrets}` 脱敏视图 | 0 | CLI_ROOT |
 | `config-set` | 无 | 必须：`{expectedRevision, patch}` JSON，≤64512 字节 | 写入后的 `{config, secrets}`（revision+1） | 0 | CLI_ROOT |
-| `calibrate` | 无（argv 负载一律拒绝） | 必须：`{steps:{...五项布尔}, expectedEnvironment?}` JSON | 校准记录结果 `{recorded, environment, steps, verified, blockers, calibratedAtMs}` | 0 | CLI_ROOT |
+| `calibrate` | 无（argv 负载一律拒绝） | 必须：`{steps:{...五项布尔}, expectedEnvironment?, operatorAttestation?}` JSON | 校准记录结果 `{recorded, environment, operatorAttestation, steps, verified, blockers, calibratedAtMs}` | 0 | CLI_ROOT |
 | `pair` | 可选一个包名（默认 `org.krvyft.agentcall`） | 不用 | 配对成功负载 | 0 | 仅 root |
 | `diagnose` | 无 | 不用 | 能力/环境报告 | 0 | CLI_ROOT |
 | `shutdown` | 无 | 不用 | `{"stopping":true,"clean":<bool>,"shutdownCode":<string|null>,"supervision":{"clean":<bool>,"ownedSession":<bool>,"termination":<string|null>,"ownershipResolved":<bool>,"disconnected":<bool>,"microphoneIsolated":<bool>,"code":<string|null>}}` | 0 | CLI_ROOT |
@@ -339,7 +347,7 @@ WebUI 的实际命令行（完整字符串，无用户数据）：
 WebUI 使用上述七条固定操作；`calibrate` 只作为 root 操作员命令提供（见下方校准通道），
 WebUI 不调用它。
 
-- 没有任意 RPC、没有任意 shell、没有把用户输入拼进命令。
+- 没有任意 RPC（控制 socket 只接受固定方法表）、没有任意 shell、没有把用户输入拼进命令。
 - 模块目录必须匹配 `^/data/adb/modules/[A-Za-z][A-Za-z0-9._-]+$`；无法确认时拒绝执行。
 - 旧管理器没有 `moduleInfo()` 时回退到固定路径 `/data/adb/modules/agentcall`，
   不拼接任何外部输入。
@@ -377,7 +385,7 @@ WebUI 不调用它。
 `shutdownCode=null`。拥有中的通话只有在终止/交还并确认断开、且恢复读回为未隔离时才得到
 `null`。
 
-11E 起 **没有拥有中的通话时也会处理观测到的隔离**：恢复成功才是 `clean=true`；仍隔离
+11E 起（最终 HEAD 保持）**没有拥有中的通话时也会处理观测到的隔离**：恢复成功才是 `clean=true`；仍隔离
 返回 `clean=false` + `shutdown_microphone_still_isolated`（不再出现“`clean=true` 但
 `microphoneIsolated=true`”的矛盾形状）。调用方仍应同时检查
 `mic = supervision.microphoneIsolated`，不能只看 `clean`（旧版 bridge 可能仍有该形状）。
@@ -390,6 +398,14 @@ WebUI 不调用它。
 `IDLE`/`ENDED`（或进程/socket 已退出）才宣称“已确认干净关闭”；否则打印机器可读警告。
 `service.sh` 在关闭响应之外，只要桥接在退出等待后仍存活就再做一次最终 `status` 探测；
 隔离仍为 true 时打印 `! microphone_still_isolated ...` 与 `bridge_stop_unclean`。
+
+**监督端持久状态（schema 3）**：`/data/adb/agentcall/supervisor-state.json` 以 `schema: 3`
+原子落盘（同目录临时文件 + fsync + rename），字段含 `phase`、`ownedSession`、
+`microphoneIsolated`、`blockedReason`、`lastFault`、`updatedAtMs`、`bootId`、
+`ownedCallMayBeLive` 与 `shutdownCode`。schema 2 增加粘性所有权标记
+`ownedCallMayBeLive`；**schema 3 增加 `shutdownCode`**，使最近一次关闭机器码跨重启仍可读。
+损坏或更高 schema 一律 fail closed（`supervision_state_corrupt` /
+`supervision_state_schema_unsupported`），绝不把旧状态当成干净启动。
 
 **停止顺序（模块侧硬契约）**：`service.sh` 的停止/退出路径与 `uninstall.sh` 都先取
 `/data/adb/agentcall/stop.lock`（`flock`，最多等待 40 s；无 flock 时退回 `mkdir` 原子目录锁），

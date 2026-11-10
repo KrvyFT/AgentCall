@@ -1,10 +1,11 @@
 # AgentCall 安装、配置与回退
 
 本文描述 AgentCall 的安装范围、配对、配置、校准、升级与卸载。**所有真机步骤均为「未验证」**：
-交付时 `adb devices` 为空，本仓库没有真机 Google 电话、KernelSU WebView 或音频证据。
-最近一次本地矩阵（HEAD `2d924f4`，11E 已合入）通过：JVM 单测 806
-（core 126 / bridge 343 / app 337）、lint 0 error；release APK 与模块 ZIP 仍是 11E 之前的
-产物，需重新打包并替换哈希。标注「未验证」的条目仍不能当作已可用。
+交付时 `adb devices` 为空，本仓库没有真机 Google 电话、KernelSU WebView 或音频证据；
+用户也明确禁止设备侧验证。最终本地矩阵（HEAD `5638995`）通过：JVM 单测 **815**
+（core 126 / bridge 345 / app 344，0 failures / 0 errors / 0 skipped）、lint 0 errors /
+15 warnings；release APK 与模块 ZIP 已在该 HEAD 上重新打包（大小与 SHA-256 见第 1 节）。
+标注「未验证」的条目仍不能当作已可用。
 
 ## 1. 产物与前提
 
@@ -16,12 +17,14 @@
 | `dist/agentcall-<version>.apk` | AgentCall APK（Xposed 模块 + 远程语音回合） |
 | `dist/SHA256SUMS` | 两个产物的 SHA-256 |
 
-最近一次打包（代码 HEAD `0073cfe`；11E 的 bridge 改动尚未重新打包，最终以 11E 重跑后的
-`dist/SHA256SUMS` 为准）：`agentcall-1.0.zip` 1,389,833 B，SHA-256
-`01f5a22da46b27f0d60de5f17b2076add74ee5ffc46b6e7fb079d885312e8be7`；
+最终打包（代码 HEAD `5638995`，在最后的 hook/bridge 修复之后重新构建；以
+`dist/SHA256SUMS` 为准）：`agentcall-1.0.zip` 1,400,028 B（11 个条目），SHA-256
+`7e285e63b35fd9563fafffc3282dd8ace8141810cee27f3f2459e3e80b7195ef`；
 `agentcall-1.0.apk` 2,266,580 B，SHA-256
-`f5ac5b3ed55b9d092e188c10c549f56b9f3d68829a1e3d307019f5a8f66b94a6`。
-以 `dist/SHA256SUMS` 为准。
+`37ccd66c890aea749c885927a03faeb892a7c73a9a247afc48d3d2442ca52a65`。
+`python3 tools/check_package.py --dist dist` 输出 `Status: PASS`：appId
+`org.krvyft.agentcall`、版本 1.0 (1)、`module.prop` 1.0 (1)、dex `classes.dex`、
+结构 module=1/scripts=3/bridge=2/bin=1/webroot=4。
 
 版本单一来源是 APK 的 `versionName/versionCode`；ZIP 内 `module.prop` 由它渲染，不一致时打包直接失败。
 桥接容器也读同一来源：`:bridge` 在构建时从 `:app` 的 `defaultConfig` 生成 `BuildConfig.VERSION_NAME`
@@ -246,7 +249,9 @@ su -c 'rm -f /data/adb/agentcall/inbox/calibration.json'
   effective environment）的任一字段未知时返回 `calibration_environment_unknown`，与预期
   不一致时返回 `calibration_environment_mismatch`，两者都整体拒绝、绝不假装已验证。
 - 校准存储未接线时返回 `calibration_unavailable`。
-- 11E 已在 HEAD `2d924f4` 合入；字段名与词表以该提交与 `docs/config-schema.md` 为准。
+- 字段名、词表与最终语义以 HEAD `5638995` 与 `docs/config-schema.md` 为准。
+- 校准/身份两道闸门都还没有设备证据：自动接听仍保持关闭（`calibration_not_verified`），
+  `UnverifiedCallIdentityVerifier` 也仍 `blocksAutoAnswer=true`。
 
 root 侧可查看能力/环境报告：
 
@@ -320,7 +325,7 @@ AI 会话，等待人工处理。恢复路径：
    2. 取 `/data/adb/agentcall/stop.lock`（flock，最多等 40 s）与 `service.sh` 串行化；
       拿不到锁时打印 `stop_lock_timeout` 并跳过重复的关闭请求，避免两个 CLI shutdown
       在恢复窗口内互相踩踏；
-   3. 固定 CLI `shutdown`（最多等 25 s；11E 的 CLI socket 超时是 20 s），再等桥接
+   3. 固定 CLI `shutdown`（最多等 25 s；CLI 的 shutdown-only socket 超时是 20 s），再等桥接
       进程/socket 消失（最多 10 s）；桥接在响应前终止/交还拥有的通话并读回恢复麦克风
       ——此时音频工作进程仍然存活；
    4. 读回 shutdown 响应（`clean`/`shutdownCode`/`supervision.microphoneIsolated`），
@@ -369,8 +374,9 @@ AI 会话，等待人工处理。恢复路径：
 | 步骤 | 状态 |
 | --- | --- |
 | 模块 ZIP 结构、DEX 入口、版本、SHA-256、密钥泄漏检查 | 本地已验证（`make package-check`） |
-| 最近一次矩阵（HEAD `2d924f4`，11E 已合入） | 本地 PASS：JVM 806（core 126 / bridge 343 / app 337）、lint 0 errors；11E 之后还需重新打包 APK/ZIP 并替换哈希 |
-| JVM/JS/Python/脚本检查 | JVM 806（11E 最后重跑）；WebUI node 113（11F 新增停止锁/隔离/重启裁决用例）；Python 52；`sh -n` 4 个脚本。11F 未跑 Gradle |
+| 最终矩阵（HEAD `5638995`） | 本地 PASS：225 个 Gradle task；JVM 815（core 126 / bridge 345 / app 344，0 failures / 0 errors / 0 skipped）、lint 0 errors / 15 warnings；APK/ZIP 已在该 HEAD 重新打包（哈希见第 1 节） |
+| JVM/JS/Python/脚本检查 | JVM 815；WebUI node 113/113；Python 59/59；`sh -n` 模块脚本通过；`make test` / `make build` / `make package-check` 全 PASS |
+| release 收缩（R8） | 本地已验证：`packageScope = setOf("**")`，mapping 约 98,580 行，release APK 6.44 MB → 2.27 MB；**真机未验证** |
 | 配对（WebUI/root CLI）与 APK 校准/诊断界面 | 已实现；root CLI `calibrate` 经 `calibration.record` 写入五项人工证据，transport/route 需 root 操作员固定词表背书（真机环境探针与五项实测未验证，见第 7 节） |
 | 优雅关闭停止顺序（先取 stop.lock、shutdown、后停音频工作进程、再 TERM→KILL） | 本地宿主已验证（`shutdown-order.test.mjs`、`module-scripts.test.mjs` 进程/CLI 替身，含并发锁等待）；**真机未验证** |
 | 关闭裁决/隔离读回与未确认警告（service.sh + uninstall.sh） | 本地宿主已验证（shutdown 响应与最终 status 探测的隔离读回、`! microphone_still_isolated`）；**真机 KernelSU 卸载时序未验证** |
@@ -385,7 +391,7 @@ AI 会话，等待人工处理。恢复路径：
 | 双卡、VoWiFi、蓝牙 | **未验证**，未测组合不启用 |
 
 结论：安装步骤按设计写成，但**除本地构建/打包/结构检查与宿主测试替身外，没有真机证据**；
-交付时也没有设备连接。root CLI `calibrate` 已提供桥接校准写入通道（11E 的
+交付时也没有设备连接。root CLI `calibrate` 已提供桥接校准写入通道（最终 HEAD 的
 operatorAttestation 只补 transport/route），但真实环境探针、五项人工测试、优雅关闭的
 麦克风恢复读回与 KernelSU 卸载时序都未上机；真机自动接听在
 完成这些验证前仍不能被当作已启用（保持 fail-closed，`calibration_not_verified`）。
