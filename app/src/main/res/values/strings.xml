@@ -1,3 +1,89 @@
 <resources>
     <string name="app_name">AgentCall</string>
+
+    <!-- 通知 -->
+    <string name="notification_channel_session">AI 通话会话</string>
+    <string name="notification_channel_session_description">显示服务就绪状态与人工接管入口</string>
+    <string name="notification_service_title">AgentCall 服务</string>
+    <string name="notification_ready">就绪：允许按规则自动接听</string>
+    <string name="notification_not_ready">未就绪：不会自动接听，保留原响铃</string>
+    <string name="notification_blocked_pending">正在检测就绪条件…</string>
+    <string name="notification_call_title">AI 通话进行中</string>
+    <string name="notification_call_text">当前状态：%1$s</string>
+    <string name="notification_action_takeover">我来接听</string>
+
+    <!-- 主页/启动向导 -->
+    <string name="main_intro">启动向导：以下每一项都必须是真机事实，缺一项就不会自动接听。启动请求本身不代表服务可用。</string>
+    <string name="main_status_root_prefix">root 桥接：</string>
+    <string name="main_status_hook_prefix">Hook 心跳：</string>
+    <string name="main_status_service_prefix">前台服务：</string>
+    <string name="main_status_calibration_prefix">校准：</string>
+    <string name="main_status_config_prefix">配置：</string>
+    <string name="main_status_session_prefix">会话：</string>
+    <string name="main_button_start">启动服务</string>
+    <string name="main_button_stop">停止服务</string>
+    <string name="main_button_retry">重新检测就绪</string>
+    <string name="main_button_notification">授予通知权限</string>
+    <string name="main_button_calibration">校准与人工测试</string>
+    <string name="main_button_takeover">我来接听</string>
+    <string name="main_note_device">真机状态需在目标 ROM 上人工验证；本页只展示可读取到的真实事实，读不到时显示“未知”，不会伪造成功。</string>
+    <string name="main_note_blockers">未就绪原因：</string>
+    <string name="main_note_no_blockers">未就绪原因：尚未完成检测</string>
+    <string name="main_note_ready">已就绪：五项事实全部满足</string>
+    <string name="main_error_prefix">最近错误：</string>
+    <string name="main_bridge_reachable">可达，APP 已通过配对核验</string>
+    <string name="main_bridge_unreachable">不可达（bridge_unavailable）</string>
+    <string name="main_hook_unknown">未知（桥接未向 APP 开放 status）</string>
+    <string name="main_mode_unknown">未知</string>
+    <string name="main_service_running">运行中（specialUse 前台类型）</string>
+    <string name="main_service_not_running">未运行</string>
+    <string name="main_service_foreground_failed">前台类型不可用：%1$s</string>
+    <string name="main_service_ready">就绪</string>
+    <string name="main_service_not_ready">未就绪</string>
+    <string name="main_calibration_verified">已验证（本机记录）</string>
+    <string name="main_calibration_unverified">未验证</string>
+    <string name="main_calibration_environment_missing">环境未知，不能判定已验证</string>
+    <string name="main_config_disabled">总开关关闭</string>
+    <string name="main_config_enabled">总开关开启</string>
+    <string name="main_config_invalid">校验未通过</string>
+    <string name="main_config_endpoints_missing">三项语音端点不完整</string>
+    <string name="main_config_endpoints_ready">三项语音端点齐备（HTTPS）</string>
+    <string name="main_config_unavailable">不可读取（bridge_unavailable）</string>
+    <string name="main_toast_service_started">已请求启动前台服务</string>
+    <string name="main_toast_no_active_call">当前没有进行中的 AI 通话</string>
+    <string name="main_toast_notification_requested">请允许通知权限以便显示接管入口</string>
+
+    <!-- 校准页 -->
+    <string name="calibration_title">校准与人工测试</string>
+    <string name="calibration_intro">五个步骤必须在真机上人工完成，并且绑定完整环境；方法可见、对象创建成功都不算验证。</string>
+    <string name="calibration_environment_prefix">环境：</string>
+    <string name="calibration_environment_available">可用（API %1$d）</string>
+    <string name="calibration_environment_unavailable">不可用：%1$s</string>
+    <string name="calibration_environment_unknown">不可用（桥接未向 APP 开放 diagnose）</string>
+    <string name="calibration_state_prefix">本机记录：</string>
+    <string name="calibration_state_verified">已验证</string>
+    <string name="calibration_state_unverified">未验证</string>
+    <string name="calibration_step_downlink">1. 本机识别到通话下行音频（不是环境麦克风）</string>
+    <string name="calibration_step_peer_heard">2. 对端听到测试语音（TTS 上行注入可用）</string>
+    <string name="calibration_step_mic_isolated">3. 本机麦克风隔离生效</string>
+    <string name="calibration_step_manual_restore">4. 人工恢复（解除隔离并交还人工）可用</string>
+    <string name="calibration_step_process_failure">5. 进程故障注入后仍能终止或保持隔离</string>
+    <string name="calibration_note">本页只保存“用户确认过”的测试进度，不保存号码、密钥或音频。是否允许自动接听由 root 桥接自己的校准证据决定；本 APK 不能写入桥接校准，因此这里的勾选不会单独解锁自动接听。</string>
+    <string name="calibration_environment_missing_note">当前取不到完整的设备环境（桥接未向 APP 开放 diagnose），因此五步全部勾选也不能标记为已验证。</string>
+    <string name="calibration_button_refresh">重新检测环境</string>
+    <string name="calibration_button_reset">清除本机记录</string>
+    <string name="calibration_toast_reset">已清除本机校准记录</string>
+
+    <!-- 接管页 -->
+    <string name="takeover_title">人工接管</string>
+    <string name="takeover_intro">接管会先与 root 监督端串行撤销 AI 所有权；只有撤销确认后才恢复人工声音，撤销失败不会显示成功。</string>
+    <string name="takeover_session_prefix">会话：</string>
+    <string name="takeover_state_prefix">状态：</string>
+    <string name="takeover_outcome_prefix">结果：</string>
+    <string name="takeover_outcome_none">尚未提交接管</string>
+    <string name="takeover_outcome_failed">接管未完成：%1$s</string>
+    <string name="takeover_button_confirm">我来接听</string>
+    <string name="takeover_button_close">关闭</string>
+    <string name="takeover_missing_session">缺少会话标识，无法接管</string>
+    <string name="takeover_service_not_running">服务未运行，请先在主页启动服务</string>
 </resources>

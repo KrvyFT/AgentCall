@@ -1,13 +1,23 @@
-<?xml version="1.0" encoding="utf-8"?><!--
-   Sample backup rules file; uncomment and customize as necessary.
-   See https://developer.android.com/guide/topics/data/autobackup
-   for details.
-   Note: This file is ignored for devices older than API 31
-   See https://developer.android.com/about/versions/12/backup-restore
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  AgentCall 备份策略（spec §11）：allowBackup=false 已在 manifest 关闭备份。
+  本文件是纵深防御：即使设备/工具链忽略了 allowBackup，也不让密钥、诊断与临时音频进入备份。
+  这里没有任何 <include>，被排除的对象只会更少、不会更多。
 -->
 <full-backup-content>
-    <!--
-   <include domain="sharedpref" path="."/>
-   <exclude domain="sharedpref" path="device.xml"/>
--->
+    <!-- 校准本机进度与（未来）诊断/会话偏好：不含密钥，但仍不备份。 -->
+    <exclude domain="sharedpref" path="agentcall_calibration.xml" />
+    <exclude domain="sharedpref" path="agentcall_diagnostics.xml" />
+    <exclude domain="sharedpref" path="agentcall_session.xml" />
+
+    <!-- 诊断日志与临时音频：一律不进入备份。 -->
+    <exclude domain="file" path="diagnostics/" />
+    <exclude domain="file" path="audio/" />
+    <exclude domain="file" path="tmp/" />
+    <exclude domain="root" path="diagnostics/" />
+    <exclude domain="database" path="agentcall_diagnostics.db" />
+    <exclude domain="database" path="agentcall-diagnostics.db" />
+
+    <!-- 外部存储不承载任何 AgentCall 数据。 -->
+    <exclude domain="external" path="." />
 </full-backup-content>

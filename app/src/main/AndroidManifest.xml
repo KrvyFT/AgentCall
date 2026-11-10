@@ -2,15 +2,66 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
+    <!--
+      只声明实际使用的权限：
+      - INTERNET/ACCESS_NETWORK_STATE：远程 ASR/LLM/TTS 与网络可达性判定；
+      - POST_NOTIFICATIONS：会话/接管通知（拒绝时服务仍可运行，但不显示通知）；
+      - FOREGROUND_SERVICE + FOREGROUND_SERVICE_SPECIAL_USE：本应用不是默认拨号器，
+        不能使用 phoneCall 类型（spec §11）；specialUse 是唯一不要求电话角色的真实类型。
+    -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="@xml/backup_rules"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
-        android:theme="@style/Theme.AgentCall">
+        android:theme="@style/Theme.AgentCall"
+        android:usesCleartextTraffic="false"
+        tools:targetApi="37">
+
+        <!-- 唯一 exported 组件：Launcher Activity。其余组件一律不导出。 -->
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".ui.CalibrationActivity"
+            android:exported="false"
+            android:label="@string/calibration_title"
+            android:parentActivityName=".ui.MainActivity" />
+
+        <activity
+            android:name=".ui.TakeoverActivity"
+            android:exported="false"
+            android:label="@string/takeover_title"
+            android:parentActivityName=".ui.MainActivity" />
+
+        <!--
+          specialUse 前台服务：manifest 必须同时声明类型、权限与 subtype property。
+          服务在系统拒绝该类型时立即停止并报告 NOT_READY，不会降级成无类型常驻服务。
+        -->
+        <service
+            android:name=".service.AgentCallService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Standalone call assistant: keeps a local readiness handshake and session notification for the user while the system dialer keeps the actual call UI." />
+        </service>
 
         <!-- 传统 Xposed 模块声明：由用户安装的 LSPosed/Vector 读取，框架本体不随 APK 打包。 -->
         <meta-data

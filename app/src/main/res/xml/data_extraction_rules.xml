@@ -1,19 +1,31 @@
-<?xml version="1.0" encoding="utf-8"?><!--
-   Sample data extraction rules file; uncomment and customize as necessary.
-   See https://developer.android.com/about/versions/12/backup-restore#xml-changes
-   for details.
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android 12+ 备份/设备迁移规则（manifest 已设 allowBackup=false）。
+  与 backup_rules.xml 保持一致：密钥、诊断与临时音频都不参与云备份或设备迁移。
 -->
 <data-extraction-rules>
     <cloud-backup>
-        <!-- TODO: Use <include> and <exclude> to control what is backed up.
-        <include .../>
-        <exclude .../>
-        -->
+        <exclude domain="sharedpref" path="agentcall_calibration.xml" />
+        <exclude domain="sharedpref" path="agentcall_diagnostics.xml" />
+        <exclude domain="sharedpref" path="agentcall_session.xml" />
+        <exclude domain="file" path="diagnostics/" />
+        <exclude domain="file" path="audio/" />
+        <exclude domain="file" path="tmp/" />
+        <exclude domain="root" path="diagnostics/" />
+        <exclude domain="database" path="agentcall_diagnostics.db" />
+        <exclude domain="database" path="agentcall-diagnostics.db" />
+        <exclude domain="external" path="." />
     </cloud-backup>
-    <!--
     <device-transfer>
-        <include .../>
-        <exclude .../>
+        <exclude domain="sharedpref" path="agentcall_calibration.xml" />
+        <exclude domain="sharedpref" path="agentcall_diagnostics.xml" />
+        <exclude domain="sharedpref" path="agentcall_session.xml" />
+        <exclude domain="file" path="diagnostics/" />
+        <exclude domain="file" path="audio/" />
+        <exclude domain="file" path="tmp/" />
+        <exclude domain="root" path="diagnostics/" />
+        <exclude domain="database" path="agentcall_diagnostics.db" />
+        <exclude domain="database" path="agentcall-diagnostics.db" />
+        <exclude domain="external" path="." />
     </device-transfer>
-    -->
 </data-extraction-rules>
