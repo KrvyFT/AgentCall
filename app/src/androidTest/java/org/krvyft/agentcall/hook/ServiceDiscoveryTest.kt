@@ -6,17 +6,17 @@ import android.telecom.InCallService
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 
 /**
- * 仪器测试：证明动态发现找到的是真实覆写方法（而不是只 Hook 基类空实现），
- * 父子类链与重复注册被去重，并且 Hook 回调抛异常不会吞掉原方法执行。
+ * 仪器测试：在真实 Android 运行时证明动态发现找到的是真实覆写方法（而不是只 Hook 基类
+ * 空实现），每个组件独立回退、父子类链与重复注册被去重、按包名过滤，并且生产 Hook 适配器
+ * 抛异常不会吞掉原方法执行。
  *
  * 本机无 Android 设备，文件只编译（:app:assembleDebugAndroidTest），未执行；
- * 结果按“未验证”记录，不作为设备结论。
+ * 结果按“未验证”记录，不作为设备结论。纯逻辑部分另有 JVM 测试 ServiceDiscoveryUnitTest。
  */
 @RunWith(AndroidJUnit4::class)
 class ServiceDiscoveryTest {
@@ -30,8 +30,25 @@ class ServiceDiscoveryTest {
 
         val added = methods.single { it.name == "onCallAdded" }
         assertEquals(FakeDialerService::class.java, added.declaringClass)
+        // 未覆写的公开回调回退到基类实现：音频路由回调也必须在 Hook 范围内。
         assertEquals(InCallService::class.java, methods.single { it.name == "onCallRemoved" }.declaringClass)
-        assertEquals(2, methods.size)
+        assertEquals(InCallService::class.java, methods.single { it.name == "onCallAudioStateChanged" }.declaringClass)
+        assertEquals(InCallService::class.java, methods.single { it.name == "onCallEndpointChanged" }.declaringClass)
+        assertEquals(4, methods.size)
+    }
+
+    @Test
+    fun perServiceFallbackAlsoCoversComponentsInheritingTheBaseCallback() {
+        val methods = ServiceDiscovery.resolve(
+            ServiceDiscoveryTest::class.java.classLoader!!,
+            listOf(serviceInfo(FakeDialerService::class.java), serviceInfo(InheritingDialerService::class.java)),
+        )
+
+        val added = methods.filter { it.name == "onCallAdded" }
+        // “有人覆写”不能成为跳过继承组件的理由。
+        assertEquals(2, added.size)
+        assertTrue(added.any { it.declaringClass == FakeDialerService::class.java })
+        assertTrue(added.any { it.declaringClass == InCallService::class.java })
     }
 
     @Test
@@ -52,30 +69,40 @@ class ServiceDiscoveryTest {
         assertEquals(1, added.size)
         assertEquals(ParentDialerService::class.java, added.single().declaringClass)
         assertEquals(1, methods.count { it.name == "onCallRemoved" })
-        assertEquals(2, methods.size)
+        assertEquals(4, methods.size)
+    }
+
+    @Test
+    fun componentsFromOtherPackagesAreIgnored() {
+        val foreign = ServiceInfo().apply {
+            name = FakeDialerService::class.java.name
+            packageName = "com.example.not.the.dialer"
+        }
+        val methods = ServiceDiscovery.resolve(
+            ServiceDiscoveryTest::class.java.classLoader!!,
+            listOf(foreign),
+        )
+        assertTrue(methods.isEmpty())
     }
 
     @Test
     fun throwingHookCallbackDoesNotPreventOriginalMethodRun() {
-        val loader = ServiceDiscoveryTest::class.java.classLoader!!
-        val method = ServiceDiscovery.resolve(loader, listOf(serviceInfo(FakeDialerService::class.java)))
-            .single { it.name == "onCallAdded" }
+        // 用生产适配器（不是“guard 之后直接反射调用原方法”的同义反复）证明：
+        // 我们的回调抛异常既不会传播，也不会阻止框架继续执行原方法。
         val service = FakeDialerService()
-        val logs = mutableListOf<String>()
+        val adapter = HookCallbackAdapter(
+            onCallback = { _, _, _ -> throw IllegalStateException("deliberate hook failure") },
+        )
 
-        val hookSucceeded = HookSafety.guard("simulated-xposed-callback", logs::add) {
-            throw IllegalStateException("deliberate hook failure")
-        }
+        assertFalse(adapter.before("onCallAdded", service, arrayOfNulls(1)))
+        service.onCallAdded(null)
 
-        assertFalse(hookSucceeded)
-        assertEquals(1, logs.size)
-        assertNotNull(method.invoke(service, null as Call?))
         assertEquals(1, service.onCallAddedCount)
     }
 
     private fun serviceInfo(type: Class<*>): ServiceInfo = ServiceInfo().apply {
         name = type.name
-        packageName = "com.google.android.dialer"
+        packageName = ServiceDiscovery.DIALER_PACKAGE
     }
 }
 
@@ -87,6 +114,9 @@ class FakeDialerService : InCallService() {
         onCallAddedCount += 1
     }
 }
+
+/** 完全不覆写任何回调的组件：必须按组件回退到基类实现。 */
+class InheritingDialerService : InCallService()
 
 open class ParentDialerService : InCallService() {
     override fun onCallAdded(call: Call?) {

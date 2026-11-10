@@ -8,7 +8,9 @@ import org.krvyft.agentcall.core.model.CallCommand
 import org.krvyft.agentcall.core.model.CallDirection
 import org.krvyft.agentcall.core.model.CallSnapshot
 import org.krvyft.agentcall.core.model.CallState
+import org.krvyft.agentcall.core.model.CommandResult
 import org.krvyft.agentcall.core.model.Presentation
+import org.krvyft.agentcall.core.model.RejectReason
 import org.krvyft.agentcall.core.model.SessionId
 import org.krvyft.agentcall.core.protocol.RolePolicy
 
@@ -76,6 +78,87 @@ class HookWireFormatTest {
 
         assertTrue(parsed.commands.isEmpty())
         assertEquals(1, parsed.invalidLines)
+    }
+
+    @Test
+    fun callCommandResultIsAllowedOutboundWithoutOpeningConfigMethods() {
+        assertTrue(HookWireFormat.isAllowedOutboundMethod(RolePolicy.METHOD_CALL_COMMAND_RESULT))
+        assertFalse(HookWireFormat.isAllowedOutboundMethod(RolePolicy.METHOD_CONFIG_READ))
+        assertFalse(HookWireFormat.isAllowedOutboundMethod(RolePolicy.METHOD_CONFIG_SECRET_READ))
+    }
+
+    @Test
+    fun snapshotPayloadCarriesActionSourceAndHandbackReason() {
+        val snapshot = CallSnapshot(
+            id = SessionId(processEpoch = "epoch-1", callId = "call-1"),
+            number = "+8613800000000",
+            state = CallState.ACTIVE,
+            direction = CallDirection.INCOMING,
+            presentation = Presentation.ALLOWED,
+            phoneAccount = "SIM1",
+            isEmergency = false,
+            isConference = false,
+            activeCallCount = 1,
+        )
+
+        val handedBack = HookWireFormat.encodeSnapshot(snapshot, ActionSource.UNKNOWN, "route_change")
+        assertTrue(handedBack.contains("\"source\":\"UNKNOWN\""))
+        assertTrue(handedBack.contains("\"handbackReason\":\"route_change\""))
+        assertFalse(handedBack.contains("\n"))
+
+        val moduleAction = HookWireFormat.encodeSnapshot(snapshot, ActionSource.MODULE)
+        assertTrue(moduleAction.contains("\"source\":\"MODULE\""))
+        assertTrue(moduleAction.contains("\"handbackReason\":null"))
+    }
+
+    @Test
+    fun commandResultPayloadCarriesOutcomeSourceAndReason() {
+        val session = SessionId(processEpoch = "epoch-1", callId = "call-1")
+
+        val rejected = HookWireFormat.encodeCommandResult(
+            session = session,
+            command = CallCommand.Answer,
+            source = ActionSource.MODULE,
+            result = CommandResult.Rejected(RejectReason.NOT_OWNED),
+            note = "not_owned",
+        )
+        assertTrue(rejected.contains("\"processEpoch\":\"epoch-1\""))
+        assertTrue(rejected.contains("\"callId\":\"call-1\""))
+        assertTrue(rejected.contains("\"command\":\"Answer\""))
+        assertTrue(rejected.contains("\"source\":\"MODULE\""))
+        assertTrue(rejected.contains("\"outcome\":\"rejected\""))
+        assertTrue(rejected.contains("\"reason\":\"NOT_OWNED\""))
+        assertTrue(rejected.contains("\"code\":null"))
+        assertFalse(rejected.contains("\n"))
+
+        val failed = HookWireFormat.encodeCommandResult(
+            session = session,
+            command = CallCommand.Hangup,
+            source = ActionSource.UNKNOWN,
+            result = CommandResult.Failed("disconnect_failed", "SECURITY"),
+        )
+        assertTrue(failed.contains("\"command\":\"Hangup\""))
+        assertTrue(failed.contains("\"outcome\":\"failed\""))
+        assertTrue(failed.contains("\"reason\":null"))
+        assertTrue(failed.contains("\"code\":\"disconnect_failed\""))
+        assertTrue(failed.contains("\"message\":\"SECURITY\""))
+
+        val accepted = HookWireFormat.encodeCommandResult(
+            session = session,
+            command = CallCommand.Answer,
+            source = ActionSource.MODULE,
+            result = CommandResult.Accepted,
+        )
+        assertTrue(accepted.contains("\"outcome\":\"accepted\""))
+        assertTrue(accepted.contains("\"reason\":null"))
+    }
+
+    @Test
+    fun onlyRootServerUidIsTrustedOnTheAbstractSocket() {
+        assertTrue(HookServerTrust.isTrustedUid(0))
+        assertFalse(HookServerTrust.isTrustedUid(1000))
+        assertFalse(HookServerTrust.isTrustedUid(10123))
+        assertFalse(HookServerTrust.isTrustedUid(null))
     }
 
     @Test

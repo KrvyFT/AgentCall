@@ -9,6 +9,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import org.krvyft.agentcall.core.model.CallCommand
 import org.krvyft.agentcall.core.model.CallSnapshot
+import org.krvyft.agentcall.core.model.CommandResult
 import org.krvyft.agentcall.core.model.RpcRequest
 import org.krvyft.agentcall.core.model.RpcResponse
 import org.krvyft.agentcall.core.model.SessionId
@@ -19,15 +20,21 @@ import org.krvyft.agentcall.core.protocol.RpcProtocolException
 /**
  * HOOK 角色的本地桥接客户端（spec §6.4）。
  *
- * 只做四件事：
- * 1. 把注册表的快照转发给特权运行容器（`hook.snapshot`）；
- * 2. 按固定间隔发送 `hook.heartbeat`；
- * 3. 从响应负载里接受**受限通话命令**（answer/hangup），交给注册表再次裁决；
- * 4. 有界队列 + 失败计数，任何回调路径都不阻塞电话 UI。
+ * 只做五件事：
+ * 1. 把注册表的快照（附动作来源/交还原因）转发给特权运行容器（`hook.snapshot`）；
+ * 2. 把每条命令的实际结果回报给特权运行容器（`call.command.result`），
+ *    这样 Task 7 的 CallControl.send 才能拿到真实的 [CommandResult]；
+ * 3. 按固定间隔发送 `hook.heartbeat`；
+ * 4. 从响应负载里接受**受限通话命令**（answer/hangup），交给注册表再次裁决；
+ * 5. 有界队列 + 失败计数，任何回调路径都不阻塞电话 UI。
  *
  * 明确不做：不读取配置/API Key（固定出站方法表里没有 config.*）、不做 ASR/TTS、
  * 不发网络请求、不碰音频、不在 Xposed 回调里建立 socket。连接失败只计数并在下一次
  * 心跳/快照时重试，不抛异常到 Telecom 线程。
+ *
+ * 信任方向（spec §6.4）：bridge 核验 hook 的内核凭据，hook 也必须核验服务端。
+ * 连接后先读 `LocalSocket.getPeerCredentials()`，只有 uid 0（root 运行容器）才发送
+ * 请求；任何应用都能抢先绑定 abstract 名字，因此这一步不能省略。
  *
  * 协议说明：Task 3 的 [org.krvyft.agentcall.bridge.ipc.ControlServer] 是“一请求一响应”，
  * 服务端不会主动推送。因此命令随 `hook.snapshot`/`hook.heartbeat` 的响应负载下发，
@@ -56,7 +63,13 @@ class HookTransport(
     }
 
     private sealed interface Outbound {
-        data class Snapshot(val snapshot: CallSnapshot) : Outbound
+        data class Snapshot(
+            val snapshot: CallSnapshot,
+            val source: ActionSource,
+            val handbackReason: String?,
+        ) : Outbound
+
+        data class CommandResult(val attempt: CommandAttempt) : Outbound
     }
 
     private val queue = ArrayBlockingQueue<Outbound>(queueCapacity)
@@ -65,13 +78,14 @@ class HookTransport(
     private val droppedSnapshots = AtomicLong(0)
     private val transportFailures = AtomicLong(0)
     private val protocolViolations = AtomicLong(0)
+    private val untrustedServers = AtomicLong(0)
     private val rejectedCommands = AtomicLong(0)
     private val requestCounter = AtomicLong(0)
 
     @Volatile
     private var worker: Thread? = null
 
-    /** 因队列饱和被丢弃的快照数（有界失败，不阻塞调用方）。 */
+    /** 因队列饱和被丢弃的快照/结果数（有界失败，不阻塞调用方）。 */
     val droppedSnapshotCount: Long get() = droppedSnapshots.get()
 
     /** 连接/读写失败次数。 */
@@ -79,6 +93,9 @@ class HookTransport(
 
     /** 非法响应、非法命令负载、非白名单方法等协议违规次数。 */
     val protocolViolationCount: Long get() = protocolViolations.get()
+
+    /** 服务端内核凭据不是 root（可能被其它应用抢绑）而拒绝发送的次数。 */
+    val untrustedServerCount: Long get() = untrustedServers.get()
 
     /** 收到的、但会话不存在或格式非法的命令数。 */
     val rejectedCommandCount: Long get() = rejectedCommands.get()
@@ -102,10 +119,25 @@ class HookTransport(
 
     /**
      * 快照转发入口：只做非阻塞 offer。队列满时丢弃并计数，绝不阻塞 Xposed 回调。
+     *
+     * @param source 触发本次快照的动作来源，供控制器区分模块动作与人工/系统动作。
+     * @param handbackReason 非 null 表示这是一次交还给人工的通知（机器可读原因）。
      */
-    fun enqueueSnapshot(snapshot: CallSnapshot) {
+    fun enqueueSnapshot(
+        snapshot: CallSnapshot,
+        source: ActionSource = ActionSource.UNKNOWN,
+        handbackReason: String? = null,
+    ) {
         if (!running.get()) return
-        if (!queue.offer(Outbound.Snapshot(snapshot))) {
+        if (!queue.offer(Outbound.Snapshot(snapshot, source, handbackReason))) {
+            droppedSnapshots.incrementAndGet()
+        }
+    }
+
+    /** 命令结果转发入口：同样只做非阻塞 offer。 */
+    fun enqueueCommandResult(attempt: CommandAttempt) {
+        if (!running.get()) return
+        if (!queue.offer(Outbound.CommandResult(attempt))) {
             droppedSnapshots.incrementAndGet()
         }
     }
@@ -121,8 +153,10 @@ class HookTransport(
                 if (!running.get()) break
                 continue
             }
-            if (outbound is Outbound.Snapshot) {
-                sendSnapshot(outbound.snapshot)
+            when (outbound) {
+                is Outbound.Snapshot -> sendSnapshot(outbound)
+                is Outbound.CommandResult -> sendCommandResult(outbound.attempt)
+                null -> Unit
             }
 
             val now = clock()
@@ -146,12 +180,28 @@ class HookTransport(
         }
     }
 
-    private fun sendSnapshot(snapshot: CallSnapshot) {
+    private fun sendSnapshot(outbound: Outbound.Snapshot) {
         val response = request(
             method = RolePolicy.METHOD_HOOK_SNAPSHOT,
-            session = snapshot.id,
-            payload = HookWireFormat.encodeSnapshot(snapshot),
+            session = outbound.snapshot.id,
+            payload = HookWireFormat.encodeSnapshot(outbound.snapshot, outbound.source, outbound.handbackReason),
         )
+        acceptCommands(response)
+    }
+
+    private fun sendCommandResult(attempt: CommandAttempt) {
+        val response = request(
+            method = RolePolicy.METHOD_CALL_COMMAND_RESULT,
+            session = attempt.session,
+            payload = HookWireFormat.encodeCommandResult(
+                session = attempt.session,
+                command = attempt.command,
+                source = attempt.source,
+                result = attempt.result,
+                note = attempt.note,
+            ),
+        )
+        // 服务端可以在任意响应里捎带命令。
         acceptCommands(response)
     }
 
@@ -175,6 +225,11 @@ class HookTransport(
         val socket = LocalSocket()
         return try {
             socket.connect(LocalSocketAddress(socketName, LocalSocketAddress.Namespace.ABSTRACT))
+            // 先核验服务端，再发送任何快照/命令：abstract 名字可以被任意应用抢先绑定。
+            if (!HookServerTrust.isTrustedUid(peerUidOf(socket))) {
+                untrustedServers.incrementAndGet()
+                return null
+            }
             socket.soTimeout = requestTimeoutMs
             socket.outputStream.write(RpcCodec.encodeRequestFrame(request))
             socket.outputStream.flush()
@@ -206,6 +261,13 @@ class HookTransport(
         } finally {
             runCatching { socket.close() }
         }
+    }
+
+    private fun peerUidOf(socket: LocalSocket): Int? = try {
+        socket.peerCredentials?.uid
+    } catch (failure: Throwable) {
+        // 凭据不可读等价于不可信；不发送任何请求。
+        null
     }
 
     private fun acceptCommands(response: RpcResponse?) {
@@ -254,10 +316,23 @@ class HookTransport(
 }
 
 /**
+ * 服务端信任判定：运行容器以 root app_process 启动，因此控制 socket 的服务端 uid 必须是 0。
+ *
+ * 只做纯判定，便于 JVM 测试；凭据读取在 [HookTransport.peerUidOf]。
+ */
+internal object HookServerTrust {
+
+    /** 合法服务端 uid（root）。 */
+    const val TRUSTED_UID: Int = 0
+
+    fun isTrustedUid(uid: Int?): Boolean = uid == TRUSTED_UID
+}
+
+/**
  * HOOK 角色的线格式（纯 Kotlin，可 JVM 测试）。
  *
- * 出站方法白名单只有快照/心跳：HOOK 角色在 Task 3 的固定表里也没有配置/密钥方法，
- * 客户端再加一道白名单，保证任何代码路径都不可能通过本传输读取 API Key。
+ * 出站方法白名单只有快照/心跳/命令结果：HOOK 角色在 Task 3 的固定表里也没有配置/密钥
+ * 方法，客户端再加一道白名单，保证任何代码路径都不可能通过本传输读取 API Key。
  *
  * 命令负载（服务端 → Hook）是严格的行文本：
  * ```
@@ -266,7 +341,8 @@ class HookTransport(
  * ```
  * 大小写敏感、单空格分隔、最多 8 条、总长 4096 字符；未知动词、非法 callId、
  * 多余令牌都只计非法行，绝不执行。快照负载是固定字段的 JSON 对象（转义完整），
- * 由 Task 7 在特权容器用 Gson 解析。
+ * 由 Task 7 在特权容器用 Gson 解析；`source` 与 `handbackReason` 让控制器区分
+ * 模块动作、人工动作与来源不明的路由交还。
  */
 internal object HookWireFormat {
 
@@ -277,6 +353,7 @@ internal object HookWireFormat {
     private val ALLOWED_OUTBOUND_METHODS: Set<String> = setOf(
         RolePolicy.METHOD_HOOK_SNAPSHOT,
         RolePolicy.METHOD_HOOK_HEARTBEAT,
+        RolePolicy.METHOD_CALL_COMMAND_RESULT,
     )
 
     fun isAllowedOutboundMethod(method: String): Boolean = method in ALLOWED_OUTBOUND_METHODS
@@ -318,8 +395,17 @@ internal object HookWireFormat {
         return ParsedCommands(commands = commands, invalidLines = invalid)
     }
 
-    /** 固定字段的 JSON 快照负载；不使用电话号码作为任何标识字段的来源。 */
-    fun encodeSnapshot(snapshot: CallSnapshot): String {
+    /**
+     * 固定字段的 JSON 快照负载；不使用电话号码作为任何标识字段的来源。
+     *
+     * @param source 触发本次快照的动作来源，控制器据此区分模块动作与人工/系统动作。
+     * @param handbackReason 非 null 表示本次快照是一次“交还人工”通知。
+     */
+    fun encodeSnapshot(
+        snapshot: CallSnapshot,
+        source: ActionSource = ActionSource.UNKNOWN,
+        handbackReason: String? = null,
+    ): String {
         val json = StringBuilder(256)
         json.append('{')
         appendStringField(json, "processEpoch", snapshot.id.processEpoch)
@@ -331,7 +417,62 @@ internal object HookWireFormat {
         appendStringField(json, "phoneAccount", snapshot.phoneAccount)
         json.append("\"isEmergency\":").append(snapshot.isEmergency).append(',')
         json.append("\"isConference\":").append(snapshot.isConference).append(',')
-        json.append("\"activeCallCount\":").append(snapshot.activeCallCount)
+        json.append("\"activeCallCount\":").append(snapshot.activeCallCount).append(',')
+        appendStringField(json, "source", source.name)
+        appendStringField(json, "handbackReason", handbackReason)
+        return finish(json)
+    }
+
+    /** 命令结果负载：让特权容器/Task 7 还原真实 [CommandResult]，而不是“已发出”。 */
+    fun encodeCommandResult(
+        session: SessionId,
+        command: CallCommand,
+        source: ActionSource,
+        result: CommandResult,
+        note: String = "",
+    ): String {
+        val json = StringBuilder(256)
+        json.append('{')
+        appendStringField(json, "processEpoch", session.processEpoch)
+        appendStringField(json, "callId", session.callId)
+        appendStringField(
+            json,
+            "command",
+            when (command) {
+                CallCommand.Answer -> "Answer"
+                CallCommand.Hangup -> "Hangup"
+            },
+        )
+        appendStringField(json, "source", source.name)
+        when (result) {
+            is CommandResult.Accepted -> {
+                appendStringField(json, "outcome", "accepted")
+                appendStringField(json, "reason", null)
+                appendStringField(json, "code", null)
+                appendStringField(json, "message", null)
+            }
+            is CommandResult.Rejected -> {
+                appendStringField(json, "outcome", "rejected")
+                appendStringField(json, "reason", result.reason.name)
+                appendStringField(json, "code", null)
+                appendStringField(json, "message", null)
+            }
+            is CommandResult.Failed -> {
+                appendStringField(json, "outcome", "failed")
+                appendStringField(json, "reason", null)
+                appendStringField(json, "code", result.code)
+                appendStringField(json, "message", result.message)
+            }
+        }
+        appendStringField(json, "note", note)
+        return finish(json)
+    }
+
+    private fun finish(json: StringBuilder): String {
+        // appendStringField 总是留下一个尾部逗号；去掉它再闭合对象。
+        if (json.length > 0 && json[json.length - 1] == ',') {
+            json.setLength(json.length - 1)
+        }
         json.append('}')
         return json.toString()
     }

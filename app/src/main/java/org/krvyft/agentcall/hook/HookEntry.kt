@@ -10,8 +10,8 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.lang.reflect.Method
 import java.util.Collections
 import java.util.IdentityHashMap
-import java.util.concurrent.atomic.AtomicBoolean
 import org.krvyft.agentcall.core.model.CallCommand
+import org.krvyft.agentcall.core.model.CallSnapshot
 import org.krvyft.agentcall.core.model.CommandResult
 import org.krvyft.agentcall.core.model.SessionId
 
@@ -22,13 +22,14 @@ import org.krvyft.agentcall.core.model.SessionId
  * 因此本类必须 public、可无参构造，且只接受 com.google.android.dialer 进程。
  * 不注入 system_server，不触碰其他包；Xposed API 仅 compileOnly，绝不随 APK 打包。
  *
- * PART B 接线：
+ * 接线：
  * 1. 通过 PackageManager 找到本进程声明的 InCallService 组件，[ServiceDiscovery] 解析出
- *    真实覆写的 `onCallAdded`/`onCallRemoved`（不依赖基类空实现）；
- * 2. 每个回调的 before-hook 只做入队/内存状态更新，包在 [HookSafety] 里，抛异常也
- *    不影响 Google 电话原方法；
+ *    真实覆写的 `onCallAdded`/`onCallRemoved` 与公开的音频路由回调（不依赖基类空实现）；
+ * 2. 每个回调的 before-hook 经 [HookCallbackAdapter] 只做入队/内存状态更新，包在
+ *    [HookSafety] 里，抛异常也不影响 Google 电话原方法；
  * 3. 每个新 Call 建一个 [AndroidCallHandle]，交给 [CallRegistry] 分配随机会话身份；
- * 4. [HookTransport] 以 HOOK 角色转发快照/心跳，只接受受限通话命令。
+ * 4. [HookTransport] 以 HOOK 角色转发快照（含动作来源/交还原因）、心跳与命令结果，
+ *    只接受受限通话命令。
  *
  * 若 handleLoadPackage 时还拿不到 PackageManager（常见于 Application 创建之前），
  * 则挂 `Instrumentation.callApplicationOnCreate` 等待 Context 就绪后再安装；
@@ -36,12 +37,11 @@ import org.krvyft.agentcall.core.model.SessionId
  */
 class HookEntry : IXposedHookLoadPackage {
 
-    private val initialized = AtomicBoolean(false)
-
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         // 包名不匹配立即返回：system_server 及其他进程一律不加载。
         if (lpparam.packageName != TARGET_PACKAGE) return
-        if (!initialized.compareAndSet(false, true)) return
+        // 进程级闸门：同一进程重复 handleLoadPackage 不得重复安装 Hook/传输线程。
+        if (!HookInstallGuard.claim()) return
         try {
             val installed = HookRuntime(lpparam.classLoader)
             if (!installed.installFromPackageManager()) {
@@ -59,17 +59,26 @@ private class HookRuntime(private val loader: ClassLoader) {
     private val handles = Collections.synchronizedMap(IdentityHashMap<Call, AndroidCallHandle>())
     private val installedMethods: MutableSet<Method> = Collections.synchronizedSet(HashSet())
 
-    private val registry = CallRegistry(
+    private val adapter = HookCallbackAdapter(onCallback = ::onServiceCallback, logger = ::log)
+
+    private val registry: CallRegistry = CallRegistry(
         listener = object : RegistryListener {
-            override fun onSnapshot(snapshot: org.krvyft.agentcall.core.model.CallSnapshot, source: ActionSource) {
-                transport?.enqueueSnapshot(snapshot)
+            override fun onSnapshot(snapshot: CallSnapshot, source: ActionSource) {
+                // 快照附带动作来源，控制器才能区分模块动作与人工/系统动作。
+                transport?.enqueueSnapshot(snapshot, source)
             }
 
-            override fun onSessionRemoved(session: SessionId) {
+            override fun onSessionRemoved(session: SessionId, handle: CallHandle) {
+                forgetHandle(handle)
                 log("session removed callId=" + session.callId)
             }
 
             override fun onHandedBack(session: SessionId, source: ActionSource, reason: String) {
+                // 交还人工必须让控制器看见，不能只写日志：随下一次快照带上机器可读原因。
+                val snapshot = registry.snapshot(session)
+                if (snapshot != null) {
+                    transport?.enqueueSnapshot(snapshot, source, reason)
+                }
                 log("handed back callId=" + session.callId + " source=" + source.name + " reason=" + reason)
             }
         },
@@ -101,7 +110,7 @@ private class HookRuntime(private val loader: ClassLoader) {
             log("no InCallService component declared in " + TARGET_PACKAGE)
             return false
         }
-        val methods = ServiceDiscovery.resolve(loader, services)
+        val methods = ServiceDiscovery.resolve(loader, services, TARGET_PACKAGE)
         if (methods.isEmpty()) {
             log("InCallService callbacks could not be resolved")
             return false
@@ -125,7 +134,7 @@ private class HookRuntime(private val loader: ClassLoader) {
                         HookSafety.guard("install-after-application", ::log) {
                             val application = param.args?.firstOrNull() as? Application ?: return@guard
                             val services = AndroidServiceCatalog.inCallServices(application.packageManager, TARGET_PACKAGE)
-                            val methods = ServiceDiscovery.resolve(loader, services)
+                            val methods = ServiceDiscovery.resolve(loader, services, TARGET_PACKAGE)
                             if (methods.isEmpty()) {
                                 log("no InCallService callbacks discovered after Application creation")
                             } else {
@@ -146,6 +155,8 @@ private class HookRuntime(private val loader: ClassLoader) {
     private fun install(methods: Set<Method>) {
         val fresh = synchronized(installedMethods) { methods.filter { installedMethods.add(it) } }
         if (fresh.isEmpty()) return
+        // 先起传输线程再安装 Hook：避免第一个 onCallAdded 的快照落在“线程尚未启动”的窗口里。
+        transport?.start()
         for (method in fresh) {
             try {
                 XposedBridge.hookMethod(method, hookCallbackFor(method.name))
@@ -153,7 +164,6 @@ private class HookRuntime(private val loader: ClassLoader) {
                 log("cannot hook " + method.declaringClass.name + "#" + method.name + ": " + failure.javaClass.name)
             }
         }
-        transport?.start()
         log(
             "installed " + fresh.size + " hook(s): " +
                 fresh.joinToString(",") { it.declaringClass.simpleName + "#" + it.name },
@@ -162,21 +172,20 @@ private class HookRuntime(private val loader: ClassLoader) {
 
     private fun hookCallbackFor(methodName: String): XC_MethodHook = object : XC_MethodHook() {
         override fun beforeHookedMethod(param: MethodHookParam) {
-            // 只读取参数并入队/更新内存；异常被隔离，原方法继续执行。
-            HookSafety.guard("InCallService." + methodName, ::log) {
-                onServiceCallback(methodName, param.thisObject, param.args)
-            }
+            // 只读取参数并入队/更新内存；异常被适配器隔离，原方法继续执行。
+            adapter.before(methodName, param.thisObject, param.args)
         }
     }
 
     // ------------------------------------------------------------------ 回调
 
-    private fun onServiceCallback(methodName: String, thisObject: Any?, args: Array<Any?>?) {
+    private fun onServiceCallback(methodName: String, thisObject: Any, args: Array<Any?>?) {
         val service = thisObject as? InCallService ?: return
-        val call = args?.firstOrNull() as? Call ?: return
         when (methodName) {
-            "onCallAdded" -> onCallAdded(service, call)
-            "onCallRemoved" -> onCallRemoved(call)
+            "onCallAdded" -> (args?.firstOrNull() as? Call)?.let { onCallAdded(service, it) }
+            "onCallRemoved" -> (args?.firstOrNull() as? Call)?.let { onCallRemoved(it) }
+            // 公开 SDK 的音频路由回调：在本进程内上报，不依赖桥接进程（Task 5）。
+            "onCallAudioStateChanged", "onCallEndpointChanged" -> notifyRouteChanged(methodName)
         }
     }
 
@@ -202,6 +211,25 @@ private class HookRuntime(private val loader: ClassLoader) {
         }
     }
 
+    /** 路由变化上报给每个存活门面；注册表只在模块接管/待执行时保守交还。 */
+    private fun notifyRouteChanged(methodName: String) {
+        val current = synchronized(handles) { handles.values.toList() }
+        for (handle in current) {
+            HookSafety.guard("route-change", ::log) {
+                handle.notifyRouteChanged(methodName)
+            }
+        }
+    }
+
+    private fun forgetHandle(handle: CallHandle) {
+        synchronized(handles) {
+            val iterator = handles.entries.iterator()
+            while (iterator.hasNext()) {
+                if (iterator.next().value.identity == handle.identity) iterator.remove()
+            }
+        }
+    }
+
     private fun dispatchCommand(session: SessionId, command: CallCommand) {
         val result = registry.command(session, command)
         if (result !is CommandResult.Accepted) {
@@ -210,10 +238,11 @@ private class HookRuntime(private val loader: ClassLoader) {
     }
 
     /**
-     * 命令尝试的注入 sink：只记录非 Accepted 结果，避免每通电话刷日志。这里不阻塞、
-     * 不发起 IPC；真正的命令结果转发属 Task 7 的会话路由。
+     * 命令尝试的注入 sink：转发给特权容器（`call.command.result`），让 Task 7 的
+     * CallControl.send 拿到真实 CommandResult。这里只做非阻塞入队，不发起 IPC。
      */
     private fun onCommandAttempt(attempt: CommandAttempt) {
+        transport?.enqueueCommandResult(attempt)
         if (attempt.result !is CommandResult.Accepted) {
             log(
                 "command " + attempt.command + " not accepted for callId=" + attempt.session.callId +
@@ -227,7 +256,7 @@ private class HookRuntime(private val loader: ClassLoader) {
     }
 }
 
-private const val TARGET_PACKAGE = "com.google.android.dialer"
+private const val TARGET_PACKAGE = ServiceDiscovery.DIALER_PACKAGE
 
 private fun logToFramework(message: String) {
     try {
