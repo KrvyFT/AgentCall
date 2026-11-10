@@ -4,6 +4,7 @@ import android.net.LocalSocket
 import android.net.LocalSocketAddress
 import android.os.Process
 import com.google.gson.JsonObject
+import com.google.gson.JsonParser
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
@@ -24,10 +25,12 @@ fun interface CliTransport {
 }
 
 /**
- * root CLI：固定六条命令，不提供任意 shell/任意 RPC。
+ * root CLI：固定七条命令，不提供任意 shell/任意 RPC。
  *
  * - status / config-get / diagnose / shutdown 无参数。
  * - config-set 只从 stdin 读 JSON；密钥值绝不作为 argv 参数出现，也不回显。
+ * - calibrate 只从 stdin 读 `calibration.record` JSON（五项人工测试事实 + 可选预期
+ *   环境），不接受 argv 负载；语义校验仍由 bridge 的 CLI_ROOT handler 负责。
  * - pair [packageName] 必须由 root 进程执行；签名摘要由 bridge 进程重新解析，
  *   CLI 与普通请求都不能自带签名。
  *
@@ -48,9 +51,19 @@ object AgentCallCli {
     const val ERROR_RESPONSE_ID_MISMATCH: String = "response_id_mismatch"
     const val ERROR_CLI_FAILED: String = "cli_failed"
 
-    private val COMMANDS = setOf("status", "config-get", "config-set", "pair", "diagnose", "shutdown")
+    private val COMMANDS = setOf(
+        "status",
+        "config-get",
+        "config-set",
+        "calibrate",
+        "pair",
+        "diagnose",
+        "shutdown",
+    )
     private const val MAX_STDIN_BYTES = RpcCodec.MAX_CONTROL_FRAME_BYTES - 1024
     private val PACKAGE_PATTERN = Regex("[A-Za-z0-9_]+(\\.[A-Za-z0-9_]+)+")
+    private const val CALIBRATION_STEPS_KEY = "steps"
+    private const val CALIBRATION_ENVIRONMENT_KEY = "expectedEnvironment"
 
     @JvmStatic
     fun main(args: Array<String>) {
@@ -93,6 +106,22 @@ object AgentCallCli {
                     return failure(stdout, ERROR_PAYLOAD_INVALID, "stdin must be a config patch JSON object", EXIT_USAGE)
                 }
                 RpcRequest(requestId, RolePolicy.METHOD_CONFIG_WRITE, payload = payload)
+            }
+            "calibrate" -> {
+                // 负载只从 stdin 读取（与 config-set 同一纪律）：argv 里出现任何负载都拒绝。
+                if (args.size != 1) return usage(stdout, "calibrate takes no arguments; send the JSON payload on stdin")
+                val bytes = readBounded(stdin)
+                    ?: return failure(stdout, ERROR_PAYLOAD_TOO_LARGE, "stdin exceeds the control frame budget", EXIT_USAGE)
+                val payload = String(bytes, StandardCharsets.UTF_8)
+                if (!isCalibrationRecordEnvelope(payload)) {
+                    return failure(
+                        stdout,
+                        ERROR_PAYLOAD_INVALID,
+                        "stdin must be a calibration.record JSON object with steps and optional expectedEnvironment",
+                        EXIT_USAGE,
+                    )
+                }
+                RpcRequest(requestId, RolePolicy.METHOD_CALIBRATION_RECORD, payload = payload)
             }
             "pair" -> {
                 // 首次配对只能由 root CLI 发起；非 root 进程连服务端角色都不会是 CLI_ROOT。
@@ -144,6 +173,23 @@ object AgentCallCli {
         }
     }
 
+    /**
+     * calibrate 的外层形状校验（不是语义权威）：必须是 JSON 对象，键只能有 `steps` 与可选
+     * `expectedEnvironment`，两者都必须是对象。五项步骤是否齐全、环境是否未知/不一致
+     * 一律由 bridge 的 CLI_ROOT calibration.record handler 判定（唯一权威）。
+     */
+    private fun isCalibrationRecordEnvelope(payload: String): Boolean {
+        if (payload.isBlank()) return false
+        val parsed = runCatching { JsonParser.parseString(payload) }.getOrNull() ?: return false
+        if (!parsed.isJsonObject) return false
+        val json = parsed.asJsonObject
+        if (!json.keySet().all { it == CALIBRATION_STEPS_KEY || it == CALIBRATION_ENVIRONMENT_KEY }) return false
+        val steps = json.get(CALIBRATION_STEPS_KEY) ?: return false
+        if (!steps.isJsonObject) return false
+        val expected = json.get(CALIBRATION_ENVIRONMENT_KEY) ?: return true
+        return expected.isJsonObject
+    }
+
     private fun readBounded(stdin: InputStream): ByteArray? {
         val buffer = ByteArrayOutputStream()
         val chunk = ByteArray(8 * 1024)
@@ -160,7 +206,8 @@ object AgentCallCli {
         failure(
             stdout,
             ERROR_USAGE,
-            "usage: status | config-get | config-set (JSON on stdin) | pair [packageName] | diagnose | shutdown ($reason)",
+            "usage: status | config-get | config-set (JSON on stdin) | calibrate (JSON on stdin) | " +
+                "pair [packageName] | diagnose | shutdown ($reason)",
             EXIT_USAGE,
         )
 

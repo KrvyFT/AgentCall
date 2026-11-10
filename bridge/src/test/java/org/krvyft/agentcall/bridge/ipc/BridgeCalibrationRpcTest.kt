@@ -2,7 +2,10 @@ package org.krvyft.agentcall.bridge.ipc
 
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
+import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.PrintStream
 import java.nio.file.Files
 import java.util.concurrent.CountDownLatch
 import org.junit.After
@@ -13,6 +16,8 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+import org.krvyft.agentcall.bridge.AgentCallCli
+import org.krvyft.agentcall.bridge.CliTransport
 import org.krvyft.agentcall.bridge.ControlDispatcher
 import org.krvyft.agentcall.bridge.config.CalibrationStore
 import org.krvyft.agentcall.bridge.config.ConfigStore
@@ -240,6 +245,58 @@ class BridgeCalibrationRpcTest {
             "环境变化必须显式报告 ENVIRONMENT_MISMATCH: " + blockers,
             blockers.contains(CalibrationBlocker.ENVIRONMENT_MISMATCH.name),
         )
+    }
+
+    /**
+     * Task 11D2a：新增的固定 CLI 命令 `calibrate` 只是 stdin 到既有 CLI_ROOT
+     * `calibration.record` handler 的传输层；服务端校验（缺步骤、未知/不一致环境、
+     * APP/HOOK 禁止）必须仍然生效。
+     */
+    @Test
+    fun calibrateCliStillAppliesServerValidation() {
+        val current = dispatcher()
+        val transport = CliTransport { request -> current.handle(cliPeer, request) }
+
+        fun calibrate(payload: String): Pair<Int, String> {
+            val stdout = ByteArrayOutputStream()
+            val exit = AgentCallCli.run(
+                arrayOf("calibrate"),
+                ByteArrayInputStream(payload.toByteArray(Charsets.UTF_8)),
+                PrintStream(stdout, true, Charsets.UTF_8.name()),
+                transport,
+            )
+            return exit to stdout.toString(Charsets.UTF_8.name())
+        }
+
+        val missingSteps = calibrate("{\"steps\":{\"downlinkRecognized\":true}}")
+        assertEquals(AgentCallCli.EXIT_SERVER_ERROR, missingSteps.first)
+        assertTrue(missingSteps.second.contains("\"payload_invalid\""))
+        assertNull("缺失步骤绝不能落盘", calibration.load())
+
+        val unknown = calibrate(recordPayload(expected = environment(carrier = PlatformFacts.UNKNOWN)))
+        assertEquals(AgentCallCli.EXIT_SERVER_ERROR, unknown.first)
+        assertTrue(unknown.second.contains("\"calibration_environment_unknown\""))
+
+        val mismatch = calibrate(recordPayload(expected = environment(carrier = "Stale Carrier")))
+        assertEquals(AgentCallCli.EXIT_SERVER_ERROR, mismatch.first)
+        assertTrue(mismatch.second.contains("\"calibration_environment_mismatch\""))
+        assertNull(calibration.load())
+
+        // 角色拒绝发生在 CLI 能到达 handler 之前（固定方法表）。
+        val recordRequest = request(RolePolicy.METHOD_CALIBRATION_RECORD, recordPayload())
+        assertFalse(RolePolicy.authorize(appPeer, recordRequest))
+        assertFalse(
+            RolePolicy.authorize(
+                PeerIdentity(uid = 20_002, role = PeerRole.HOOK, packageName = "org.krvyft.agentcall", signatureSha256 = "sig"),
+                recordRequest,
+            ),
+        )
+
+        // 合法负载通过 CLI 后仍然落盘并返回机器可读结果。
+        val accepted = calibrate(recordPayload())
+        assertEquals(AgentCallCli.EXIT_OK, accepted.first)
+        assertTrue(accepted.second.contains("\"recorded\":true"))
+        assertNotNull(calibration.load())
     }
 
     // ------------------------------------------------------------------ read
