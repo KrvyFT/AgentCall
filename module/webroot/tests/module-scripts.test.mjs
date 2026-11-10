@@ -68,18 +68,42 @@ test("service.sh：等待系统就绪、有限重启，干净退出后不再拉�
   assert.equal(/while true/.test(service), false, "禁止无界重启循环");
 });
 
-test("uninstall.sh：先请求桥接停止并交还会话，再清理私有数据", () => {
+test("uninstall.sh：先尝试停止桥接（CLI 或 PID 回退），再清理私有数据", () => {
   const uninstall = read("uninstall.sh");
   const shutdownAt = uninstall.indexOf('"$CTL" shutdown');
+  const killAt = uninstall.indexOf("kill -KILL");
   const cleanupAt = uninstall.indexOf('rm -rf "$DATA_ROOT"');
-  assert.ok(shutdownAt > -1, "卸载必须先走固定 CLI 的 shutdown");
+  assert.ok(shutdownAt > -1, "卸载必须优先走固定 CLI 的 shutdown");
   assert.ok(cleanupAt > -1, "卸载必须清理私有数据目录");
   assert.ok(shutdownAt < cleanupAt, "shutdown 必须发生在删除数据之前");
-  assert.match(uninstall, /STOP_WAIT_SECONDS=\d+/, "等待交还必须有上限");
-  assert.match(uninstall, /未能.*确认.*交还|未能在/, "未确认交还时必须显式警告，不得谎称成功");
+  assert.ok(killAt > -1, "CLI 不可执行/无响应时必须有 PID 回退杀进程");
+  assert.ok(killAt < cleanupAt, "PID 回退必须在删除数据之前完成");
+  assert.match(uninstall, /STOP_WAIT_SECONDS=\d+/, "等待停止必须有上限");
+  assert.match(uninstall, /KILL_WAIT_SECONDS=\d+/, "等待强杀必须有上限");
+  assert.match(uninstall, /未能.*确认.*(停止|交还)|未能在/, "未确认停止时必须显式警告，不得谎称成功");
   assert.match(uninstall, /case "\$DATA_ROOT" in[\s\S]*\/data\/adb\/agentcall\)/, "只允许删除固定私有目录");
   assert.match(uninstall, /Google 电话默认角色/, "必须声明未改动默认拨号角色");
   assert.equal(/chmod|set_perm/.test(uninstall), false, "卸载脚本不修改模块/webroot 权限");
+});
+
+test("uninstall.sh 诚实性：不宣称桥接没有的“交还会话”能力，并区分 socket 与 CLI 可执行性", () => {
+  const uninstall = read("uninstall.sh");
+  // 桥接当前没有会话/租约（session.request 为 method_not_implemented），脚本必须说明它无法终止/交还通话。
+  assert.match(uninstall, /(没有|无).*(会话|租约)/, "必须说明桥接没有会话/租约实现");
+  assert.match(uninstall, /(无法|不能).*(终止|交还).*(通话|AI)/, "必须明确无法保证终止/交还正在进行的通话");
+  assert.equal(/交还\/终止其托管的 AI 会话/.test(uninstall), false, "不得复述虚假的交还契约");
+  assert.match(uninstall, /socket_present/, "必须单独探测 abstract socket 是否存在");
+  assert.match(uninstall, /ctl_usable/, "必须单独判断固定 CLI 是否可执行");
+  assert.equal(/\] && \[ -x "\$CTL" \]/.test(uninstall), false, "不得把 socket 存在与 CLI 可执行混在同一个条件里");
+});
+
+test("uninstall.sh / agentcallctl：$0 不含斜杠时仍解析出正确目录", () => {
+  for (const file of ["uninstall.sh", "bin/agentcallctl"]) {
+    const source = read(file);
+    assert.match(source, /case "\$0" in/, file + " 必须显式处理 $0 不含斜杠的情况");
+    assert.match(source, /\*\/\*/, file + " 必须有带斜杠分支");
+    assert.equal(/^MODDIR=\$\{0%\/\*\}$/m.test(source), false, file + " 不得只依赖百分号斜杠展开");
+  }
 });
 
 test("customize.sh 只补固定包装器可执行位，不改 webroot 官方权限", () => {

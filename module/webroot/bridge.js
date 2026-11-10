@@ -40,6 +40,16 @@
   var ENDPOINT_FIELDS = { ASR: "asr", LLM: "llm", TTS: "tts" };
   var SPEED_MIN = 0.5;
   var SPEED_MAX = 2.0;
+  /**
+   * 页面保存作用域：任何一次页面保存只提交该页面的字段。
+   * 总开关单独保存（只有 enabled），页面补丁不包含 enabled，避免一个页面夹带
+   * 另一个页面未确认的编辑（尤其是 AI 密钥意图）。
+   */
+  var PAGE_PATCH_KEYS = {
+    rules: ["mode", "blacklist", "whitelist", "region", "handleUnknownNumbers", "answerDelayMs", "maxCallDurationMs"],
+    ai: ["asr", "llm", "tts", "voice", "secrets"],
+    dialog: ["openingLine", "prompt", "speed"],
+  };
   /** 与后端 RpcCodec.PATCH_KEYS 保持一致的固定字段表（漂移由测试守护）。 */
   var PATCH_KEYS = [
     "enabled",
@@ -178,16 +188,6 @@
     element.textContent = value === null || value === undefined ? "" : String(value);
   }
 
-  function escapeHtml(value) {
-    return toText(value).replace(/[&<>"']/g, function (character) {
-      if (character === "&") return "&amp;";
-      if (character === "<") return "&lt;";
-      if (character === ">") return "&gt;";
-      if (character === '"') return "&quot;";
-      return "&#39;";
-    });
-  }
-
   /** 脱敏文本：把疑似凭据字段的值替换为 ***，用于日志/导出前的二次过滤。 */
   function redactText(value) {
     return toText(value)
@@ -270,6 +270,13 @@
 
   // ---------------------------------------------------------------- 管理器探测
 
+  /**
+   * 解析模块目录：
+   * - 管理器没有 moduleInfo、抛错、返回不可解析/非对象，或对象里没有 moduleDir（旧版/分支管理器
+   *   常见的版本偏差）→ 回退到固定路径 /data/adb/modules/agentcall。该值是常量，不含外部输入。
+   * - 明确给出 moduleDir 但不符合固定模式 → 视为不可信，返回 null（fail closed）。
+   * 只有“明确提供却不可信”才应禁止命令；缺少字段不等于不可信。
+   */
   function readModuleDir(ksu) {
     if (!ksu || typeof ksu.moduleInfo !== "function") return MODULE_ROOT;
     var raw;
@@ -282,9 +289,12 @@
     try {
       parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
     } catch (error) {
-      return null;
+      return MODULE_ROOT;
     }
-    if (!isPlainObject(parsed)) return null;
+    if (!isPlainObject(parsed)) return MODULE_ROOT;
+    if (!hasOwn(parsed, "moduleDir") || parsed.moduleDir === null || parsed.moduleDir === undefined) {
+      return MODULE_ROOT;
+    }
     var directory = parsed.moduleDir;
     if (typeof directory === "string" && MODULE_DIR_PATTERN.test(directory)) return directory;
     return null;
@@ -453,6 +463,14 @@
         if (!directory.exists() && !directory.mkdirs() && !directory.exists()) {
           return { ok: false, reason: "directory" };
         }
+        // 明文密钥负载落在该目录：显式 0700（ownerOnly rwx），不依赖 mkdirs 的默认 umask。
+        try {
+          if (typeof directory.setReadable === "function") directory.setReadable(true, true);
+          if (typeof directory.setWritable === "function") directory.setWritable(true, true);
+          if (typeof directory.setExecutable === "function") directory.setExecutable(true, true);
+        } catch (error) {
+          /* 管理器不支持 chmod 时由 agentcallctl/customize.sh 预创建的 0700 目录兜底 */
+        }
         var target = io.File(INBOX_PATH);
         if (target.exists() && typeof target.isSymlink === "function" && target.isSymlink()) {
           target.delete();
@@ -517,6 +535,8 @@
       }
       var written = writeInbox(text);
       if (!written.ok) {
+        // 失败路径也可能留下已经创建/部分写入的负载（含密钥），必须在这里删除。
+        deleteInbox();
         recordLog("config-set", -1, CODE.INBOX_WRITE_FAILED);
         return reject(CODE.INBOX_WRITE_FAILED, errorText(CODE.INBOX_WRITE_FAILED) + "（" + written.reason + "）");
       }
@@ -570,7 +590,9 @@
 
     function readLog(maxBytes) {
       if (support.mode === "demo") return Promise.resolve({ ok: false, code: CODE.BRIDGE_UNAVAILABLE, message: errorText(CODE.BRIDGE_UNAVAILABLE) });
-      if (!support.hasIo || support.moduleDir === null) {
+      // 日志是固定路径 /data/adb/agentcall/logs/service.log，不需要模块目录；
+      // 模块目录不可信只应禁用需要执行 CLI 的命令，不应连带禁用只读日志。
+      if (!support.hasIo) {
         return Promise.resolve({ ok: false, code: CODE.IO_UNAVAILABLE, message: errorText(CODE.IO_UNAVAILABLE) });
       }
       try {
@@ -753,6 +775,22 @@
     return { code: code, field: field, message: message, blocking: blocking !== false };
   }
 
+  /** 字段归属页面（与 app.js 的渲染分桶共用同一套规则）。 */
+  function pageForField(field) {
+    var name = toText(field);
+    if (/^(asr|llm|tts|voice|secrets)/.test(name)) return "ai";
+    if (/^(openingLine|prompt|speed)/.test(name)) return "dialog";
+    return "rules";
+  }
+
+  /** scope 为空/all 时返回全部问题；否则只保留本页字段的问题。 */
+  function scopeIssues(issues, scope) {
+    if (!scope || scope === "all") return issues;
+    return issues.filter(function (item) {
+      return pageForField(item.field) === scope;
+    });
+  }
+
   function issueText(code, field) {
     var label = field ? "（" + field + "）" : "";
     if (code === "RULE_NUMBER_OVERLAP") return "同一号码规范化后同时出现在黑名单与白名单" + label;
@@ -766,7 +804,7 @@
     return "后端拒绝该配置" + label;
   }
 
-  function validateForm(form) {
+  function validateForm(form, scope) {
     var issues = [];
     var source = form || {};
 
@@ -866,12 +904,13 @@
       issues.push(issue("BLACKLIST_EMPTY", "blacklist", "空黑名单：不会自动接管任何号码", false));
     }
 
+    var scoped = scopeIssues(issues, scope);
     return {
-      issues: issues,
-      blocking: issues.filter(function (item) {
+      issues: scoped,
+      blocking: scoped.filter(function (item) {
         return item.blocking;
       }),
-      warnings: issues.filter(function (item) {
+      warnings: scoped.filter(function (item) {
         return !item.blocking;
       }),
     };
@@ -900,8 +939,8 @@
     return patch;
   }
 
-  function buildConfigPatch(form, baseline) {
-    var validation = validateForm(form);
+  function buildConfigPatch(form, baseline, scope) {
+    var validation = validateForm(form, scope);
     if (validation.blocking.length > 0) {
       return {
         ok: false,
@@ -932,6 +971,14 @@
       secrets: secretsPatch(form),
     };
     // 页面不编辑 PhoneAccount，因此补丁绝不覆盖它：避免把 APK 写入的启用项清空。
+    var pageKeys = scope && PAGE_PATCH_KEYS[scope] ? PAGE_PATCH_KEYS[scope] : null;
+    if (pageKeys) {
+      var scopedPatch = {};
+      pageKeys.forEach(function (key) {
+        if (hasOwn(patch, key)) scopedPatch[key] = patch[key];
+      });
+      patch = scopedPatch;
+    }
     return {
       ok: true,
       issues: validation.issues,
@@ -986,6 +1033,22 @@
   }
 
   /**
+   * 保存按钮可用性状态机（Critical 1 的可测试核心）：
+   * 只有真实桥 + 可保存 + 已加载基线（已知 revision）+ 没有正在进行的保存时才允许保存。
+   * 缺少基线时禁止保存，而不是回退到 DEMO revision 0 去覆盖真实配置。
+   */
+  function computeSaveAvailability(input) {
+    var source = input || {};
+    var mode = toText(source.mode);
+    if (mode !== "kernelsu") return { enabled: false, reason: mode === "readonly" ? "readonly" : "demo" };
+    if (source.canSave !== true) return { enabled: false, reason: "readonly" };
+    if (source.saving === true) return { enabled: false, reason: "saving" };
+    if (source.loaded !== true) return { enabled: false, reason: "not_loaded" };
+    if (!isIntegerValue(source.revision) || source.revision < 0) return { enabled: false, reason: "revision_unknown" };
+    return { enabled: true, reason: "ready" };
+  }
+
+  /**
    * 总开关是独立写入：只提交 { enabled }，不夹带同一页面上其它未保存字段，
    * 尤其不提交正在编辑的密钥意图。开关不应因别的表单字段非法而被阻断。
    */
@@ -1028,8 +1091,8 @@
     });
   }
 
-  function saveConfig(bridge, form, baseline) {
-    var built = buildConfigPatch(form, baseline);
+  function saveConfig(bridge, form, baseline, scope) {
+    var built = buildConfigPatch(form, baseline, scope);
     if (!built.ok) {
       return Promise.resolve({
         ok: false,
@@ -1148,6 +1211,8 @@
     buildEnabledPatch: buildEnabledPatch,
     saveEnabled: saveEnabled,
     saveConfig: saveConfig,
+    computeSaveAvailability: computeSaveAvailability,
+    pageForField: pageForField,
     issuesFromBackend: issuesFromBackend,
     isRepairRequired: isRepairRequired,
     errorText: errorText,
@@ -1156,7 +1221,6 @@
     isPhoneLike: isPhoneLike,
     parseList: parseList,
     setText: setText,
-    escapeHtml: escapeHtml,
     redactText: redactText,
     toBase64Utf8: toBase64Utf8,
     fromBase64Utf8: fromBase64Utf8,

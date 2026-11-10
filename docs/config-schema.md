@@ -22,7 +22,7 @@
 | `/data/adb/agentcall/config.json` | 公开配置 + 密钥 + schema + revision | 0600 |
 | `/data/adb/agentcall/pairing.json` | 配对记录（包名/UID/签名摘要/版本） | 0600 |
 | `/data/adb/agentcall/config.schema-<n>.json.bak` | 迁移前旧 schema 备份 | 0600 |
-| `/data/adb/agentcall/inbox` | WebUI 写入的 `config-set` 临时负载 | 0700 |
+| `/data/adb/agentcall/inbox` | WebUI 写入的 `config-set` 临时负载 | 0700（WebUI 创建时显式 ownerOnly rwx，不依赖 umask；`customize.sh` 预创建） |
 | `/data/adb/agentcall/inbox/config-set.json` | 单次写入负载；写后立即删除 | 写入后收紧为 0000 |
 | `/data/adb/agentcall/logs/service.log` | 服务日志（有大小上限） | 0700 目录，服务自身轮转 |
 
@@ -110,6 +110,10 @@
 - `secrets` 的值为 `CONFIGURED` 或 `MISSING`，没有原值、没有长度、没有前缀。
 - `status` 负载：`bridgeVersion`、`protocolVersion`、`revision`、`enabled`、`paired`、
   `uptimeMs`、`activeConnections`、`rejectedConnections`。
+- 概览的“Google 电话默认角色”和“Hook 连通性”目前**没有**后端字段。WebUI 保留两个可选
+  字段名 `dialerDefaultRole`(boolean) 与 `hookConnected`(boolean)：只有后端真的返回时才按
+  真实值渲染，缺失时显示“未知（后端未提供）”。这是阶段 B（桥接/Task 7 诊断）需要补齐的
+  契约；本文不声称当前桥接已提供它们，也不允许前端伪造结论。
 - `diagnose` 负载：`environment`（apiLevel/romFingerprint/kernelVersion/
   dialerPackageVersion/frameworkVersion/bridgeVersion/audioPolicyDigest/simCarrier/
   transport/route）、`downlinkExtraction`、`uplinkInjection`、`microphoneIsolation`、
@@ -152,6 +156,18 @@
 - 配置内容只经 stdin 传输；命令行只有固定的
   `<moduleDir>/bin/agentcallctl config-set < /data/adb/agentcall/inbox/config-set.json`。
   密钥永远不进入进程 argv、URL、日志或错误消息。
+- **页面作用域**：WebUI 的每个页面保存只提交本页字段，校验也只针对本页；绝不夹带其它页面
+  正在编辑（未确认）的内容，尤其是 AI 密钥意图：
+
+  | 入口 | 提交的 patch 键 |
+  | --- | --- |
+  | 总开关（概览） | 只有 `enabled` |
+  | 规则页 | `mode`、`blacklist`、`whitelist`、`region`、`handleUnknownNumbers`、`answerDelayMs`、`maxCallDurationMs` |
+  | AI 页 | `asr`、`llm`、`tts`、`voice`、`secrets` |
+  | 对话页 | `openingLine`、`prompt`、`speed` |
+
+  页面补丁不包含 `enabled`（开关独立保存），也不包含 `enabledPhoneAccounts`。缺省字段对后端
+  仍然表示“保持原值”，所以按页提交不会清空其它配置。
 
 ---
 
@@ -201,7 +217,8 @@
 | --- | --- | --- |
 | `bridge_unavailable` | 没有 KernelSU 管理器注入（普通浏览器） | 演示/只读态，保存一律失败 |
 | `secret_transport_unsupported` | 管理器没有 `ksu.io` 受控写入接口 | 只读态，拒绝 `config-set`，不执行命令 |
-| `module_dir_unresolved` | `moduleInfo()` 无法给出可信模块目录 | 禁用所有命令与保存（fail closed） |
+| `module_dir_unresolved` | `moduleInfo()` **明确给出**的 `moduleDir` 不符合固定模式（不可信） | 禁用所有需要执行 CLI 的命令与保存（fail closed）；固定路径日志仍可读 |
+| `io_missing`（只读原因，不是命令错误码） | 管理器没有 `ksu.io()` 或 `version()<1` | 只读态：读取/诊断/配对/关闭可用，保存一律拒绝（`secret_transport_unsupported`） |
 | `io_unavailable` | 文件接口不可用（读日志等） | 显示“无法读取”，不伪造数据 |
 | `unsupported_operation` | 不在六条固定命令内 | 拒绝，不拼 shell |
 | `payload_not_allowed` | 无参数命令收到负载 | 拒绝，不执行 |
@@ -302,9 +319,18 @@ WebUI 的实际命令行（完整字符串，无用户数据）：
 
 | 状态 | 条件 | 能力 |
 | --- | --- | --- |
-| `kernelsu` | 有 `ksu.exec`、`ksu.io()` ≥ v1、模块目录可信 | 全部六条命令；保存可用 |
-| `readonly` | 有 `ksu.exec`，但没有 `ksu.io()`（或版本不足/模块目录不可信） | 读取/诊断/配对/关闭可用；**保存一律拒绝**（`secret_transport_unsupported`），绝不降级为 base64/echo 命令行参数 |
+| `kernelsu` | 有 `ksu.exec`、`ksu.io()` ≥ v1、模块目录可信（`moduleInfo` 缺少 `moduleDir` 时回退固定路径） | 全部六条命令；保存可用 |
+| `readonly`（`io_missing`） | 有 `ksu.exec`，但没有 `ksu.io()`（或 `version()<1`） | 读取/诊断/配对/关闭可用；**保存一律拒绝**（`secret_transport_unsupported`），绝不降级为 base64/echo 命令行参数 |
+| `readonly`（`module_dir_unresolved`） | `moduleInfo()` **明确给出**不可信的 `moduleDir` | 需要执行 CLI 的命令禁用；固定路径日志读取仍可用（日志不依赖模块目录）；保存拒绝 |
 | `demo` | 普通浏览器，没有管理器注入 | 明确标注“演示数据”，保存、配对、日志均不可用；不发起任何网络请求 |
+
+模块目录解析规则（版本偏差不再一刀切）：
+
+- 没有 `moduleInfo()`、调用抛错、返回非法 JSON/非对象，或对象里**没有** `moduleDir`
+  （旧版/分支管理器常见）→ 回退到固定常量 `/data/adb/modules/agentcall`，所有命令照常可用。
+- `moduleDir` 存在但不符合 `^/data/adb/modules/[A-Za-z][A-Za-z0-9._-]+$` → 视为不可信，
+  返回 `module_dir_unresolved`，只禁用需要模块目录的命令。
+- 日志路径 `/data/adb/agentcall/logs/service.log` 是固定的，不因模块目录未解析而失效。
 
 写入路径：
 
@@ -316,9 +342,19 @@ WebUI 的实际命令行（完整字符串，无用户数据）：
 5. 无论成功失败都删除临时文件；成功与否只以后端回读为准。
 
 WebUI 不加载任何在线 CDN、不发起 fetch/XHR、不用 `innerHTML` 渲染不受信任文本；
-配置与日志一律 `textContent`。诊断页的“校验地址格式”只做本地格式检查，
-真实连通性测试会使用密钥向远程地址发起真实请求（可能计费），必须在 AgentCall APK 内执行；
-WebUI 无法读取密钥，因此不代发请求。
+配置与日志一律 `textContent`。
+
+**连接测试归属（控制器裁决）**：特权桥接进程**不得**代替用户发起远程 API 请求
+（spec §6.3），WebUI 也不读取密钥。因此逐端点连接测试属于 APK 侧诊断（Task 7）：
+
+- AI 页只做本地“地址格式校验”（按钮文案为“校验地址格式（非连接测试）”）；
+- AI 页有一个明确的“连接测试”卡片，状态恒为“未实现（需 APK 端）”，并写明
+  “连接测试在 AgentCall APK 诊断页执行，需真实远程 API 请求（会使用密钥并可能计费）；
+  WebUI 不发起远程请求，也不伪造测试结果”；
+- 当前没有 APK 的 deep link 约定，因此只提供路径说明（AgentCall APK → 诊断 → 连接测试），
+  不提供会失败的链接。
+
+**WebUI 自身不得显示假的“已连接/已就绪”**：任何一次真实请求都必须发生在 APK 进程。
 
 ---
 
@@ -331,9 +367,18 @@ WebUI 无法读取密钥，因此不代发请求。
   旧版模块不会降级覆盖新版配置。
 - 模块升级：`customize.sh` 只补可执行位、校验桥接容器、预创建 0700 目录，
   不迁移、不改写既有配置；配置迁移由桥接在读取时完成。
-- 卸载：`uninstall.sh` 先请求 `shutdown` 并等待桥接退出（上限 15 秒），
-  未确认时明确警告“可能存在尚未交还的 AI 通话”，然后才删除
-  `/data/adb/agentcall`。不修改 Google 电话默认角色、vendor 音频配置或 SELinux。
+- 卸载：`uninstall.sh` 分开探测 abstract socket 是否存在与固定 CLI 是否可执行
+  （socket 存在不等于 CLI 可执行），然后：
+  1. 两者都可用 → 固定 CLI `shutdown`，在上限 15 秒内等待 socket 消失；
+  2. CLI 不可执行或等待超时 → 从 `/data/adb/agentcall/bridge.pid` 取 PID，
+     核验 `/proc/<pid>/cmdline` 命中 AgentCall 桥接入口后 TERM（有界等待 5 秒）→ KILL；
+  3. PID 文件缺失/不可核验时**不猜测 PID**，显式警告；
+  4. 最后才删除 `/data/adb/agentcall`。
+
+  **诚实边界**：当前桥接没有会话/租约实现（`session.request` 为
+  `method_not_implemented`），`shutdown` 只关闭配置服务与 socket，**不能终止或交还
+  正在进行的 AI 通话**；脚本会打印这一点，并提示用户先在 Google 电话中手动结束。
+  不修改 Google 电话默认角色、vendor 音频配置或 SELinux。
 
 ---
 
@@ -347,7 +392,13 @@ WebUI 无法读取密钥，因此不代发请求。
   能把 JSON 放进 root 私有文件并做重定向。管理器的文件写入接口不可用时，没有
   不暴露密钥的替代通道；实现选择拒绝保存，而不是用 base64 命令行参数伪装保密。
 - **KernelSU IO 版本**：`ksu.io()` 的 `version()` 必须 ≥ 1；不同管理器/分支的
-  文件接口细节未逐一验证。
+  文件接口细节未逐一验证。版本为 0 时按“没有受控写入接口”处理（只读，不是保存成功）。
+- **模块目录版本偏差**：`moduleInfo()` 缺少 `moduleDir` 时回退固定路径；只有明确给出
+  非法目录才 fail closed。该项由 `transport.test.mjs` 覆盖，未在真机管理器上验证。
+- **概览实时字段**：`dialerDefaultRole`/`hookConnected` 目前不由桥接提供，页面显示
+  “未知（后端未提供）”；阶段 B 后端补齐后页面无需改协议即可显示真实值。
+- **连接测试**：WebUI 不执行连接测试，也不代发任何远程请求；真实测试只能在 AgentCall APK
+  诊断页进行（会计费），当前无设备证据。
 - **WebView 存储**：`localStorage` 保存“最近错误”在 file:// 或受限 WebView 中可能
   不可用，代码已降级为本次会话内显示；未在真实 WebView 验证。
 - **密钥明文落盘**：主副本是 root 私有明文文件，依赖 0700/0600；不提供加密，

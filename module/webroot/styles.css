@@ -57,10 +57,22 @@ body {
   color: #1b1b1b;
 }
 
-.app-header {
+/*
+ * 顶部固定层：header 与 tabs 共享一个 sticky 容器。
+ * 旧实现给 tabs 写死 top:56px（header 实际高度会随标题/说明换行变化），
+ * 且 header 的 z-index(20) 高于 tabs(15)，导致 tabs 滑到 header 底下被遮挡。
+ * 现在只有 .topbar 负责 sticky，两者都不再单独定位，偏移不再依赖魔法数字。
+ */
+.topbar {
   position: sticky;
   top: 0;
   z-index: 20;
+  background: var(--bg);
+}
+
+.app-header {
+  position: static;
+  z-index: auto;
   padding: calc(12px + env(safe-area-inset-top)) 16px 10px;
   background: color-mix(in srgb, var(--bg) 92%, transparent);
   border-bottom: 1px solid var(--border);
@@ -151,9 +163,8 @@ body {
 }
 
 .tabs {
-  position: sticky;
-  top: calc(56px + env(safe-area-inset-top));
-  z-index: 15;
+  position: static;
+  z-index: auto;
   display: flex;
   gap: 6px;
   overflow-x: auto;
@@ -430,6 +441,17 @@ textarea.is-invalid {
   margin: 0;
   word-break: break-word;
   font-variant-numeric: tabular-nums;
+}
+
+.steps {
+  margin: 10px 0 0;
+  padding-left: 20px;
+  color: var(--muted);
+  font-size: 12.5px;
+}
+
+.steps li {
+  margin-top: 4px;
 }
 
 .notice {

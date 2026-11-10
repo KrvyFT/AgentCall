@@ -14,7 +14,20 @@
 set -u
 umask 077
 
-MODDIR=${0%/*}/..
+# $0 可能是不含斜杠的相对调用；显式解析，避免百分号斜杠展开得到错误目录。
+case "$0" in
+    */*)
+        SCRIPT_DIR=${0%/*}
+        ;;
+    *)
+        resolved=$(command -v "$0" 2>/dev/null || printf '%s' "$0")
+        case "$resolved" in
+            */*) SCRIPT_DIR=${resolved%/*} ;;
+            *) SCRIPT_DIR=. ;;
+        esac
+        ;;
+esac
+MODDIR=$SCRIPT_DIR/..
 DATA_ROOT=/data/adb/agentcall
 INBOX_DIR=$DATA_ROOT/inbox
 LOG_DIR=$DATA_ROOT/logs

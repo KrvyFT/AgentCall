@@ -21,6 +21,8 @@
     secretIntent: { ASR: "keep", LLM: "keep", TTS: "keep" },
     dirty: false,
     saving: false,
+    loaded: false,
+    saveEnabled: false,
     demo: bridge.mode === "demo",
     canSave: bridge.mode === "kernelsu",
   };
@@ -253,13 +255,6 @@
     });
   }
 
-  function pageForField(field) {
-    var name = String(field || "");
-    if (/^(asr|llm|tts|voice|secrets)/.test(name)) return "ai";
-    if (/^(openingLine|prompt|speed)/.test(name)) return "dialog";
-    return "rules";
-  }
-
   /**
    * 阻断项与非阻断提醒按字段归到各自页面；提醒绝不覆盖阻断项
    * （否则一次保存失败后用户只看到“空白名单”而看不到真正要修的错误）。
@@ -268,7 +263,7 @@
     var items = (blocking || []).concat(warnings || []);
     var buckets = { rules: [], ai: [], dialog: [] };
     items.forEach(function (item) {
-      buckets[pageForField(item.field)].push(item);
+      buckets[B.pageForField(item.field)].push(item);
     });
     renderIssues($("rules-issues"), buckets.rules);
     renderIssues($("dlg-issues"), buckets.dialog);
@@ -362,8 +357,8 @@
     }
   }
 
-  function fillForm(form) {
-    $("ov-enabled").checked = form.enabled === true;
+  /** 分页面回填：保存某一页后只刷新该页，避免清掉其它页面尚未保存的编辑。 */
+  function fillRules(form) {
     $("rules-mode").value = form.mode;
     $("rules-blacklist").value = form.blacklistText;
     $("rules-whitelist").value = form.whitelistText;
@@ -371,10 +366,10 @@
     $("rules-unknown").checked = form.handleUnknownNumbers === true;
     $("rules-delay").value = form.answerDelayMs;
     $("rules-duration").value = form.maxCallDurationMs;
+  }
+
+  function fillAi(form) {
     $("ai-voice").value = form.voice;
-    $("dlg-speed").value = form.speed;
-    $("dlg-opening").value = form.openingLine;
-    $("dlg-prompt").value = form.prompt;
     ["ASR", "LLM", "TTS"].forEach(function (kind) {
       var lower = kind.toLowerCase();
       var endpoint = form[lower];
@@ -383,7 +378,27 @@
       state.secretState[kind] = endpoint.secretState;
       resetSecretControls(kind);
     });
+  }
+
+  function fillDialog(form) {
+    $("dlg-speed").value = form.speed;
+    $("dlg-opening").value = form.openingLine;
+    $("dlg-prompt").value = form.prompt;
+  }
+
+  function fillForm(form) {
+    $("ov-enabled").checked = form.enabled === true;
+    fillRules(form);
+    fillAi(form);
+    fillDialog(form);
     renderEnabledState();
+  }
+
+  function fillSavedPage(scope, form) {
+    if (scope === "rules") fillRules(form);
+    else if (scope === "ai") fillAi(form);
+    else if (scope === "dialog") fillDialog(form);
+    else fillForm(form);
   }
 
   function renderEnabledState() {
@@ -405,7 +420,7 @@
         note,
         bridge.support.reason === "io_missing"
           ? "当前管理器没有受控文件写入接口：可读取状态，但保存已禁用（密钥不会通过 base64 命令行参数提交）。"
-          : "无法确认模块安装目录：已禁用所有命令与保存。",
+          : "moduleInfo() 给出的模块目录不可信：已禁用需要 CLI 的命令与保存；固定路径日志仍可读取。",
       );
     } else {
       setBadge(badge, "演示（只读）", "warn");
@@ -413,11 +428,25 @@
     }
   }
 
-  function disableSaveButtons(disabled) {
+  /**
+   * 保存按钮可用性：唯一入口。真实桥 + 已加载基线（已知 revision）+ 非保存中才启用；
+   * demo/readonly/加载失败/未知 revision 一律禁用（fail closed）。
+   */
+  function applySaveAvailability() {
+    var baselineConfig = state.baseline && state.baseline.config ? state.baseline.config : null;
+    var availability = B.computeSaveAvailability({
+      mode: bridge.mode,
+      canSave: state.canSave,
+      saving: state.saving,
+      loaded: state.loaded === true,
+      revision: baselineConfig && typeof baselineConfig.revision === "number" ? baselineConfig.revision : null,
+    });
+    state.saveEnabled = availability.enabled;
     ["ov-save-switch", "rules-save", "ai-save", "dlg-save"].forEach(function (id) {
       var button = $(id);
-      if (button) button.disabled = disabled;
+      if (button) button.disabled = !availability.enabled;
     });
+    return availability;
   }
 
   /** 只读/演示态：配置输入与密钥动作都不可用，避免“能改但存不了”的误导。 */
@@ -439,6 +468,7 @@
   function renderStatus(status) {
     if (!status) {
       setText($("ov-bridge-state"), "不可达");
+      renderLiveOverview();
       return;
     }
     setText($("ov-bridge-state"), "status 成功（" + formatTime(Date.now()) + "）");
@@ -452,6 +482,52 @@
         " / " +
         String(status.rejectedConnections === undefined ? "—" : status.rejectedConnections),
     );
+    renderLiveOverview();
+  }
+
+  /** 只读取后端确实返回的字段；没有就是“未知”，绝不填充猜测值。 */
+  function liveStatusValue(key) {
+    if (!state.status || !Object.prototype.hasOwnProperty.call(state.status, key)) return undefined;
+    var value = state.status[key];
+    return value === undefined || value === null ? undefined : value;
+  }
+
+  /**
+   * 概览实时值：
+   * - 后端提供 dialerDefaultRole / hookConnected 时按真实值渲染；
+   * - 当前固定 CLI 的 status 不提供这两个字段（阶段 B 由桥接/APK 诊断补齐），
+   *   因此现在显示“未知（后端未提供）”，不显示硬编码的“未验证/无法确认”结论。
+   */
+  function renderLiveOverview() {
+    var role = liveStatusValue("dialerDefaultRole");
+    if (role === true) {
+      setText($("ov-dialer-role"), "已设为默认拨号器");
+      setBadge($("ov-dialer-badge"), "已确认", "ok");
+      setText($("ov-dialer-note"), "该值来自桥接 status 的真实字段。");
+    } else if (role === false) {
+      setText($("ov-dialer-role"), "未设为默认拨号器");
+      setBadge($("ov-dialer-badge"), "不满足", "warn");
+      setText($("ov-dialer-note"), "自动接管需要 Google 电话为默认拨号器；该值来自桥接 status。");
+    } else {
+      setText($("ov-dialer-role"), "未知（后端未提供）");
+      setBadge($("ov-dialer-badge"), "未知", "neutral");
+      setText($("ov-dialer-note"), "当前固定 CLI 的 status 不提供默认拨号角色；未获得真实值前不显示结论（该检查属于 APK 启动向导）。");
+    }
+
+    var hook = liveStatusValue("hookConnected");
+    if (hook === true) {
+      setText($("ov-hook-state"), "已连接");
+      setBadge($("ov-hook-badge"), "已确认", "ok");
+      setText($("ov-hook-note"), "该值来自桥接 status 的真实字段。");
+    } else if (hook === false) {
+      setText($("ov-hook-state"), "未连接");
+      setBadge($("ov-hook-badge"), "未连接", "warn");
+      setText($("ov-hook-note"), "桥接报告 Hook 未连接；未连接时不自动接管。");
+    } else {
+      setText($("ov-hook-state"), "未知（后端未提供）");
+      setBadge($("ov-hook-badge"), "未知", "neutral");
+      setText($("ov-hook-note"), "固定 CLI 的 status 不报告 Hook 心跳；当前显示未知，不伪造“已连接/未连接”结论。");
+    }
   }
 
   function renderStatusUnavailable(result) {
@@ -461,6 +537,7 @@
     setText($("ov-protocol-version"), "—");
     setText($("ov-uptime"), "—");
     setText($("ov-connections"), "—");
+    renderLiveOverview();
   }
 
   function renderDiagnose(report) {
@@ -528,6 +605,8 @@
       })
       .then(function (result) {
         if (!result.ok) {
+          state.loaded = false;
+          applySaveAvailability();
           noteFailure(result);
           if (result.code === "config_conflict") {
             showBanner("err", "配置读取失败：" + B.errorText(result.code), [{ label: "重试", primary: true, onClick: loadAll }]);
@@ -536,8 +615,10 @@
         }
         state.baseline = result.data;
         state.form = B.formFromRedacted(result.data);
+        state.loaded = true;
         fillForm(state.form);
         clearDirty();
+        applySaveAvailability();
         var validation = B.validateForm(state.form);
         renderWarnings(validation.warnings);
         renderPageIssues([], validation.warnings);
@@ -568,43 +649,47 @@
     markDirty(false);
   }
 
-  function collectSecretIntentFromDom() {
-    // intents 由按钮驱动，值从输入框读取；此函数仅用于文档化顺序。
-  }
-
   /** 串行化保存：临时文件路径固定，双击不能把两次写入交错到同一个 inbox 文件。 */
   function beginSave() {
     if (state.saving) return false;
     state.saving = true;
-    disableSaveButtons(true);
+    applySaveAvailability();
     return true;
   }
 
   function endSave() {
     state.saving = false;
-    disableSaveButtons(!state.canSave);
+    applySaveAvailability();
   }
 
-  function saveConfig() {
+  function refuseSave(message, code) {
+    toast(message, true);
+    if (code) recordError(code, message);
+    return Promise.resolve(null);
+  }
+
+  function saveConfig(scope) {
     if (!state.canSave) {
-      toast("当前为只读/演示状态，不能保存", true);
-      recordError("bridge_unavailable", B.errorText("bridge_unavailable"));
-      return Promise.resolve(null);
+      return refuseSave("当前为只读/演示状态，不能保存", "bridge_unavailable");
+    }
+    if (!state.baseline) {
+      return refuseSave("配置尚未加载完成，不能保存；请先等待或重新加载配置", "baseline_missing");
     }
     if (!beginSave()) {
-      toast("上一项保存还在进行，请稍候", true);
-      return Promise.resolve(null);
+      return refuseSave("上一项保存还在进行，请稍候");
     }
     var form = readForm();
-    return B.saveConfig(bridge, form, state.baseline || B.DEMO.config).then(function (result) {
+    return B.saveConfig(bridge, form, state.baseline, scope).then(function (result) {
       if (result && result.ok) {
         state.baseline = result.data;
         state.form = result.form;
-        fillForm(state.form);
+        state.loaded = true;
+        fillSavedPage(scope, result.form);
         clearDirty();
         renderPageIssues([], result.warnings || []);
         renderWarnings(result.warnings);
         hideBanner();
+        applySaveAvailability();
         toast("已保存；后端回读确认 revision " + (result.data && result.data.config ? result.data.config.revision : "?"));
         return result;
       }
@@ -641,19 +726,27 @@
 
   function saveEnabledOnly() {
     if (!state.canSave) {
-      toast("当前为只读/演示状态，不能保存", true);
-      return;
+      return refuseSave("当前为只读/演示状态，不能保存", "bridge_unavailable");
+    }
+    // 配置还没加载完（没有可信 revision）时绝不保存：不能用 DEMO revision 0 覆盖真实配置。
+    if (!state.baseline) {
+      return refuseSave("配置尚未加载完成，不能保存开关；请稍后再试或重新加载", "baseline_missing");
     }
     if (!beginSave()) {
-      toast("上一项保存还在进行，请稍候", true);
-      return;
+      return refuseSave("上一项保存还在进行，请稍候");
     }
     // 只写 enabled：不提交其它页面正在编辑的字段，尤其不提交未确认的密钥意图。
-    B.saveEnabled(bridge, $("ov-enabled").checked, state.baseline || B.DEMO.config).then(function (result) {
+    return B.saveEnabled(bridge, $("ov-enabled").checked, state.baseline).then(function (result) {
       if (result && result.ok) {
         state.baseline = result.data;
-        state.form.enabled = result.form.enabled;
+        state.loaded = true;
+        if (state.form) {
+          state.form.enabled = result.form.enabled;
+        } else {
+          state.form = result.form;
+        }
         hideBanner();
+        applySaveAvailability();
         toast(result.form.enabled ? "已开启自动接管" : "已关闭自动接管");
         // 其它页面的未保存编辑不受影响，因此不在这里清除 dirty 标记。
       } else {
@@ -674,11 +767,14 @@
         }
         toast("开关保存失败：" + (failure.code || "unknown"), true);
       }
-    }).then(function () {
+      return result;
+    }).then(function (result) {
       endSave();
+      return result;
     }, function (error) {
       endSave();
       recordError("client_error", String(error && error.message ? error.message : error));
+      return null;
     });
   }
 
@@ -939,7 +1035,7 @@
             {
               code: "LOCAL_FORMAT_ONLY",
               field: lower,
-              message: "地址格式通过。真实连通性测试会使用密钥向该地址发起真实请求，必须由 AgentCall APK 执行；本页未发起任何请求。",
+              message: "地址格式通过。WebUI 不执行连接测试；连接测试在 AgentCall APK 诊断页执行，需真实远程 API 请求（会使用密钥并可能计费）。",
               blocking: false,
             },
           ]);
@@ -967,10 +1063,17 @@
       if (tab) tab.click();
       $("diag-cal-list").hidden = false;
     });
-    $("rules-save").addEventListener("click", saveConfig);
+    // 每个页面只提交本页字段；总开关走独立保存。
+    $("rules-save").addEventListener("click", function () {
+      saveConfig("rules");
+    });
     $("rules-trial-btn").addEventListener("click", runTrial);
-    $("ai-save").addEventListener("click", saveConfig);
-    $("dlg-save").addEventListener("click", saveConfig);
+    $("ai-save").addEventListener("click", function () {
+      saveConfig("ai");
+    });
+    $("dlg-save").addEventListener("click", function () {
+      saveConfig("dialog");
+    });
     $("diag-refresh").addEventListener("click", function () {
       toast("正在重试连接…");
       loadAll().then(function () {
@@ -984,6 +1087,11 @@
     $("diag-disable").addEventListener("click", function () {
       if (!state.canSave) {
         toast("当前为只读/演示状态，不能保存", true);
+        return;
+      }
+      // config-get 尚未解析时没有可信 revision：不得用 DEMO revision 0 覆盖真实配置。
+      if (!state.baseline) {
+        toast("配置尚未加载完成，不能停用", true);
         return;
       }
       confirmAction("停用后不会自动接管任何来电，已托管的通话不受影响。确认停用？", "确认停用", function () {
@@ -1030,7 +1138,9 @@
     ["ASR", "LLM", "TTS"].forEach(function (kind) {
       updateSecretBadge(kind);
     });
-    collectSecretIntentFromDom();
+    // 配置加载完成前保存按钮一律禁用（HTML 里也是 disabled）。
+    applySaveAvailability();
+    renderLiveOverview();
 
     if (bridge.mode === "demo") {
       state.baseline = B.DEMO.config;
@@ -1040,15 +1150,15 @@
       fillForm(state.form);
       renderStatus(B.DEMO.status);
       renderDiagnose(B.DEMO.diagnose);
-      disableSaveButtons(true);
+      applySaveAvailability();
       disableConfigEditing();
       mountDemoNote();
       setText($("diag-log"), "演示状态：未连接真实桥接，无法读取模块日志。");
-      return;
+      return Promise.resolve();
     }
 
     if (bridge.mode === "readonly") {
-      disableSaveButtons(true);
+      applySaveAvailability();
       disableConfigEditing();
       if (bridge.support.reason === "io_missing") {
         showBanner(
@@ -1057,12 +1167,13 @@
           [{ label: "知道了", onClick: hideBanner }],
         );
       } else {
-        showBanner("err", "无法确认模块安装目录，已禁用命令执行与保存。", [{ label: "知道了", onClick: hideBanner }]);
+        showBanner("err", "moduleInfo() 给出的模块目录不可信：已禁用需要 CLI 的命令与保存（固定路径日志仍可读取）。", [{ label: "知道了", onClick: hideBanner }]);
       }
     }
 
-    loadAll().then(function () {
+    return loadAll().then(function () {
       reloadLogIfDiagnose();
+      applySaveAvailability();
     });
   }
 
@@ -1078,6 +1189,21 @@
         onClick: hideBanner,
       },
     ]);
+  }
+
+  var ui = {
+    init: init,
+    state: state,
+    bridge: bridge,
+    saveConfig: saveConfig,
+    saveEnabledOnly: saveEnabledOnly,
+    applySaveAvailability: applySaveAvailability,
+    loadAll: loadAll,
+  };
+
+  // 仅测试环境导出（生产 WebView 没有 module，导出分支不会执行；页面行为不变）。
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = ui;
   }
 
   if (document.readyState === "loading") {

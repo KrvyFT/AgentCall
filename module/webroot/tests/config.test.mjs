@@ -6,7 +6,6 @@ const require = createRequire(import.meta.url);
 const B = require("../bridge.js");
 
 const SECRET = "sk-live-DO-NOT-LEAK-9f8e7d6c";
-const CTL = "/data/adb/modules/agentcall/bin/agentcallctl";
 
 function redacted(overrides, secrets) {
   return {
@@ -430,5 +429,107 @@ test("成功保存后表单按后端回读重建（密钥输入被清空、意�
   assert.equal(result.form.asr.secretState, "CONFIGURED");
   assert.equal(result.form.enabled, true);
   assert.equal(JSON.stringify(result.form).includes(SECRET), false);
-  assert.equal(CTL.includes("/bin/"), true);
+});
+
+
+test("保存可用性状态机：只有真实桥 + 已加载基线 + 非保存中才允许保存按钮", () => {
+  const ready = B.computeSaveAvailability({ mode: "kernelsu", canSave: true, loaded: true, saving: false, revision: 4 });
+  assert.deepEqual(ready, { enabled: true, reason: "ready" });
+
+  const cases = [
+    [{ mode: "demo" }, "demo"],
+    [{ mode: "readonly", canSave: false }, "readonly"],
+    [{ mode: "kernelsu", canSave: true, loaded: false, revision: null }, "not_loaded"],
+    [{ mode: "kernelsu", canSave: true, loaded: true, revision: null }, "revision_unknown"],
+    [{ mode: "kernelsu", canSave: true, loaded: true, saving: true, revision: 4 }, "saving"],
+  ];
+  for (const [input, reason] of cases) {
+    const state = B.computeSaveAvailability(input);
+    assert.equal(state.enabled, false, JSON.stringify(input));
+    assert.equal(state.reason, reason, JSON.stringify(input));
+  }
+});
+
+test("页面保存作用域：规则页补丁只含规则字段，绝不夹带 AI 密钥意图", () => {
+  const form = newForm({ revision: 5 });
+  form.asr.baseUrl = "https://api.example.com/v1";
+  form.asr.model = "whisper-1";
+  form.asr.secretIntent = "replace";
+  form.asr.secretValue = SECRET;
+  form.openingLine = "未保存的对话页草稿";
+  form.speed = "1.3";
+
+  const built = B.buildConfigPatch(form, redacted({ revision: 5 }), "rules");
+  assert.equal(built.ok, true);
+  assert.deepEqual(Object.keys(built.write.patch).sort(), ["answerDelayMs", "blacklist", "handleUnknownNumbers", "maxCallDurationMs", "mode", "region", "whitelist"]);
+  assert.equal(JSON.stringify(built.write.patch).includes(SECRET), false);
+  assert.equal("enabled" in built.write.patch, false, "页面保存不写总开关");
+  assert.equal(built.write.expectedRevision, 5);
+});
+
+test("页面保存作用域：AI 页补丁不含规则/对话字段，含显式密钥意图", () => {
+  const form = newForm({ revision: 2 });
+  form.asr.baseUrl = "https://api.example.com/v1";
+  form.asr.model = "whisper-1";
+  form.asr.secretIntent = "replace";
+  form.asr.secretValue = SECRET;
+  form.tts.secretIntent = "clear";
+  form.voice = "alloy";
+
+  const built = B.buildConfigPatch(form, redacted({ revision: 2 }), "ai");
+  assert.equal(built.ok, true);
+  assert.deepEqual(Object.keys(built.write.patch).sort(), ["asr", "llm", "secrets", "tts", "voice"]);
+  assert.deepEqual(built.write.patch.secrets.ASR, { action: "replace", value: SECRET });
+  assert.deepEqual(built.write.patch.secrets.TTS, { action: "clear" });
+  assert.deepEqual(built.write.patch.secrets.LLM, { action: "keep" });
+  assert.equal("mode" in built.write.patch, false);
+  assert.equal("region" in built.write.patch, false);
+});
+
+test("页面保存作用域：对话页补丁只含对话字段", () => {
+  const form = newForm({ revision: 3 });
+  form.blacklistText = "not-a-number";
+  form.openingLine = "您好。";
+  form.prompt = "只做对话。";
+  form.speed = "1.25";
+
+  const built = B.buildConfigPatch(form, redacted({ revision: 3 }), "dialog");
+  assert.equal(built.ok, true, "规则页的非法名单不应阻止对话页保存");
+  assert.deepEqual(Object.keys(built.write.patch).sort(), ["openingLine", "prompt", "speed"]);
+  assert.equal(built.write.patch.speed, 1.25);
+});
+
+test("页面保存作用域：只校验本页字段，阻止项按页返回", () => {
+  const form = newForm({ revision: 1 });
+  form.asr.baseUrl = "http://insecure.example.com";
+  form.asr.model = "whisper-1";
+  form.blacklistText = "not-a-number";
+
+  const rules = B.buildConfigPatch(form, redacted({ revision: 1 }), "rules");
+  assert.equal(rules.ok, false);
+  assert.deepEqual(codes(rules.blocking), ["RULE_NUMBER_UNPARSEABLE"]);
+
+  const ai = B.buildConfigPatch(form, redacted({ revision: 1 }), "ai");
+  assert.equal(ai.ok, false);
+  assert.deepEqual(codes(ai.blocking), ["ENDPOINT_HTTPS_REQUIRED"]);
+
+  const dialog = B.buildConfigPatch(form, redacted({ revision: 1 }), "dialog");
+  assert.equal(dialog.ok, true, "其它页面的非法字段不得阻止对话页保存");
+});
+
+test("页面保存作用域沿用同一 expectedRevision CAS 基线", async () => {
+  const calls = [];
+  const bridge = {
+    mode: "kernelsu",
+    call(operation, payload) {
+      calls.push({ operation, payload });
+      return Promise.resolve({ ok: true, source: "bridge", data: redacted({ revision: 6 }) });
+    },
+  };
+  const form = newForm({ revision: 5 });
+  const result = await B.saveConfig(bridge, form, redacted({ revision: 5 }), "rules");
+  assert.equal(result.ok, true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].payload.expectedRevision, 5);
+  assert.equal("secrets" in calls[0].payload.patch, false);
 });

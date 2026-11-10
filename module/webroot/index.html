@@ -11,26 +11,28 @@
 <body>
 <noscript><p class="noscript">此页面需要启用 JavaScript 才能读取 AgentCall 配置。</p></noscript>
 
-<header class="app-header">
-  <div class="app-title">
-    <h1>AgentCall</h1>
-    <span id="mode-badge" class="badge badge-neutral">正在检测…</span>
-  </div>
-  <p id="mode-note" class="mode-note"></p>
-</header>
+<div class="topbar">
+  <header class="app-header">
+    <div class="app-title">
+      <h1>AgentCall</h1>
+      <span id="mode-badge" class="badge badge-neutral">正在检测…</span>
+    </div>
+    <p id="mode-note" class="mode-note"></p>
+  </header>
+
+  <nav class="tabs" id="tabs" aria-label="页面切换">
+    <button type="button" class="tab is-active" data-page="overview" aria-current="page">概览</button>
+    <button type="button" class="tab" data-page="rules">规则</button>
+    <button type="button" class="tab" data-page="ai">AI</button>
+    <button type="button" class="tab" data-page="dialog">对话</button>
+    <button type="button" class="tab" data-page="diag">诊断</button>
+  </nav>
+</div>
 
 <div id="banner" class="banner" hidden>
   <p id="banner-text" class="banner-text"></p>
   <div id="banner-actions" class="banner-actions"></div>
 </div>
-
-<nav class="tabs" id="tabs" aria-label="页面切换">
-  <button type="button" class="tab is-active" data-page="overview" aria-current="page">概览</button>
-  <button type="button" class="tab" data-page="rules">规则</button>
-  <button type="button" class="tab" data-page="ai">AI</button>
-  <button type="button" class="tab" data-page="dialog">对话</button>
-  <button type="button" class="tab" data-page="diag">诊断</button>
-</nav>
 
 <main class="content">
 
@@ -52,16 +54,15 @@
         <span id="ov-enabled-state" class="value">—</span>
         <button type="button" class="btn btn-primary btn-small" id="ov-save-switch" disabled>保存开关</button>
       </div>
-      <ul class="issues" id="ov-issues"></ul>
     </div>
 
     <div class="card">
       <div class="card-label">Google 电话默认角色</div>
       <div class="card-row">
-        <span id="ov-dialer-role" class="value">未检测</span>
-        <span class="badge badge-warn">未验证</span>
+        <span id="ov-dialer-role" class="value">未知（后端未提供）</span>
+        <span id="ov-dialer-badge" class="badge badge-neutral">未知</span>
       </div>
-      <p class="card-hint" id="ov-dialer-note">当前固定 CLI 不读取默认拨号角色；该检查属于 APK 启动向导，未获得设备证据前不会显示“已就绪”。</p>
+      <p class="card-hint" id="ov-dialer-note">该值由桥接/APK 后端上报；当前固定 CLI 的 status 不提供默认拨号角色。未获得真实值前只显示“未知”，不显示伪结论。</p>
     </div>
 
     <div class="card">
@@ -82,10 +83,10 @@
     <div class="card">
       <div class="card-label">Hook 连通性</div>
       <div class="card-row">
-        <span id="ov-hook-state" class="value">无法确认</span>
-        <span class="badge badge-warn">未验证</span>
+        <span id="ov-hook-state" class="value">未知（后端未提供）</span>
+        <span id="ov-hook-badge" class="badge badge-neutral">未知</span>
       </div>
-      <p class="card-hint" id="ov-hook-note">固定 CLI 的 status 只报告桥接自身的连接统计，不提供 Hook 心跳；Hook 侧状态由 APK 会话与诊断上报。</p>
+      <p class="card-hint" id="ov-hook-note">固定 CLI 的 status 只报告桥接自身的连接统计，不提供 Hook 心跳；未获得真实值前显示“未知”，不伪造“已连接/未连接”。</p>
     </div>
 
     <div class="card">
@@ -187,7 +188,7 @@
 
     <ul class="issues" id="rules-issues"></ul>
     <div class="actions">
-      <button type="button" class="btn btn-primary" id="rules-save">保存规则</button>
+      <button type="button" class="btn btn-primary" id="rules-save" disabled>保存规则</button>
     </div>
   </section>
 
@@ -195,7 +196,22 @@
     <h2 id="h-ai">AI <span id="ai-dirty" class="chip chip-dirty" hidden>未保存</span></h2>
 
     <div class="notice notice-warn">
-      密钥只显示“已配置/未配置”，不显示原值。真实连通性测试会使用你的密钥向所填地址发起真实请求并可能计费；WebUI 无法读取密钥，因此真实测试必须在 AgentCall APK 内执行（本页不代为发起）。
+      密钥只显示“已配置/未配置”，不显示原值。本页只校验地址格式，不发起任何远程请求。
+    </div>
+
+    <div class="card" id="ai-live-test">
+      <div class="card-row">
+        <div>
+          <div class="card-label">连接测试</div>
+          <div class="card-hint" id="ai-live-test-note">连接测试在 AgentCall APK 诊断页执行，需真实远程 API 请求（会使用密钥并可能计费）；WebUI 不发起远程请求，也不伪造测试结果。</div>
+        </div>
+        <span id="ai-live-test-state" class="badge badge-neutral">未实现（需 APK 端）</span>
+      </div>
+      <ol class="steps" id="ai-live-test-steps">
+        <li>在 AgentCall APK 的启动向导/诊断页完成 root、Hook 与默认拨号角色检查。</li>
+        <li>在 APK 内保存三项 API 配置与密钥（WebUI 的密钥通道只负责写入，不读取原值）。</li>
+        <li>在 APK 诊断页对每个端点执行连接测试；测试会发出真实请求，结果只在 APK 内展示。</li>
+      </ol>
     </div>
 
     <div class="card" data-endpoint="asr">
@@ -220,7 +236,7 @@
         <input type="password" id="ai-asr-secret" autocomplete="off" spellcheck="false">
       </div>
       <div class="card-row card-row-end">
-        <button type="button" class="btn btn-secondary btn-small" id="ai-asr-test">校验地址格式</button>
+        <button type="button" class="btn btn-secondary btn-small" id="ai-asr-test">校验地址格式（非连接测试）</button>
       </div>
       <ul class="issues" id="ai-asr-issues"></ul>
     </div>
@@ -247,7 +263,7 @@
         <input type="password" id="ai-llm-secret" autocomplete="off" spellcheck="false">
       </div>
       <div class="card-row card-row-end">
-        <button type="button" class="btn btn-secondary btn-small" id="ai-llm-test">校验地址格式</button>
+        <button type="button" class="btn btn-secondary btn-small" id="ai-llm-test">校验地址格式（非连接测试）</button>
       </div>
       <ul class="issues" id="ai-llm-issues"></ul>
     </div>
@@ -274,7 +290,7 @@
         <input type="password" id="ai-tts-secret" autocomplete="off" spellcheck="false">
       </div>
       <div class="card-row card-row-end">
-        <button type="button" class="btn btn-secondary btn-small" id="ai-tts-test">校验地址格式</button>
+        <button type="button" class="btn btn-secondary btn-small" id="ai-tts-test">校验地址格式（非连接测试）</button>
       </div>
       <ul class="issues" id="ai-tts-issues"></ul>
     </div>
@@ -288,7 +304,7 @@
 
     <ul class="issues" id="ai-issues"></ul>
     <div class="actions">
-      <button type="button" class="btn btn-primary" id="ai-save">保存 AI 配置</button>
+      <button type="button" class="btn btn-primary" id="ai-save" disabled>保存 AI 配置</button>
     </div>
   </section>
 
@@ -313,7 +329,7 @@
 
     <ul class="issues" id="dlg-issues"></ul>
     <div class="actions">
-      <button type="button" class="btn btn-primary" id="dlg-save">保存对话配置</button>
+      <button type="button" class="btn btn-primary" id="dlg-save" disabled>保存对话配置</button>
     </div>
   </section>
 
@@ -329,7 +345,6 @@
         <button type="button" class="btn btn-warn btn-small" id="diag-disable">停用自动接管</button>
         <button type="button" class="btn btn-danger btn-small" id="diag-shutdown">关闭桥接服务</button>
       </div>
-      <ul class="issues" id="diag-issues"></ul>
     </div>
 
     <div class="card">

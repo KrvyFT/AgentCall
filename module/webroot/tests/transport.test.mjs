@@ -4,14 +4,12 @@ import { createRequire } from "node:module";
 import { readFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { fakeManager, CTL, INBOX, LOG_PATH, MODULE_DIR } from "./fake-manager.mjs";
 
 const require = createRequire(import.meta.url);
 const B = require("../bridge.js");
 
-const CTL = "/data/adb/modules/agentcall/bin/agentcallctl";
-const INBOX = "/data/adb/agentcall/inbox/config-set.json";
 const SECRET = "sk-live-DO-NOT-LEAK-9f8e7d6c";
-const MODULE_DIR = "/data/adb/modules/agentcall";
 
 function redacted(overrides, secrets) {
   const config = Object.assign(
@@ -40,86 +38,6 @@ function redacted(overrides, secrets) {
     config,
     secrets: secrets || { ASR: "MISSING", LLM: "MISSING", TTS: "MISSING" },
   });
-}
-
-/**
- * 只模拟 KernelSU 管理器文档化的注入接口（WebViewInterface.kt / js/index.js）：
- * exec(cmd, optionsJson, callbackName) 与 io().version()/File()/FileOutputStream()。
- * 绝不接触真实 shell。
- */
-function fakeManager(options) {
-  const opts = options || {};
-  const commands = [];
-  const files = new Map();
-  const writes = [];
-  const dirs = new Set();
-  const handlers = opts.handlers || {};
-
-  const io = {
-    version: () => 1,
-    File(path) {
-      return {
-        exists: () => files.has(path) || dirs.has(path),
-        isFile: () => files.has(path),
-        isDirectory: () => dirs.has(path),
-        mkdirs: () => {
-          dirs.add(path);
-          return true;
-        },
-        delete: () => files.delete(path),
-        isSymlink: () => false,
-        setReadable: () => true,
-        setWritable: () => true,
-      };
-    },
-    FileOutputStream() {
-      const streams = new Map();
-      return {
-        open(path) {
-          const id = "stream-" + (streams.size + 1);
-          streams.set(id, { path, chunks: [] });
-          return id;
-        },
-        write(id, base64) {
-          const stream = streams.get(id);
-          if (!stream) return false;
-          stream.chunks.push(base64);
-          return true;
-        },
-        flush: () => true,
-        close(id) {
-          const stream = streams.get(id);
-          if (!stream) return false;
-          const text = Buffer.from(stream.chunks.join(""), "base64").toString("utf8");
-          files.set(stream.path, text);
-          writes.push({ path: stream.path, text });
-          return true;
-        },
-      };
-    },
-  };
-
-  const ksu = {
-    exec(command, optionsJson, callbackName) {
-      commands.push(command);
-      const tokens = command.split(/\s+/);
-      const op = tokens[1];
-      const handler = handlers[op];
-      const result = typeof handler === "function" ? handler(command) : handler || { errno: 0, stdout: "{}", stderr: "" };
-      setTimeout(() => {
-        if (typeof globalThis[callbackName] === "function") {
-          globalThis[callbackName](result.errno, result.stdout, result.stderr);
-        }
-      }, 0);
-    },
-  };
-
-  if (opts.moduleInfo !== false) {
-    ksu.moduleInfo = () => JSON.stringify({ id: "agentcall", moduleDir: opts.moduleDir || MODULE_DIR });
-  }
-  if (opts.io !== false) ksu.io = () => io;
-
-  return { ksu, commands, files, writes, dirs, io };
 }
 
 function bridgeWith(fake) {
@@ -162,6 +80,10 @@ test("管理器缺少 io 受控文件接口：读取可用，写入被拒绝且�
   assert.equal(save.ok, false);
   assert.equal(save.code, "secret_transport_unsupported");
   assert.equal(fake.commands.some((c) => c.includes("config-set")), false);
+
+  const log = await bridge.readLog();
+  assert.equal(log.ok, false);
+  assert.equal(log.code, "io_unavailable");
 });
 
 test("真实桥：密钥只经 root 私有文件 stdin 传输，绝不出现在 argv/日志/URL", async () => {
@@ -211,6 +133,30 @@ test("真实桥：密钥只经 root 私有文件 stdin 传输，绝不出现在 
   assert.equal(logText.includes(secretBase64), false);
 });
 
+test("inbox 目录由 WebUI 显式收紧为 0700（ownerOnly 读写执行、组/其它无权限）", async () => {
+  const fake = fakeManager({ handlers: { "config-set": () => ({ errno: 0, stdout: redacted({ revision: 1 }), stderr: "" }) } });
+  const result = await bridgeWith(fake).call("config-set", { expectedRevision: 0, patch: { enabled: false } });
+  assert.equal(result.ok, true);
+  assert.equal(fake.dirs.has(B.INBOX_DIR), true, "必须创建 inbox 目录");
+  const flags = fake.perms.filter((entry) => entry.path === B.INBOX_DIR);
+  for (const kind of ["readable", "writable", "executable"]) {
+    assert.ok(
+      flags.some((entry) => entry.kind === kind && entry.value === true && entry.ownerOnly === true),
+      "目录必须以 ownerOnly 方式设置 " + kind,
+    );
+  }
+});
+
+test("写入中途失败时删除半成品 inbox 负载（文档承诺“总是删除”）", async () => {
+  const fake = fakeManager({ failFlush: true, handlers: statusHandler });
+  const bridge = bridgeWith(fake);
+  const result = await bridge.call("config-set", { expectedRevision: 0, patch: { enabled: true } });
+  assert.equal(result.ok, false);
+  assert.equal(result.code, "inbox_write_failed");
+  assert.equal(fake.files.has(INBOX), false, "失败后不得留下含密钥的半成品文件");
+  assert.equal(fake.commands.length, 0, "写入失败时不得执行 config-set");
+});
+
 test("保存只有在后端回读确认新 revision 与密钥状态后才算成功", async () => {
   const unchanged = fakeManager({
     handlers: {
@@ -237,7 +183,7 @@ test("保存只有在后端回读确认新 revision 与密钥状态后才算成�
   assert.equal(second.code, "save_unconfirmed");
 });
 
-test("CAS 冲突不覆盖：只发一次写请求，不自动重试或抬升 revision", async () => {
+test("CAS 冲突不覆盖：只发一次写请求，不自动重试或抬升 revision，临时文件仍被删除", async () => {
   const conflict = fakeManager({
     handlers: {
       "config-set": () => ({
@@ -257,6 +203,7 @@ test("CAS 冲突不覆盖：只发一次写请求，不自动重试或抬升 rev
   assert.equal(result.conflict, true);
   assert.equal(conflict.commands.length, 1);
   assert.equal(bridge.lastKnownRevision(), null);
+  assert.equal(conflict.files.has(INBOX), false);
 });
 
 test("未知操作、参数走私与非法负载都在执行前被拒绝", async () => {
@@ -299,13 +246,83 @@ test("未知操作、参数走私与非法负载都在执行前被拒绝", async
   assert.deepEqual(fake.commands, []);
 });
 
-test("模块目录不可信时拒绝执行任何命令（fail closed）", async () => {
+test("moduleInfo 给出的模块目录不可信时拒绝执行命令（fail closed）", async () => {
   const fake = fakeManager({ moduleDir: "/tmp/attacker" });
   const bridge = bridgeWith(fake);
   const result = await bridge.call("status");
   assert.equal(result.ok, false);
   assert.equal(result.code, "module_dir_unresolved");
   assert.deepEqual(fake.commands, []);
+});
+
+test("moduleInfo 存在但缺少 moduleDir（版本偏差）时回退固定模块路径，而不是拒绝所有命令", async () => {
+  for (const moduleInfo of [{ id: "agentcall", version: "1.0" }, {}, () => JSON.stringify({ id: "agentcall" })]) {
+    const fake = fakeManager({ moduleInfo, handlers: statusHandler });
+    const bridge = bridgeWith(fake);
+    assert.equal(bridge.mode, "kernelsu", "缺少 moduleDir 不得降级为只读");
+    assert.equal(bridge.support.moduleDir, MODULE_DIR);
+    const status = await bridge.call("status");
+    assert.equal(status.ok, true);
+    assert.equal(fake.commands[0], CTL + " status");
+  }
+});
+
+test("moduleInfo 抛错或返回非法 JSON 时也回退固定模块路径", async () => {
+  for (const moduleInfo of [
+    () => {
+      throw new Error("manager version skew");
+    },
+    () => "not-json",
+    () => 42,
+  ]) {
+    const fake = fakeManager({ moduleInfo, handlers: statusHandler });
+    const bridge = bridgeWith(fake);
+    assert.equal(bridge.mode, "kernelsu");
+    assert.equal(bridge.support.moduleDir, MODULE_DIR);
+    assert.equal((await bridge.call("status")).ok, true);
+  }
+});
+
+test("io 版本为 0：视为没有受控文件接口（readonly io_missing），保存被拒绝", async () => {
+  const fake = fakeManager({ ioVersion: 0, handlers: statusHandler });
+  const bridge = bridgeWith(fake);
+  assert.equal(bridge.mode, "readonly");
+  assert.equal(bridge.support.reason, "io_missing");
+  assert.equal(bridge.support.ioVersion, 0);
+  assert.equal(bridge.support.hasIo, false);
+
+  const save = await bridge.call("config-set", { expectedRevision: 0, patch: { enabled: true } });
+  assert.equal(save.ok, false);
+  assert.equal(save.code, "secret_transport_unsupported");
+  assert.equal(fake.commands.some((command) => command.indexOf(" config-set ") !== -1), false);
+});
+
+test("readLog 通过 RandomAccessFile 读取尾部并标记 truncated，且做脱敏", async () => {
+  const fake = fakeManager({ logText: "prefix\napi_key=sk-live-abcdefgh" });
+  const bridge = bridgeWith(fake);
+  const result = await bridge.readLog(24);
+  assert.equal(result.ok, true);
+  assert.equal(result.truncated, true);
+  assert.equal(result.text, "api_key=***", "只读尾部 24 字节，密钥被脱敏");
+  assert.equal(fake.commands.length, 0, "读日志不得执行 shell 命令");
+});
+
+test("没有 RandomAccessFile 时 readLog 回退 FileInputStream", async () => {
+  const fake = fakeManager({ randomAccess: false, logText: "hello agentcall log\n" });
+  const bridge = bridgeWith(fake);
+  const result = await bridge.readLog(4096);
+  assert.equal(result.ok, true);
+  assert.equal(result.truncated, false);
+  assert.equal(result.text, "hello agentcall log\n");
+});
+
+test("文件接口可用时，即使 moduleInfo 目录不可信也仍能读取固定路径日志", async () => {
+  const fake = fakeManager({ moduleDir: "/tmp/attacker", logText: "tail-of-log" });
+  const bridge = bridgeWith(fake);
+  assert.equal(bridge.support.reason, "module_dir_unresolved");
+  const result = await bridge.readLog();
+  assert.equal(result.ok, true);
+  assert.equal(result.text, "tail-of-log");
 });
 
 test("没有 moduleInfo 的旧管理器回退到固定模块路径，不拼接任何外部输入", async () => {
@@ -334,7 +351,7 @@ test("页面不做任何网络请求：密钥不可能进入 URL", async () => {
   assert.equal(fetchCalls, 0);
 });
 
-test("不受信任的 HTML 一律按文本呈现，绝不经由 innerHTML", () => {
+test("不受信任的 HTML 一律按文本呈现：setText 只写 textContent", () => {
   const payload = '<img src=x onerror="alert(1)"><b>粗体</b>';
   const element = {
     textContent: "",
@@ -347,7 +364,8 @@ test("不受信任的 HTML 一律按文本呈现，绝不经由 innerHTML", () =
   };
   B.setText(element, payload);
   assert.equal(element.textContent, payload);
-  assert.equal(B.escapeHtml('<a href="x">&</a>'), "&lt;a href=&quot;x&quot;&gt;&amp;&lt;/a&gt;");
+  // 转义 helper 已删除（此前无人使用）：展示层唯一通道是 textContent。
+  assert.equal("escapeHtml" in B, false);
 });
 
 test("静态资源不含在线 CDN、内联事件处理器，也不使用 innerHTML", () => {
@@ -369,3 +387,5 @@ test("静态资源不含在线 CDN、内联事件处理器，也不使用 innerH
   assert.equal(/<meta[^>]+name=["']viewport["']/i.test(html), true);
   assert.equal(/<script[^>]+src=["']bridge\.js["']/i.test(html), true);
 });
+
+// 渲染路径（DOM 层）由 app-ui.test.mjs 用极简 DOM 垫片真实执行；此处只保留静态扫描。
