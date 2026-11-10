@@ -1,0 +1,11 @@
+{
+  "id": "chatcmpl-fixture",
+  "object": "chat.completion",
+  "choices": [
+    {
+      "index": 0,
+      "message": { "role": "assistant", "content": "您好，这里是机主的 AI 助理，请讲。" },
+      "finish_reason": "stop"
+    }
+  ]
+}
