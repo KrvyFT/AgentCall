@@ -13,16 +13,19 @@ import org.krvyft.agentcall.bridge.diagnostics.DeviceProbe
 import org.krvyft.agentcall.bridge.diagnostics.ReflectiveAudioApiProbe
 import org.krvyft.agentcall.bridge.ipc.AndroidPackageIdentitySource
 import org.krvyft.agentcall.bridge.ipc.ControlServer
+import org.krvyft.agentcall.bridge.ipc.HookCommandRouter
 import org.krvyft.agentcall.bridge.ipc.PackageIdentitySource
 import org.krvyft.agentcall.bridge.ipc.PeerVerifier
 import org.krvyft.agentcall.bridge.ipc.RootFramework
 import org.krvyft.agentcall.bridge.ipc.RpcHandler
+import org.krvyft.agentcall.core.model.CallCommand
 import org.krvyft.agentcall.core.model.EndpointKind
 import org.krvyft.agentcall.core.model.PROTOCOL_VERSION
 import org.krvyft.agentcall.core.model.PeerIdentity
 import org.krvyft.agentcall.core.model.RpcError
 import org.krvyft.agentcall.core.model.RpcRequest
 import org.krvyft.agentcall.core.model.RpcResponse
+import org.krvyft.agentcall.core.model.SessionId
 import org.krvyft.agentcall.core.protocol.RolePolicy
 import org.krvyft.agentcall.core.protocol.RpcCodec
 
@@ -185,7 +188,20 @@ internal class ControlDispatcher(
     private val shutdown: CountDownLatch,
     private val startedAtMs: Long = System.currentTimeMillis(),
     private val connectionStats: () -> Pair<Int, Long> = { 0 to 0L },
+    private val hookCommands: HookCommandRouter = HookCommandRouter(),
 ) : RpcHandler {
+
+    /**
+     * 为某个 HOOK 会话排入一条受限通话命令；随该会话下一次 `hook.snapshot`/`hook.heartbeat`
+     * 的响应负载下发。Task 7 的 CallControl.send 经此进入 Hook，不在 bridge 内直接操作 Telecom。
+     * @return false 表示会话字段非法或队列饱和（有界失败）
+     */
+    fun enqueueHookCommand(session: SessionId, command: CallCommand): Boolean =
+        hookCommands.enqueueCommand(session, command)
+
+    /** 取走 Hook 已回报的命令结果（每条只返回一次）。 */
+    fun takeHookCommandResults(): List<HookCommandRouter.HookCommandOutcome> =
+        hookCommands.takeResults()
 
     override fun handle(peer: PeerIdentity, request: RpcRequest): RpcResponse = try {
         when (request.method) {
@@ -199,12 +215,13 @@ internal class ControlDispatcher(
                 shutdown.countDown()
                 ok(request, "{\"stopping\":true}")
             }
+            RolePolicy.METHOD_HOOK_SNAPSHOT,
+            RolePolicy.METHOD_HOOK_HEARTBEAT,
+            -> hookCommandLines(request)
+            RolePolicy.METHOD_CALL_COMMAND_RESULT -> hookCommandResult(request)
             RolePolicy.METHOD_SESSION_REQUEST,
             RolePolicy.METHOD_AUDIO_CHANNEL,
             RolePolicy.METHOD_HANDOVER,
-            RolePolicy.METHOD_HOOK_SNAPSHOT,
-            RolePolicy.METHOD_HOOK_HEARTBEAT,
-            RolePolicy.METHOD_CALL_COMMAND_RESULT,
             -> failure(request, "method_not_implemented", "session and audio routing are owned by a later task")
             else -> failure(request, "method_not_implemented", "method is not in the fixed command table")
         }
@@ -214,6 +231,26 @@ internal class ControlDispatcher(
     } catch (t: Exception) {
         // 其它异常的文本可能含路径：只回类名。
         failure(request, "internal_error", t.javaClass.simpleName)
+    }
+
+    /**
+     * `hook.snapshot`/`hook.heartbeat` 的响应：带回该会话的待执行命令行（可能为空）。
+     * 命令不在响应里执行，Hook 收到后仍要按自己的会话/代次/状态裁决。
+     */
+    private fun hookCommandLines(request: RpcRequest): RpcResponse {
+        val session = request.sessionId
+            ?: return failure(request, "payload_invalid", "hook calls must carry a session id")
+        return ok(request, hookCommands.drainCommandLines(session))
+    }
+
+    /** `call.command.result`：解析并暂存真实结果，供 APP 侧 CallControl.send 取走。 */
+    private fun hookCommandResult(request: RpcRequest): RpcResponse {
+        val session = request.sessionId
+            ?: return failure(request, "payload_invalid", "hook calls must carry a session id")
+        if (!hookCommands.recordResult(session, request.payload)) {
+            return failure(request, "payload_invalid", "command result payload is invalid")
+        }
+        return ok(request, "")
     }
 
     private fun statusPayload(): String {
