@@ -13,6 +13,8 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.krvyft.agentcall.core.model.AgentConfig
@@ -34,6 +36,7 @@ import org.krvyft.agentcall.core.port.AudioSession
 import org.krvyft.agentcall.core.port.CallControl
 import org.krvyft.agentcall.core.port.ConversationPort
 import org.krvyft.agentcall.core.port.MonotonicClock
+import org.krvyft.agentcall.core.session.LeaseRegistry
 
 /**
  * APK 侧会话协调器的 JVM 测试（虚拟调度器 + 假端口）。
@@ -64,6 +67,8 @@ class SessionCoordinatorTest {
     private fun ringing(session: SessionId): CallSnapshot = snapshot(session, CallState.RINGING)
 
     private fun active(session: SessionId): CallSnapshot = snapshot(session, CallState.ACTIVE)
+
+    private fun disconnected(session: SessionId): CallSnapshot = snapshot(session, CallState.DISCONNECTED)
 
     private fun snapshot(session: SessionId, state: CallState): CallSnapshot = CallSnapshot(
         id = session,
@@ -260,6 +265,281 @@ class SessionCoordinatorTest {
         }
     }
 
+    // ------------------------------------------------------------------ 撤销未确认：不得显示交还成功（IMPORTANT 3）
+
+    /**
+     * 撤销失败（bridge 回 revoke_failed）时：不停止本地音频、不广播交还、状态留在 HANDOFF。
+     * spec §8：撤销失败不得显示交还成功。
+     */
+    @Test
+    fun revokeFailedNeverShowsHandbackSuccess() = runTest {
+        assertRevokeFailureKeepsHandoff(RevokeOutcome.REVOKE_FAILED)
+    }
+
+    /** 撤销不可用（bridge 不可达）与失败同等对待：保持隔离、只诊断。 */
+    @Test
+    fun revokeUnavailableNeverShowsHandbackSuccess() = runTest {
+        assertRevokeFailureKeepsHandoff(RevokeOutcome.UNAVAILABLE)
+    }
+
+    /**
+     * 在途的 session.request（最长 4000 ms，客户端预算更长）还没落地时，撤销必须等它；
+     * 等满 commandSettleTimeoutMs 仍不落地就放弃撤销（不抢在授权之前），绝不恢复声音。
+     */
+    @Test
+    fun unsettledAnswerAbortsTheHandbackInsteadOfRacingIt() = runTest {
+        val events = mutableListOf<String>()
+        val lateAnswer = CompletableDeferred<CommandResult>()
+        val calls = FakeCallControl(lateAnswer = lateAnswer)
+        val audio = FakeAudioBridge(events)
+        val conversation = FakeConversation(events)
+        val revoker = FakeRevoker(events)
+        val observer = RecordingObserver(events)
+        val coordinator = coordinator(calls, audio, conversation, revoker, observer)
+        coordinator.start()
+        try {
+            coordinator.onEvent(SessionEvent.StateChanged(ringing(sessionA)))
+            coordinator.onEvent(SessionEvent.ReadyChanged(true))
+            advance(3_100)
+            assertEquals(listOf(SentCommand(sessionA, CallCommand.Answer)), calls.sent)
+
+            // 接听结果迟迟不回；此时用户接管：撤销必须等这条在途请求。
+            coordinator.onEvent(SessionEvent.Takeover(TakeoverReason.USER_REQUESTED))
+            advance(100)
+            assertTrue("the revoke must wait for the in-flight answer", revoker.revoked.isEmpty())
+
+            advance(SessionCoordinator.COMMAND_SETTLE_TIMEOUT_MS + 200)
+            assertEquals(SessionState.HANDOFF, coordinator.state)
+            assertTrue("the revoke must never race the in-flight authorization", revoker.revoked.isEmpty())
+            assertTrue("no handback may be reported", observer.handedBack.isEmpty())
+            assertTrue(
+                "no local audio may be stopped without a confirmed revoke",
+                events.none { it.startsWith("audio.") || it.startsWith("restored") || it.startsWith("conversation.") },
+            )
+            assertTrue(
+                "the unsettled command must be diagnosed, got " + observer.diagnostics,
+                "handback_command_unsettled" in observer.diagnostics,
+            )
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    // ------------------------------------------------------------------ 安全输入不可丢（IMPORTANT 5）
+
+    /**
+     * 有界队列饱和时（消费端正卡在撤销等待里），Takeover/断开通话这类安全输入绝不丢弃：
+     * 丢掉一条断开通话会让状态永远停在 HANDOFF，丢掉 Takeover 会让用户以为接管了却没人撤权。
+     */
+    @Test
+    fun safetyInputsAreNeverDroppedUnderQueueSaturation() = runTest {
+        val events = mutableListOf<String>()
+        val gate = CompletableDeferred<Unit>()
+        val calls = FakeCallControl()
+        val audio = FakeAudioBridge(events)
+        val conversation = FakeConversation(events)
+        val revoker = FakeRevoker(events, gate = gate)
+        val observer = RecordingObserver(events)
+        val coordinator = coordinator(calls, audio, conversation, revoker, observer)
+        coordinator.start()
+        try {
+            coordinator.onEvent(SessionEvent.StateChanged(ringing(sessionA)))
+            coordinator.onEvent(SessionEvent.ReadyChanged(true))
+            advance(3_100)
+            coordinator.onEvent(SessionEvent.StateChanged(active(sessionA)))
+            advance(100)
+            assertEquals(SessionState.ACTIVE_AI, coordinator.state)
+
+            // 人工接管：消费端卡在撤销等待里（gate 未放行）。
+            coordinator.onEvent(SessionEvent.Takeover(TakeoverReason.USER_REQUESTED))
+            runCurrent()
+            assertEquals(listOf(sessionA), revoker.revoked)
+
+            // 灌满有界队列：只有 Tick 允许被丢弃。
+            repeat(200) { coordinator.onEvent(SessionEvent.Tick) }
+            assertTrue("the bounded queue must actually be saturated", coordinator.droppedInputCount > 0)
+
+            // 饱和期间到达的安全输入。
+            coordinator.onEvent(SessionEvent.StateChanged(disconnected(sessionA)))
+
+            gate.complete(Unit)
+            advance(100)
+
+            assertTrue(
+                "a disconnected call must still end after saturation",
+                observer.states.contains(sessionA to SessionState.ENDED),
+            )
+            assertNull("the session must be retired after ENDED", coordinator.activeSession)
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    // ------------------------------------------------------------------ 配置热更新（IMPORTANT 6）
+
+    /**
+     * 总开关在通话中被关闭：同一条串行消费者立即让 reducer 生效——取消 AI 会话、下发挂断、
+     * 撤销所有权（ENDING），而不是等 180 s 上限或重建协调器。
+     */
+    @Test
+    fun masterSwitchOffTerminatesAnActiveCallImmediately() = runTest {
+        val events = mutableListOf<String>()
+        val calls = FakeCallControl()
+        val audio = FakeAudioBridge(events)
+        val conversation = FakeConversation(events)
+        val revoker = FakeRevoker(events)
+        val observer = RecordingObserver(events)
+        val coordinator = coordinator(calls, audio, conversation, revoker, observer)
+        coordinator.start()
+        try {
+            coordinator.onEvent(SessionEvent.StateChanged(ringing(sessionA)))
+            coordinator.onEvent(SessionEvent.ReadyChanged(true))
+            advance(3_100)
+            coordinator.onEvent(SessionEvent.StateChanged(active(sessionA)))
+            advance(100)
+            assertEquals(SessionState.ACTIVE_AI, coordinator.state)
+            assertEquals(listOf("audio.opened:call-a", "conversation.started:call-a"), events)
+
+            coordinator.onConfigChanged(config.copy(enabled = false))
+            advance(100)
+
+            assertEquals("the master switch must end the AI call", SessionState.ENDING, coordinator.state)
+            assertEquals(
+                "answer once, then exactly one hangup",
+                listOf(
+                    SentCommand(sessionA, CallCommand.Answer),
+                    SentCommand(sessionA, CallCommand.Hangup),
+                ),
+                calls.sent,
+            )
+            assertTrue("the AI conversation must stop", "conversation.cancelled:call-a" in events)
+            assertEquals(listOf(sessionA), revoker.revoked)
+            assertTrue(
+                "the microphone stays isolated until the disconnect is confirmed",
+                events.none { it.startsWith("audio.stopped") },
+            )
+
+            // 真实断开确认之后才恢复人工路由并结束。
+            coordinator.onEvent(SessionEvent.StateChanged(disconnected(sessionA)))
+            advance(100)
+            assertEquals(listOf(sessionA), observer.handedBack)
+            assertTrue("audio must be released after the disconnect", events.contains("audio.stopped:call-a"))
+            assertTrue(observer.states.contains(sessionA to SessionState.ENDED))
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    // ------------------------------------------------------------------ 关闭语义/ENDED 去重（minors）
+
+    /** close() 必须停掉当前音频、撤销本地租约，并拒绝关闭后的 start()/onEvent()。 */
+    @Test
+    fun closeStopsAudioRevokesTheLeaseAndRejectsLateStart() = runTest {
+        val events = mutableListOf<String>()
+        val calls = FakeCallControl()
+        val audio = FakeAudioBridge(events)
+        val conversation = FakeConversation(events)
+        val leases = LeaseRegistry()
+        val coordinator = coordinator(
+            calls, audio, conversation, FakeRevoker(events), RecordingObserver(events), leases = leases,
+        )
+        coordinator.start()
+        try {
+            coordinator.onEvent(SessionEvent.StateChanged(ringing(sessionA)))
+            coordinator.onEvent(SessionEvent.ReadyChanged(true))
+            advance(3_100)
+            coordinator.onEvent(SessionEvent.StateChanged(active(sessionA)))
+            advance(100)
+            assertTrue(leases.isLive(sessionA))
+
+            coordinator.close()
+            runCurrent()
+
+            assertTrue("close() must stop the live audio session", events.contains("audio.stopped:call-a"))
+            assertFalse("close() must revoke the local lease", leases.isLive(sessionA))
+            assertNull(coordinator.activeSession)
+
+            val before = events.size
+            coordinator.start()
+            coordinator.onEvent(SessionEvent.StateChanged(ringing(sessionB)))
+            advance(5_000)
+            assertEquals("a closed coordinator must stay closed", before, events.size)
+            assertNull(coordinator.activeSession)
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    /** ENDED 只广播一次：reduceAndApply 与 retire 都不得各发一遍。 */
+    @Test
+    fun disconnectedCallEndsExactlyOnce() = runTest {
+        val events = mutableListOf<String>()
+        val observer = RecordingObserver(events)
+        val coordinator = coordinator(
+            FakeCallControl(), FakeAudioBridge(events), FakeConversation(events), FakeRevoker(events), observer,
+        )
+        coordinator.start()
+        try {
+            coordinator.onEvent(SessionEvent.StateChanged(ringing(sessionA)))
+            coordinator.onEvent(SessionEvent.ReadyChanged(true))
+            advance(3_100)
+            coordinator.onEvent(SessionEvent.StateChanged(active(sessionA)))
+            advance(100)
+
+            coordinator.onEvent(SessionEvent.StateChanged(disconnected(sessionA)))
+            advance(100)
+
+            val ended = observer.states.filter { it.first == sessionA && it.second == SessionState.ENDED }
+            assertEquals("ENDED must be broadcast exactly once, got " + observer.states, 1, ended.size)
+            assertNull(coordinator.activeSession)
+        } finally {
+            coordinator.close()
+        }
+    }
+
+    private fun TestScope.assertRevokeFailureKeepsHandoff(outcome: RevokeOutcome) {
+        val events = mutableListOf<String>()
+        val calls = FakeCallControl()
+        val audio = FakeAudioBridge(events)
+        val conversation = FakeConversation(events)
+        val revoker = FakeRevoker(events, outcome = outcome)
+        val observer = RecordingObserver(events)
+        val coordinator = coordinator(calls, audio, conversation, revoker, observer)
+        coordinator.start()
+        try {
+            coordinator.onEvent(SessionEvent.StateChanged(ringing(sessionA)))
+            coordinator.onEvent(SessionEvent.ReadyChanged(true))
+            advance(3_100)
+            coordinator.onEvent(SessionEvent.StateChanged(active(sessionA)))
+            advance(100)
+            assertEquals(SessionState.ACTIVE_AI, coordinator.state)
+
+            coordinator.onEvent(SessionEvent.Takeover(TakeoverReason.USER_REQUESTED))
+            advance(100)
+
+            assertEquals(
+                "the AI conversation must stop and be revoked, but nothing may be restored",
+                listOf(
+                    "audio.opened:call-a",
+                    "conversation.started:call-a",
+                    "conversation.cancelled:call-a",
+                    "revoked:call-a",
+                ),
+                events,
+            )
+            assertEquals("the call stays handed off", SessionState.HANDOFF, coordinator.state)
+            assertTrue("no handback may be reported", observer.handedBack.isEmpty())
+            assertTrue("no handback outcome may be published", observer.outcomes.isEmpty())
+            assertTrue(
+                "the blocked restore must be diagnosed, got " + observer.diagnostics,
+                "handback_restore_blocked" in observer.diagnostics,
+            )
+            assertTrue("manual takeover must never hang up", calls.sent.none { it.command == CallCommand.Hangup })
+        } finally {
+            coordinator.close()
+        }
+    }
+
     // ------------------------------------------------------------------ 装配
 
     private fun TestScope.coordinator(
@@ -268,13 +548,17 @@ class SessionCoordinatorTest {
         conversation: ConversationPort,
         revoker: OwnershipRevoker,
         observer: SessionObserver,
+        leases: LeaseRegistry = LeaseRegistry(),
+        heartbeat: HeartbeatPump = HeartbeatPump { },
     ): SessionCoordinator = SessionCoordinator(
         config = config,
         calls = calls,
         audio = audio,
         conversation = conversation,
         clock = MonotonicClock { testScheduler.currentTime },
+        leases = leases,
         revoker = revoker,
+        heartbeat = heartbeat,
         observer = observer,
         dispatcher = StandardTestDispatcher(testScheduler),
         tickIntervalMs = 1_000,
@@ -336,9 +620,14 @@ class SessionCoordinatorTest {
     private class FakeRevoker(
         private val events: MutableList<String>,
         private val outcome: RevokeOutcome = RevokeOutcome.CONFIRMED,
+        private val gate: CompletableDeferred<Unit>? = null,
     ) : OwnershipRevoker {
+        val revoked = mutableListOf<SessionId>()
+
         override suspend fun revoke(id: SessionId): RevokeOutcome {
+            revoked += id
             events += "revoked:" + id.callId
+            gate?.await()
             return outcome
         }
     }
@@ -346,11 +635,21 @@ class SessionCoordinatorTest {
     private class RecordingObserver(private val events: MutableList<String>) : SessionObserver() {
         val handedBack = mutableListOf<SessionId>()
         val outcomes = mutableListOf<RevokeOutcome>()
+        val states = mutableListOf<Pair<SessionId, SessionState>>()
+        val diagnostics = mutableListOf<String>()
+
+        override fun onStateChanged(id: SessionId, state: SessionState) {
+            states += id to state
+        }
 
         override fun onHandedBack(id: SessionId, outcome: RevokeOutcome) {
             handedBack += id
             outcomes += outcome
             events += "restored:" + id.callId
+        }
+
+        override fun onDiagnostic(code: String, id: SessionId?) {
+            diagnostics += code
         }
     }
 }

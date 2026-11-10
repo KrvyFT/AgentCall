@@ -25,6 +25,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import org.krvyft.agentcall.core.model.AudioFormatSpec
 import org.krvyft.agentcall.core.model.CallCommand
 import org.krvyft.agentcall.core.model.CommandResult
@@ -102,6 +103,52 @@ data class HandoverResult(
 )
 
 /**
+ * 控制请求的每方法超时预算（单一来源：生产 LocalSocket 传输与客户端兜底共用）。
+ *
+ * 为什么必须分方法：bridge 的 `session.request`（supervisor prepareAnswer）与
+ * `session.command`（APP_COMMAND_TIMEOUT_MS）都要等 HOOK 的真实结果，最长 4000 ms；
+ * 再加上 HOOK 心跳（2000 ms）与调度抖动。若控制 socket 用统一的 2 s 超时，一次“慢但成功”的
+ * Answer 会变成 null → [CommandResult.Failed](`bridge_unavailable`)，协调器据此认为接听
+ * 未被接受并交还人工——而 HOOK 其实已经接起了这通电话。反之，心跳/配置读取必须保持短超时，
+ * 失败要立刻回到调用方。
+ */
+object ControlTimeouts {
+
+    /** 心跳/配置读取的预算：本地一请求一响应，失败必须立刻回到调用方。 */
+    const val SHORT_TIMEOUT_MS: Int = 2_000
+
+    /** 会话类方法的预算：bridge 内部的 4000 ms 等待窗口 + 调度余量。 */
+    const val LONG_TIMEOUT_MS: Int = 8_000
+
+    /** 会话类预算的上界（防止被调成无限等待）。 */
+    const val MAX_LONG_TIMEOUT_MS: Int = 15_000
+
+    /** bridge 内部等 HOOK 结果的上限（跨模块事实：prepareAnswer / APP_COMMAND_TIMEOUT_MS）。 */
+    const val BRIDGE_COMMAND_WAIT_MS: Int = 4_000
+
+    /** 客户端兜底在传输预算之外多给的收尾余量。 */
+    const val CLIENT_GRACE_MS: Long = 1_000L
+
+    /**
+     * 某个方法允许的传输超时（ms）。
+     *
+     * 未知方法按短预算失败：宁可让一次未预期的方法快速失败，也不要占住控制通道。
+     */
+    fun timeoutMsFor(method: String): Int = when (method) {
+        RolePolicy.METHOD_SESSION_REQUEST,
+        RolePolicy.METHOD_SESSION_COMMAND,
+        RolePolicy.METHOD_HANDOVER,
+        RolePolicy.METHOD_AUDIO_CHANNEL,
+        -> LONG_TIMEOUT_MS
+
+        else -> SHORT_TIMEOUT_MS
+    }
+
+    /** 客户端兜底上限：始终晚于传输自身的预算，让 socket 超时先走正常的失败路径。 */
+    fun clientTimeoutMsFor(method: String): Long = timeoutMsFor(method) + CLIENT_GRACE_MS
+}
+
+/**
  * APP 角色的本地桥接客户端（spec §6.4 / Task 7B1）。
  *
  * 职责与边界：
@@ -111,8 +158,8 @@ data class HandoverResult(
  * - **接听裁决**：[send] 的 Answer 只走 **session.request**（监督端授权、取租约、隔离麦克风并
  *   下发接听），Hangup 只走 **session.command**。因此“session.request 在途中又发
  *   session.command(answer)”在结构上不可能发生——answer 从不作为命令发送。
- * - **心跳**：[heartbeatWhileLive] 在会话存活期间按 [heartbeatIntervalMs]（≤5000 ms）持续发送
- *   session.heartbeat；用注入的 [CoroutineScope] 与 [CoroutineDispatcher]，没有 GlobalScope。
+ * - **心跳**：[heartbeatWhileLive] 在会话存活期间按 [heartbeatIntervalMs]（严格小于 5000 ms）
+ *   持续发送 session.heartbeat；用注入的 [CoroutineScope] 与 [CoroutineDispatcher]，没有 GlobalScope。
  * - **密钥**：只有 [readSecret] 会读取密钥原值，且必须由 API 层显式调用；[readRedactedConfig]
  *   永远只返回脱敏配置。日志只写机器码。
  * - **音频**：audio.channel 只是绑定，随后连接 PCM lane 并重复同一 SessionId/格式做首帧握手；
@@ -136,8 +183,10 @@ class BridgeClient(
 ) : CallControl, AudioBridge {
 
     init {
-        require(heartbeatIntervalMs in 1..HEARTBEAT_TIMEOUT_MS) {
-            "heartbeat interval must stay within the 5000 ms timeout"
+        // 监督端把 >=5000 ms 的静默判为失联（core 的 SessionLimits.HEARTBEAT_TIMEOUT_MS）：
+        // 间隔必须严格小于它，否则心跳永远晚一步。
+        require(heartbeatIntervalMs in 1 until HEARTBEAT_TIMEOUT_MS) {
+            "heartbeat interval must be strictly below the 5000 ms supervisor timeout"
         }
         require(ackTimeoutMs > 0) { "ackTimeoutMs must be positive" }
         require(attachRetryAttempts > 0) { "attachRetryAttempts must be positive" }
@@ -187,8 +236,9 @@ class BridgeClient(
     /**
      * 在会话存活期间持续发送心跳，直到调用方取消子 Job。
      *
-     * 间隔必须 ≤ [HEARTBEAT_TIMEOUT_MS]（5000 ms），否则监督端会先把 APP 判为失联并终止
-     * 这通电话。全部执行在调用方注入的 [CoroutineScope] 中，不使用 GlobalScope。
+     * 间隔必须严格小于 [HEARTBEAT_TIMEOUT_MS]（5000 ms），否则监督端会先把 APP 判为失联并
+     * 终止这通电话（构造期已强制）。全部执行在调用方注入的 [CoroutineScope] 中，不使用
+     * GlobalScope。
      */
     suspend fun heartbeatWhileLive(session: SessionId) {
         while (true) {
@@ -302,12 +352,24 @@ class BridgeClient(
      * [attachRetryDelayMs] 有界重试；其余错误码立即失败。
      */
     override suspend fun open(id: SessionId, format: AudioFormatSpec): AudioSession {
-        closeCurrentLane(ERROR_AUDIO_LANE_SUPERSEDED)
+        // 同一会话重开：bridge 对已有 ATTACHED 连接会回 audio_pcm_already_attached，
+        // 必须先把旧 lane 拆掉再重连（这里没有“保留旧音频”的余地）。
+        if (currentLaneSession() == id) closeCurrentLane(ERROR_AUDIO_LANE_SUPERSEDED)
         val socketName = openChannel(id, format)
         val lane = attach(id, format, socketName)
-        synchronized(laneLock) { currentLane = lane }
+        // 新 lane 已通过握手才关闭旧 lane：attach 失败时，当前这通电话的音频仍保持可用。
+        val previous = synchronized(laneLock) {
+            val old = currentLane
+            currentLane = lane
+            old
+        }
+        if (previous != null && previous !== lane) {
+            previous.closeFromClient(ERROR_AUDIO_LANE_SUPERSEDED)
+        }
         return lane
     }
+
+    private fun currentLaneSession(): SessionId? = synchronized(laneLock) { currentLane?.sessionId }
 
     /** 关闭当前 lane 与控制传输；重复调用安全。 */
     suspend fun close() {
@@ -350,6 +412,7 @@ class BridgeClient(
     private suspend fun attach(id: SessionId, format: AudioFormatSpec, socketName: String): PcmAudioSession {
         val openFrame = encodeFrame(TYPE_CONTROL, encodeOpen(id, format))
             ?: throw AudioLaneException(ERROR_FRAME_TOO_LARGE, "PCM handshake exceeds the lane limit")
+        var socket = socketName
         var attempt = 0
         var lastCode: String = ERROR_AUDIO_PCM_NOT_OPEN
         while (true) {
@@ -358,13 +421,28 @@ class BridgeClient(
                     throw AudioLaneException(lastCode, "audio worker did not open the session")
                 }
                 delay(attachRetryDelayMs)
+                if (attempt % ATTACH_DEADLINE_REFRESH_ATTEMPTS == 0) {
+                    // bridge 的接入期限从首次 audio.channel 起算（10 s）。重试途中重发同一格式的
+                    // audio.channel 会刷新该期限，否则“工作进程稍后才 OPEN”的正常窗口会在最后
+                    // 几次重试里被判成 audio_pcm_bind_expired。
+                    socket = openChannel(id, format)
+                }
             }
             attempt += 1
-            val connection = pcm.open(socketName)
+            val connection = openLane(socket)
                 ?: throw AudioLaneException(ERROR_BRIDGE_UNAVAILABLE, "PCM lane is unavailable")
             try {
-                connection.write(openFrame)
-                val frame = readFrame(connection)
+                // 生产 PcmLaneConnection 以 soTimeout=0 阻塞读：握手必须有界，否则对端停在
+                // open_ok 前会让 attach 永远占住协调器的唯一消费者。bridge 自己 5000 ms 放弃，
+                // 客户端多留 1 s 收尾余量。
+                val handshake = withTimeoutOrNull(PCM_HANDSHAKE_TIMEOUT_MS) {
+                    connection.write(openFrame)
+                    HandshakeFrame(readFrame(connection))
+                } ?: throw AudioLaneException(
+                    ERROR_HANDSHAKE_TIMEOUT,
+                    "bridge did not answer the PCM handshake within " + PCM_HANDSHAKE_TIMEOUT_MS + " ms",
+                )
+                val frame = handshake.frame
                     ?: throw AudioLaneException(ERROR_HANDSHAKE, "PCM lane closed during the handshake")
                 if (frame.type != TYPE_CONTROL) {
                     throw AudioLaneException(ERROR_HANDSHAKE, "PCM handshake must start with a control frame")
@@ -404,6 +482,19 @@ class BridgeClient(
         }
     }
 
+    /**
+     * 连接 PCM lane，连接本身也有界：abstract socket 的 connect 在对端不 accept 时同样会挂住。
+     * @return 连接；null 表示对端明确不可用（bridge_unavailable，不是重试条件）。
+     */
+    private suspend fun openLane(socketName: String): PcmLaneConnection? {
+        val opened = withTimeoutOrNull(PCM_OPEN_TIMEOUT_MS) { LaneOpen(pcm.open(socketName)) }
+            ?: throw AudioLaneException(
+                ERROR_CONNECT_TIMEOUT,
+                "PCM lane connect did not complete within " + PCM_OPEN_TIMEOUT_MS + " ms",
+            )
+        return opened.connection
+    }
+
     private suspend fun closeCurrentLane(code: String) {
         val lane = synchronized(laneLock) {
             val current = currentLane
@@ -425,7 +516,11 @@ class BridgeClient(
             payload = payload,
         )
         val response = try {
-            withContext(ioDispatcher) { control.request(request) }
+            // 兜底上限：即使注入的传输实现自己不设超时，协调器也不能被一条控制请求挂住。
+            // 比传输自身的预算多 CLIENT_GRACE_MS，正常路径仍由 socket 的 soTimeout 先失败。
+            withTimeoutOrNull(ControlTimeouts.clientTimeoutMsFor(method)) {
+                withContext(ioDispatcher) { control.request(request) }
+            }
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (failure: Throwable) {
@@ -469,7 +564,8 @@ class BridgeClient(
      * 任何非法帧/断链/超时都让会话以机器码失败，绝不静默继续。
      */
     private inner class PcmAudioSession(
-        private val session: SessionId,
+        /** 这条 lane 唯一服务的会话；重开同一会话时用于判断“先拆旧再重连”。 */
+        val sessionId: SessionId,
         private val format: AudioFormatSpec,
         private val connection: PcmLaneConnection,
     ) : AudioSession {
@@ -635,6 +731,12 @@ class BridgeClient(
 
     private class PendingAck(val seq: Int, val ack: CompletableDeferred<PcmAck>)
 
+    /** 握手读取结果（用于把“超时”与“EOF”分开：两者都不能混为一谈）。 */
+    private class HandshakeFrame(val frame: LaneFrame?)
+
+    /** 连接结果（用于把“连接超时”与“对端不可用”分开）。 */
+    private class LaneOpen(val connection: PcmLaneConnection?)
+
     // ------------------------------------------------------------------ PCM 线格式
 
     private class LaneFrame(val type: Int, val body: ByteArray)
@@ -756,6 +858,23 @@ class BridgeClient(
         /** 单帧上行 ACK 的等待上限；正常播放一帧 ≈1 s，留足余量。 */
         const val ACK_TIMEOUT_MS: Long = 30_000L
 
+        /**
+         * 单次 PCM 握手（写 open + 读 open_ok）的上限。
+         *
+         * bridge 的 AudioPcmProtocol.HANDSHAKE_TIMEOUT_MS 是 5000 ms（超时后它会关闭连接），
+         * 客户端多留 1 s 收尾余量；超过即 fail closed，绝不无限阻塞在 soTimeout=0 的读上。
+         */
+        const val PCM_HANDSHAKE_TIMEOUT_MS: Long = 6_000L
+
+        /** 连接 PCM lane 的上限：abstract socket 的 connect 本身不得无限阻塞。 */
+        const val PCM_OPEN_TIMEOUT_MS: Long = 5_000L
+
+        /**
+         * 重试期间刷新接入期限的间隔：bridge 的 AudioPcmRelay.ATTACH_DEADLINE_MS 是 10000 ms，
+         * 每 10 次重试（默认 200 ms 间隔 = 2 s）重发一次同格式 audio.channel 把期限推后。
+         */
+        const val ATTACH_DEADLINE_REFRESH_ATTEMPTS: Int = 10
+
         /** 接入重试：只在工作进程回答 audio_pcm_not_open（ACTIVE 前）时有界重试。 */
         const val ATTACH_RETRY_ATTEMPTS: Int = 25
         const val ATTACH_RETRY_DELAY_MS: Long = 200L
@@ -796,6 +915,8 @@ class BridgeClient(
         const val ERROR_INVALID_RESPONSE: String = "invalid_response"
         const val ERROR_COMMAND_FAILED: String = "command_failed"
         const val ERROR_HANDSHAKE: String = "audio_pcm_handshake_invalid"
+        const val ERROR_HANDSHAKE_TIMEOUT: String = "audio_pcm_handshake_timeout"
+        const val ERROR_CONNECT_TIMEOUT: String = "audio_pcm_connect_timeout"
         const val ERROR_AUDIO_PCM_NOT_OPEN: String = "audio_pcm_not_open"
         const val ERROR_FORMAT_MISMATCH: String = "audio_pcm_format_mismatch"
         const val ERROR_LANE_FAILED: String = "audio_pcm_lane_failed"
@@ -829,7 +950,6 @@ class BridgeClient(
  */
 class LocalSocketControlTransport(
     private val socketName: String = BridgeClient.CONTROL_SOCKET,
-    private val requestTimeoutMs: Int = REQUEST_TIMEOUT_MS,
 ) : ControlTransport {
 
     override suspend fun request(request: RpcRequest): RpcResponse? {
@@ -842,7 +962,9 @@ class LocalSocketControlTransport(
         return try {
             socket.connect(LocalSocketAddress(socketName, LocalSocketAddress.Namespace.ABSTRACT))
             if (socket.peerCredentials?.uid != BridgeClient.ROOT_UID) return null
-            socket.soTimeout = requestTimeoutMs
+            // 每方法预算：session.request/session.command/handover 必须容纳 bridge 内部 4 s
+            // 的 HOOK 等待；心跳/配置读取保持短超时。
+            socket.soTimeout = ControlTimeouts.timeoutMsFor(request.method)
             socket.outputStream.write(frame)
             socket.outputStream.flush()
             when (val result = RpcCodec.readResponseFrame(socket.inputStream)) {
@@ -860,11 +982,6 @@ class LocalSocketControlTransport(
     }
 
     override suspend fun close() = Unit
-
-    companion object {
-        /** 控制请求超时：与 HOOK 侧一致，本地 socket 不该等更久。 */
-        const val REQUEST_TIMEOUT_MS: Int = 2_000
-    }
 }
 
 /**

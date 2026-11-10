@@ -15,6 +15,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicLong
@@ -108,7 +109,7 @@ open class SessionObserver {
  *   在 bridge 内完成隔离并读回），这里刻意不重复执行。
  */
 class SessionCoordinator(
-    private val config: AgentConfig,
+    config: AgentConfig,
     private val calls: CallControl,
     private val audio: AudioBridge,
     private val conversation: ConversationPort,
@@ -130,13 +131,43 @@ class SessionCoordinator(
         require(commandSettleTimeoutMs > 0) { "commandSettleTimeoutMs must be positive" }
     }
 
+    /**
+     * 当前生效的配置。热更新只影响下一通电话（新 reducer 用新快照），当前会话只吃
+     * reducer 的“总开关关闭”规则（见 [onConfigChanged]）。
+     */
+    @Volatile
+    private var config: AgentConfig = config
+
     private val scope = CoroutineScope(SupervisorJob() + dispatcher)
+
+    /**
+     * 安全相关输入（快照/接管/READY/命令结果/配置）的专用通道：无界、绝不丢弃。
+     *
+     * 这些事件每通电话只会产生寥寥几条（换会话、人工接管、一次命令结果、一次开关变化），
+     * 无界不会变成内存泄漏；而丢掉一条 Takeover 意味着用户以为接管了却没人向监督端撤权，
+     * 丢掉一条 DISCONNECTED 意味着状态永远停在 HANDOFF。
+     */
+    private val priorityInputs = Channel<Input>(Channel.UNLIMITED)
+
+    /** 可丢弃的输入（只有 Tick）：有界，饱和时计数丢弃，绝不阻塞调用线程。 */
     private val inputs = Channel<Input>(queueCapacity)
+
+    /**
+     * close() 的收尾作用域：用户/服务线程调用 close() 时不阻塞，音频停止在注入的分派器上
+     * 异步完成（[scope] 已被取消，不能再承载收尾工作）。
+     */
+    private val teardown = CoroutineScope(SupervisorJob() + dispatcher)
+
     private val generationCounter = AtomicLong(0)
     private val droppedInputs = AtomicLong(0)
 
     private var consumerJob: Job? = null
+
+    @Volatile
     private var started = false
+
+    @Volatile
+    private var closed = false
 
     @Volatile
     private var current: CallRuntime? = null
@@ -153,80 +184,141 @@ class SessionCoordinator(
     val activeSession: SessionId?
         get() = current?.session
 
-    /** 因有界队列饱和被丢弃的输入数（诊断用；不是协议错误）。 */
+    /**
+     * 因有界队列饱和被丢弃的输入数（诊断用；不是协议错误）。
+     *
+     * 只有周期性的 Tick 会被丢弃（下一个 1 s 内还会再来一条）；快照/接管/READY/命令结果/
+     * 配置走无界的优先通道，永不丢弃。
+     */
     val droppedInputCount: Long get() = droppedInputs.get()
 
-    /** 启动唯一消费者；重复调用无效。 */
+    /** 启动唯一消费者；重复调用无效，关闭后不再启动。 */
     @Synchronized
     fun start() {
-        if (started) return
+        if (started || closed) return
         started = true
         consumerJob = scope.launch { consume() }
     }
 
-    /** 非阻塞投递一个会话事件；队列饱和时丢弃并计数，绝不阻塞调用线程。 */
+    /** 非阻塞投递一个会话事件；只有 Tick 会在队列饱和时被丢弃并计数。 */
     fun onEvent(event: SessionEvent) {
         addInput(Input.Event(event))
     }
 
-    /** 取消消费者、当前会话子 Job 与所有后台协程；重复调用安全。 */
+    /**
+     * 配置热更新（总开关关闭时立即作用于进行中的通话）。
+     *
+     * 与 [onEvent] 一样经唯一的串行消费者生效，因此不会与正在执行的 reducer/效果竞争；
+     * 它是安全相关输入，队列饱和时也不会被丢弃。关闭总开关时 reducer 会立即终止仍归 AI 的
+     * 通话（挂断/撤销所有权）或交还人工，不需要重建协调器。
+     */
+    fun onConfigChanged(config: AgentConfig) {
+        addInput(Input.ConfigChanged(config))
+    }
+
+    /**
+     * 取消消费者、当前会话子 Job 与所有后台协程；停止当前音频会话、撤销本地租约。
+     * 重复调用安全，关闭后 [start]/[onEvent] 不再生效。
+     */
     @Synchronized
     fun close() {
-        inputs.close()
+        if (closed) return
+        closed = true
+        val runtime = current
+        current = null
         scope.cancel()
         consumerJob = null
         started = false
+        if (runtime == null) return
+        runtime.active = false
+        runtime.conversationJob?.cancel()
+        runtime.callJob.cancel()
+        // 本地租约是“可以命令这通电话”的凭据：关闭后绝不能被下一条命令复用。
+        leases.revoke(runtime.session)
+        val session = runtime.audioSession
+        runtime.audioSession = null
+        if (session != null) {
+            // 不在调用线程上阻塞（可能是主线程）：停止音频交给收尾作用域，
+            // 停完之后把收尾作用域收回（协调器已永久关闭）。
+            teardown.launch {
+                withContext(NonCancellable) { runCatching { session.stop() } }
+                teardown.cancel()
+            }
+        }
+        if (runtime.reducer.state != SessionState.ENDED) {
+            observer.onStateChanged(runtime.session, SessionState.ENDED)
+        }
     }
 
     // ------------------------------------------------------------------ 消费
 
     private sealed interface Input {
-        data class Event(val event: SessionEvent) : Input
+        /**
+         * 安全相关输入永不被丢弃（走 [priorityInputs]）：只有周期性的 Tick 允许丢。
+         */
+        val safetyRelevant: Boolean
+
+        data class Event(val event: SessionEvent) : Input {
+            override val safetyRelevant: Boolean
+                get() = event !is SessionEvent.Tick
+        }
 
         data class CommandFinished(
             val session: SessionId,
             val generation: Long,
             val command: CallCommand,
             val result: CommandResult,
-        ) : Input
+        ) : Input {
+            /** 接听/挂断结果决定是否交还人工，丢了会让会话停在 ANSWER_PENDING。 */
+            override val safetyRelevant: Boolean get() = true
+        }
 
-        data object AudioFailed : Input
+        /** 配置热更新（总开关关闭必须立即生效）。 */
+        data class ConfigChanged(val config: AgentConfig) : Input {
+            override val safetyRelevant: Boolean get() = true
+        }
 
-        data object ApiFailed : Input
+        /** 远程会话/API 失败（内部输入，必须终止仍归 AI 的通话）。 */
+        data object ApiFailed : Input {
+            override val safetyRelevant: Boolean get() = true
+        }
     }
 
     private fun addInput(input: Input) {
-        if (!inputs.trySend(input).isSuccess) droppedInputs.incrementAndGet()
+        if (closed) return
+        val target = if (input.safetyRelevant) priorityInputs else inputs
+        if (!target.trySend(input).isSuccess) droppedInputs.incrementAndGet()
     }
 
     private suspend fun consume() {
-        try {
-            for (input in inputs) {
-                currentCoroutineContext().ensureActive()
-                try {
-                    apply(input)
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (failure: Throwable) {
-                    // 单个效果失败不能让串行消费者退出；只广播机器码。
-                    observer.onDiagnostic("coordinator_effect_failed", current?.session)
-                }
+        while (true) {
+            val input = nextInput()
+            currentCoroutineContext().ensureActive()
+            try {
+                apply(input)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Throwable) {
+                // 单个效果失败不能让串行消费者退出；只广播机器码。
+                observer.onDiagnostic("coordinator_effect_failed", current?.session)
             }
-        } catch (cancelled: CancellationException) {
-            throw cancelled
         }
+    }
+
+    /**
+     * 取下一个输入：安全通道优先（select 的声明顺序即优先级），其次才是可丢弃的 Tick 队列。
+     * 关闭时由 [close] 取消 [scope]，这里不需要关闭通道。
+     */
+    private suspend fun nextInput(): Input = select {
+        priorityInputs.onReceive { it }
+        inputs.onReceive { it }
     }
 
     private suspend fun apply(input: Input) {
         when (input) {
             is Input.Event -> handleEvent(input.event)
             is Input.CommandFinished -> handleCommandResult(input)
-            Input.AudioFailed -> {
-                val runtime = current ?: return
-                val effects = runtime.reducer.onAudioFailure(clock.nowMs())
-                observer.onStateChanged(runtime.session, runtime.reducer.state)
-                applyEffects(runtime, effects, handbackViaServer = false)
-            }
+            is Input.ConfigChanged -> handleConfigChanged(input.config)
             Input.ApiFailed -> {
                 val runtime = current ?: return
                 val effects = runtime.reducer.onApiFailure()
@@ -234,6 +326,20 @@ class SessionCoordinator(
                 applyEffects(runtime, effects, handbackViaServer = false)
             }
         }
+    }
+
+    /**
+     * 配置热更新：先更新协调器自己的快照（下一通电话与新会话用它），再让当前 reducer 处理。
+     *
+     * 只有“总开关关闭”立即作用于本会话：reducer 会终止仍归 AI 的通话（挂断 + 撤销所有权）
+     * 或交还人工；其余字段仍只影响下一通电话。
+     */
+    private suspend fun handleConfigChanged(next: AgentConfig) {
+        config = next
+        val runtime = current ?: return
+        val effects = runtime.reducer.onConfigChanged(next)
+        observer.onStateChanged(runtime.session, runtime.reducer.state)
+        applyEffects(runtime, effects, handbackViaServer = true)
     }
 
     private suspend fun handleEvent(event: SessionEvent) {
@@ -545,7 +651,11 @@ class SessionCoordinator(
             withContext(NonCancellable) { runCatching { session.stop() } }
         }
         leases.revoke(runtime.session)
-        observer.onStateChanged(runtime.session, SessionState.ENDED)
+        // reduceAndApply 已经为本会话广播过 ENDED；这里只补“非 ENDED 路径”（换会话/关闭）。
+        // 重复的 ENDED 会让 7B2 的通知/UI 把同一通电话结束两次。
+        if (runtime.reducer.state != SessionState.ENDED) {
+            observer.onStateChanged(runtime.session, SessionState.ENDED)
+        }
         observer.onDiagnostic(reason, runtime.session)
     }
 

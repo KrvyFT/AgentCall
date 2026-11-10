@@ -3,7 +3,9 @@ package org.krvyft.agentcall.ipc
 import com.google.gson.JsonParser
 import java.nio.charset.StandardCharsets
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
@@ -13,7 +15,7 @@ import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.krvyft.agentcall.core.model.AudioFormatSpec
@@ -237,7 +239,7 @@ class BridgeClientTest {
         val audioB = client.open(sessionB, format)
         assertEquals(2, pcm.connections.size)
         assertTrue("the lane of session A must be closed when B opens", laneA.closed)
-        assertNotEquals(laneA, pcm.connections[1])
+        assertNotSame("B must run on its own lane, never A's", laneA, pcm.connections[1])
 
         // A 的会话句柄绝不能再写入任何 lane。
         val failure = runCatching { audioA.writeUplink(PcmAudio(ByteArray(64), format)) }.exceptionOrNull()
@@ -294,6 +296,255 @@ class BridgeClientTest {
 
         audio.stop()
         client.close()
+    }
+
+    // ------------------------------------------------------------------ 每方法超时预算（CRITICAL 1）
+
+    /**
+     * bridge 的 session.request / session.command 会等 HOOK 结果到 4000 ms
+     * （supervisor prepareAnswer 与 APP_COMMAND_TIMEOUT_MS 同源），客户端超时必须严格大于它：
+     * 否则“慢但成功”的 Answer 会被判成 bridge_unavailable，协调器随即交还一通已经被接起的电话。
+     */
+    @Test
+    fun sessionTimeoutsOutliveTheBridgeFourSecondWindow() {
+        val answer = ControlTimeouts.timeoutMsFor("session.request")
+        val command = ControlTimeouts.timeoutMsFor("session.command")
+        val handover = ControlTimeouts.timeoutMsFor("handover")
+        val bridgeWindow = ControlTimeouts.BRIDGE_COMMAND_WAIT_MS
+        assertTrue(
+            "session.request timeout must exceed the bridge's " + bridgeWindow + " ms window, was " + answer,
+            answer >= bridgeWindow + 2_000,
+        )
+        assertTrue(
+            "session.command timeout must exceed the bridge's " + bridgeWindow + " ms window, was " + command,
+            command >= bridgeWindow + 2_000,
+        )
+        assertTrue(
+            "handover timeout must exceed the bridge's " + bridgeWindow + " ms window, was " + handover,
+            handover >= bridgeWindow + 2_000,
+        )
+        assertTrue(
+            "audio.channel is a session operation too, was " + ControlTimeouts.timeoutMsFor("audio.channel"),
+            ControlTimeouts.timeoutMsFor("audio.channel") >= 6_000,
+        )
+        assertTrue(
+            "the long budget must not be an unbounded wait",
+            answer <= ControlTimeouts.MAX_LONG_TIMEOUT_MS,
+        )
+    }
+
+    /** 心跳/配置读取是本地的快速方法：短超时，失败要立刻回到调用方。 */
+    @Test
+    fun heartbeatAndConfigKeepShortTimeouts() {
+        assertTrue(ControlTimeouts.timeoutMsFor("session.heartbeat") <= 2_000)
+        assertTrue(ControlTimeouts.timeoutMsFor("config.read") <= 2_000)
+        assertTrue(ControlTimeouts.timeoutMsFor("config.secret.read") <= 2_000)
+        // 安全默认：未知方法按短超时失败，不占用控制通道。
+        assertTrue(ControlTimeouts.timeoutMsFor("hook.snapshot") <= 2_000)
+    }
+
+    /** HOOK 3 s 后才回 Accepted：bridge 尚未超时，客户端也不得提前判成传输失败。 */
+    @Test
+    fun slowButSuccessfulAnswerIsNotATransportFailure() = runTest {
+        val control = FakeControlTransport { request ->
+            when (request.method) {
+                "session.request" -> RpcResponse(id = request.id, payload = "{\"outcome\":\"accepted\"}")
+                "session.command" -> RpcResponse(id = request.id, payload = "{\"outcome\":\"accepted\"}")
+                else -> null
+            }
+        }
+        control.delayMs = { request -> if (request.method == "session.request") 3_000L else 0L }
+        val client = client(control = control, pcm = FakePcmLaneTransport())
+
+        val started = testScheduler.currentTime
+        assertEquals(CommandResult.Accepted, client.send(session, CallCommand.Answer))
+        val elapsed = testScheduler.currentTime - started
+        assertTrue("the slow answer must really have waited, was " + elapsed + " ms", elapsed >= 3_000)
+        assertTrue("a 3 s answer must stay inside the request budget, was " + elapsed + " ms", elapsed < 8_000)
+        assertEquals(CommandResult.Accepted, client.send(session, CallCommand.Hangup))
+
+        client.close()
+    }
+
+    /** 对端永不回答：请求必须在每方法预算内 fail closed，不能挂住协调器。 */
+    @Test
+    fun stalledControlRequestFailsClosedWithinItsBudget() = runTest {
+        val control = FakeControlTransport { null }
+        control.delayMs = { 60_000L }
+        val client = client(control = control, pcm = FakePcmLaneTransport())
+
+        val started = testScheduler.currentTime
+        val result = client.send(session, CallCommand.Answer)
+        val elapsed = testScheduler.currentTime - started
+
+        assertEquals(CommandResult.Failed("bridge_unavailable", "bridge control channel is unavailable"), result)
+        assertTrue("a stalled answer must be bounded by its budget, was " + elapsed + " ms", elapsed in 6_000..12_000)
+
+        client.close()
+    }
+
+    // ------------------------------------------------------------------ PCM 握手/连接有界（IMPORTANT 2）
+
+    /**
+     * 生产 PcmLaneConnection 以 soTimeout=0 阻塞读；对端在 open_ok 前停住时，
+     * attach 必须按握手预算失败并关闭这条 lane，而不是永远占住唯一的消费者。
+     */
+    @Test
+    fun stalledPcmHandshakeIsBoundedAndClosed() = runTest {
+        val pcm = FakePcmLaneTransport() // onConnect 什么都不发：open_ok 永不到达
+        val client = client(control = audioChannelControl(), pcm = pcm)
+
+        val started = testScheduler.currentTime
+        val failure = runCatching { client.open(session, format) }.exceptionOrNull()
+        val elapsed = testScheduler.currentTime - started
+
+        assertTrue("a stalled handshake must fail with a machine code", failure is AudioLaneException)
+        assertEquals(BridgeClient.ERROR_HANDSHAKE_TIMEOUT, (failure as AudioLaneException).code)
+        assertTrue("bounded by the handshake budget, was " + elapsed + " ms", elapsed in 6_000..8_000)
+        assertTrue("the stalled lane must be closed", pcm.connections.single().closed)
+
+        client.close()
+    }
+
+    /** 连接 PCM lane 本身也可能挂住（abstract socket 对端不 accept）；连接必须同样有界。 */
+    @Test
+    fun stalledPcmConnectIsBounded() = runTest {
+        val pcm = FakePcmLaneTransport()
+        pcm.stallOpen = true
+        val client = client(control = audioChannelControl(), pcm = pcm)
+
+        val started = testScheduler.currentTime
+        val failure = runCatching { client.open(session, format) }.exceptionOrNull()
+        val elapsed = testScheduler.currentTime - started
+
+        assertTrue(failure is AudioLaneException)
+        assertEquals(BridgeClient.ERROR_CONNECT_TIMEOUT, (failure as AudioLaneException).code)
+        assertTrue("bounded by the connect budget, was " + elapsed + " ms", elapsed in 5_000..7_000)
+        assertTrue("no lane may be recorded for a failed connect", pcm.connections.isEmpty())
+
+        client.close()
+    }
+
+    /**
+     * bridge 的接入期限是 10000 ms：重试期间必须重发同一格式的 audio.channel 刷新期限，
+     * 否则“工作进程稍后才 OPEN”的正常窗口会在最后几次重试里被判成 audio_pcm_bind_expired。
+     */
+    @Test
+    fun attachRetriesRefreshTheBridgeAttachDeadline() = runTest {
+        val control = audioChannelControl()
+        val pcm = FakePcmLaneTransport()
+        var attempt = 0
+        pcm.onConnect = { lane ->
+            attempt += 1
+            if (attempt <= 10) {
+                lane.feed(
+                    frame(
+                        TYPE_CONTROL,
+                        "{\"type\":\"error\",\"code\":\"audio_pcm_not_open\"}".toByteArray(StandardCharsets.UTF_8),
+                    ),
+                )
+            } else {
+                lane.feed(openOkFrame())
+            }
+        }
+        val client = BridgeClient(
+            control = control,
+            pcm = pcm,
+            scope = this,
+            clock = MonotonicClock { testScheduler.currentTime },
+            ioDispatcher = StandardTestDispatcher(testScheduler),
+            heartbeatIntervalMs = 2_000,
+            ackTimeoutMs = 5_000,
+            attachRetryAttempts = 12,
+            attachRetryDelayMs = 50,
+        )
+
+        client.open(session, format)
+
+        val channelRequests = control.requests.filter { it.method == "audio.channel" }
+        assertEquals("retrying must refresh the 10 s bridge attach deadline", 2, channelRequests.size)
+        assertEquals("a refresh must repeat the bound format", channelRequests[0].payload, channelRequests[1].payload)
+        assertEquals(11, pcm.connections.size)
+        assertTrue(client.protocolViolationCount == 0L)
+
+        client.close()
+    }
+
+    // ------------------------------------------------------------------ 先验证新 lane 再关旧 lane（minor）
+
+    /** 打开新会话失败时，仍活着的旧 lane 不能被提前拆掉：当前这通电话还要继续用音频。 */
+    @Test
+    fun failedAttachKeepsTheLiveLane() = runTest {
+        val pcm = FakePcmLaneTransport()
+        pcm.onConnect = { lane -> lane.feed(openOkFrame()) }
+        val client = client(control = audioChannelControl(), pcm = pcm)
+
+        val audioA = client.open(session, format)
+        val laneA = pcm.connections[0]
+
+        pcm.refuseOpen = true
+        val failure = runCatching { client.open(sessionB, format) }.exceptionOrNull()
+        assertTrue(failure is AudioLaneException)
+        assertEquals(BridgeClient.ERROR_BRIDGE_UNAVAILABLE, (failure as AudioLaneException).code)
+        assertFalse("a failed attach must not tear down the live lane", laneA.closed)
+
+        // A 的 lane 仍然可用：上行照旧落到 A 的 socket。
+        pcm.refuseOpen = false
+        val write = launch { audioA.writeUplink(PcmAudio(ByteArray(64), format)) }
+        runCurrent()
+        assertEquals("the live lane still carries uplinks", 2, laneA.writes.size)
+        laneA.feed(frame(TYPE_ACK, ackJson(0).toByteArray(StandardCharsets.UTF_8)))
+        runCurrent()
+        assertTrue(write.isCompleted)
+
+        audioA.stop()
+        client.close()
+    }
+
+    // ------------------------------------------------------------------ 心跳（minor 加强）
+
+    /** 单次心跳耗时 1500 ms 时，发送起点之间的间隔仍必须 ≤5000 ms。 */
+    @Test
+    fun heartbeatCadenceSurvivesSlowControlRequests() = runTest {
+        val control = FakeControlTransport { request ->
+            if (request.method == "session.heartbeat") {
+                RpcResponse(id = request.id, payload = "{\"acknowledged\":true}")
+            } else {
+                null
+            }
+        }
+        control.now = { testScheduler.currentTime }
+        control.delayMs = { 1_500L }
+        val client = client(control = control, pcm = FakePcmLaneTransport())
+
+        val pump = launch { client.heartbeatWhileLive(session) }
+        advanceTimeBy(12_000)
+        runCurrent()
+        pump.cancel()
+
+        assertTrue("at least three heartbeats in 12 s, got " + control.times.size, control.times.size >= 3)
+        val gaps = control.times.zipWithNext { previous, next -> next - previous }
+        assertTrue("every heartbeat gap must be <= 5000 ms, got " + gaps, gaps.all { it <= 5_000L })
+        assertTrue("a slow request must not reset the failure counter", client.heartbeatFailureCount == 0L)
+
+        client.close()
+    }
+
+    /** 5000 ms 及以上意味着监督端会先把 APP 判为失联，构造期就必须拒绝。 */
+    @Test
+    fun heartbeatIntervalMustBeStrictlyBelowTheSupervisorTimeout() {
+        fun build(interval: Long) = runCatching {
+            BridgeClient(
+                control = FakeControlTransport { null },
+                pcm = FakePcmLaneTransport(),
+                scope = TestScope(),
+                heartbeatIntervalMs = interval,
+            )
+        }
+
+        assertTrue("4999 ms is a valid interval", build(4_999L).isSuccess)
+        assertTrue("5000 ms must be rejected", build(5_000L).exceptionOrNull() is IllegalArgumentException)
+        assertTrue("0 ms must be rejected", build(0L).exceptionOrNull() is IllegalArgumentException)
     }
 
     // ------------------------------------------------------------------ 装配/辅助
@@ -361,12 +612,15 @@ class BridgeClientTest {
         val requests = mutableListOf<RpcRequest>()
         val times = mutableListOf<Long>()
         var now: () -> Long = { 0L }
-        var failure = false
+
+        /** 每次请求的模拟耗时（ms）；用来验证慢但成功的响应与心跳节奏。 */
+        var delayMs: (RpcRequest) -> Long = { 0L }
 
         override suspend fun request(request: RpcRequest): RpcResponse? {
             requests += request
             times += now()
-            if (failure) return null
+            val wait = delayMs(request)
+            if (wait > 0) delay(wait)
             return handler(request)
         }
 
@@ -378,7 +632,15 @@ class BridgeClientTest {
         var lastSocketName: String? = null
         var onConnect: (FakeLaneConnection) -> Unit = {}
 
-        override suspend fun open(socketName: String): PcmLaneConnection {
+        /** 连接失败（对端未起）：open 返回 null，调用方 fail closed。 */
+        var refuseOpen = false
+
+        /** 连接挂住（abstract socket 不 accept）：open 永不返回。 */
+        var stallOpen = false
+
+        override suspend fun open(socketName: String): PcmLaneConnection? {
+            if (stallOpen) awaitCancellation()
+            if (refuseOpen) return null
             lastSocketName = socketName
             val connection = FakeLaneConnection()
             connections += connection
