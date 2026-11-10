@@ -41,6 +41,16 @@ internal object HookInstallGuard {
     /** @return true 表示本次调用赢得了安装权；之后的所有调用都返回 false */
     fun claim(): Boolean = claimed.compareAndSet(false, true)
 
+    /**
+     * 释放安装权（M6）。只有真正安装成功才应永久占用：
+     * PackageManager/Context 尚未就绪、发现不到 InCallService、延迟安装也失败时必须允许
+     * 下一次 handleLoadPackage/Application 创建重试，否则一次早期失败就让本进程永久失去
+     * Hook。已安装成功后再 release 会破坏“只安装一次”的保证，因此只在失败路径调用。
+     */
+    fun release() {
+        claimed.set(false)
+    }
+
     /** 仅测试用：重置进程级闸门，避免测试之间相互影响。 */
     internal fun resetForTest() {
         claimed.set(false)

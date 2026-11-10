@@ -32,8 +32,9 @@ import org.krvyft.agentcall.core.model.SessionId
  *   注册表保留上一次已知状态，既不猜成 ACTIVE 也不误撤销待执行接听。
  * - **路由变化在本进程内上报**：Call.Callback 的音频路由回调是 @SystemApi（公开 SDK
  *   不可见但运行时存在），按 JVM 签名声明即可被框架虚分派；HookRuntime 另外 Hook 了
- *   InCallService 上的公开同名回调。两条路径都上报 [EventKind.ROUTE_CHANGED]，
- *   来源不明时由注册表保守交还，不依赖 Task 5 的桥接进程。
+ *   InCallService 上的公开同名回调。两条路径都上报 [EventKind.ROUTE_CHANGED]，并附带
+ *   音频状态/端点指纹；注册表只在指纹相对基线**确实变化**且已经 ACTIVE 时才保守交还，
+ *   重复的框架通知与接听窗口内的事件都不交还（I2），不依赖 Task 5 的桥接进程。
  *
  * 本类只持有单个 Call；会话身份与去重由 [CallRegistry] 负责。
  */
@@ -41,6 +42,11 @@ internal class AndroidCallHandle(
     private val call: Call,
     private val processEpoch: String,
     private val calls: () -> List<Call>,
+    /**
+     * 还没有收到本 Call 的路由回调时，用 InCallService 的公开音频状态作为基线。
+     * 这样接听时刻就有一个可比较的“之前”，真实用户改路由不会被误当成第一次观测。
+     */
+    private val fallbackRouteFingerprint: () -> String? = { null },
     private val mainHandler: Handler = Handler(Looper.getMainLooper()),
     private val logger: (String) -> Unit = {},
 ) : CallHandle {
@@ -62,6 +68,13 @@ internal class AndroidCallHandle(
      */
     @Volatile
     private var revoked: Boolean = false
+
+    /**
+     * 最近一次观测到的音频路由/端点指纹。用于回答“路由是否真的变了”，而不是每收到一次
+     * 框架的重复音频状态通知就交还。只在通话回调线程写、任意线程读。
+     */
+    @Volatile
+    private var lastRouteFingerprint: String? = null
 
     /** 只在主线程读写：模块动作的待认领标记。 */
     private var pendingAction: PendingAction? = null
@@ -89,6 +102,7 @@ internal class AndroidCallHandle(
                 isEmergency = false,
                 isConference = false,
                 activeCallCount = 1,
+                routeFingerprint = currentRouteFingerprint(),
             )
         }
         val details = runCatching { call.details }.getOrNull()
@@ -120,9 +134,12 @@ internal class AndroidCallHandle(
             details.hasProperty(Call.Details.PROPERTY_CONFERENCE) ||
                 details.hasProperty(Call.Details.PROPERTY_GENERIC_CONFERENCE)
             )
+        // M4：service.calls 为空（尚不可见/正在销毁）时活动通话数就是 0，必须原样保留。
+        // 以前 coerceAtLeast(1) 会把“没有一路可确认的通话”伪造成唯一一路，安全门失效。
+        // 只有读取异常才用保守的 2；正常返回的空列表/全断开是 0。
         val activeCallCount = runCatching {
-            calls().count { callStateOf(it) != Call.STATE_DISCONNECTED && callStateOf(it) != Call.STATE_DISCONNECTING }
-        }.getOrDefault(2).coerceAtLeast(1)
+            CallCounts.activeCalls(calls().map(::callStateOf))
+        }.getOrDefault(2)
         return HandleSnapshot(
             number = number,
             state = mappedState,
@@ -132,8 +149,13 @@ internal class AndroidCallHandle(
             isEmergency = isEmergency,
             isConference = isConference,
             activeCallCount = activeCallCount,
+            routeFingerprint = currentRouteFingerprint(),
         )
     }
+
+    /** 本 Call 的最近指纹优先；没有时回退到 InCallService 的服务级音频状态。 */
+    private fun currentRouteFingerprint(): String? =
+        lastRouteFingerprint ?: runCatching { fallbackRouteFingerprint() }.getOrNull()
 
     override fun addCallback(callback: CallCallback) {
         if (destroyed) return
@@ -201,11 +223,23 @@ internal class AndroidCallHandle(
 
     /**
      * 音频路由变化上报入口：Call.Callback 的隐藏回调与 InCallService 的公开回调都走这里。
-     * 模块从不主动改路由，因此来源一律是 [ActionSource.UNKNOWN]（来源不明 → 保守交还）。
+     *
+     * 模块从不主动改路由，因此来源一律是 [ActionSource.UNKNOWN]。注册表只有在指纹相对
+     * 基线真的变化时才交还；重复上报同一状态、或拿不到指纹时都不交还（I2）。
      */
-    internal fun notifyRouteChanged(reason: String) {
+    internal fun notifyRouteChanged(reason: String, fingerprint: String? = null) {
         if (destroyed) return
-        deliver(HandleEvent(snapshot(), ActionSource.UNKNOWN, EventKind.ROUTE_CHANGED, reason))
+        if (fingerprint != null) lastRouteFingerprint = fingerprint
+        val current = snapshot()
+        deliver(
+            HandleEvent(
+                snapshot = current,
+                source = ActionSource.UNKNOWN,
+                kind = EventKind.ROUTE_CHANGED,
+                reason = reason,
+                routeFingerprint = fingerprint ?: current.routeFingerprint,
+            ),
+        )
     }
 
     // ------------------------------------------------------------------ 核验
@@ -285,7 +319,7 @@ internal class AndroidCallHandle(
          */
         @Suppress("unused")
         fun onCallAudioStateChanged(call: Call?, audioState: CallAudioState?) {
-            notifyRouteChanged("audio_route_changed")
+            notifyRouteChanged("audio_route_changed", RouteFingerprint.ofAudioState(audioState))
         }
 
         /**
@@ -293,7 +327,7 @@ internal class AndroidCallHandle(
          */
         @Suppress("unused")
         fun onCallEndpointChanged(call: Call?, endpoint: CallEndpoint?) {
-            notifyRouteChanged("call_endpoint_changed")
+            notifyRouteChanged("call_endpoint_changed", RouteFingerprint.ofEndpoint(endpoint))
         }
     }
 

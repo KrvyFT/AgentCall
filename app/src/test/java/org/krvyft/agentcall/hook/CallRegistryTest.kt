@@ -6,6 +6,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.krvyft.agentcall.core.model.AgentConfig
 import org.krvyft.agentcall.core.model.CallCommand
 import org.krvyft.agentcall.core.model.CallDirection
 import org.krvyft.agentcall.core.model.CallSnapshot
@@ -15,6 +16,7 @@ import org.krvyft.agentcall.core.model.CommandResult.Rejected
 import org.krvyft.agentcall.core.model.Presentation
 import org.krvyft.agentcall.core.model.RejectReason
 import org.krvyft.agentcall.core.model.SessionId
+import org.krvyft.agentcall.core.rules.RuleMatcher
 
 /**
  * [CallRegistry] 的 JVM 测试：用可观察的 fake [CallHandle] 证明
@@ -239,21 +241,25 @@ class CallRegistryTest {
     }
 
     @Test
-    fun unknownRouteChangeCancelsPendingAnswerAndKeepsCallForHuman() {
+    fun routeEventDuringAnswerWindowIsANoOp() {
         val handle = FakeCallHandle()
         val listener = RecordingListener()
         val registry = CallRegistry(listener = listener)
         val session = registry.observe(handle)
         assertEquals(CommandResult.Accepted, registry.answer(session))
 
-        handle.emit(kind = EventKind.ROUTE_CHANGED, source = ActionSource.UNKNOWN, snapshot = ringingSnapshot())
+        // I2(c)：接听窗口内的路由事件可能只是框架在接通过程中重配音频，不得撤销接听。
+        handle.emit(
+            kind = EventKind.ROUTE_CHANGED,
+            source = ActionSource.UNKNOWN,
+            snapshot = ringingSnapshot().copy(routeFingerprint = "speaker"),
+            reason = "audio_route_changed",
+        )
 
-        assertFalse(registry.isPendingAnswer(session))
-        assertTrue(registry.isHandedBack(session))
-        assertEquals(1, listener.handbacks.size)
-        assertEquals("route_change", listener.handbacks[0].third)
-        assertEquals(Rejected(NOT_OWNED), registry.hangup(session))
-        assertEquals(0, handle.disconnectCount)
+        assertTrue("a route event inside the answer window must not cancel", registry.isPendingAnswer(session))
+        assertFalse(registry.isHandedBack(session))
+        assertTrue(listener.handbacks.isEmpty())
+        assertEquals(1, handle.answerCount)
     }
 
     @Test
@@ -297,13 +303,17 @@ class CallRegistryTest {
         val registry = CallRegistry(listener = listener)
         val session = registry.observe(handle)
         assertEquals(CommandResult.Accepted, registry.answer(session))
-        handle.emit(snapshot = ringingSnapshot().copy(state = CallState.ACTIVE), source = ActionSource.MODULE)
+        handle.emit(
+            snapshot = ringingSnapshot().copy(state = CallState.ACTIVE, routeFingerprint = "earpiece"),
+            source = ActionSource.MODULE,
+        )
 
-        // AI 通话中系统/人工切换音频路由：来源不明，必须保守交还。
+        // AI 通话中用户真的切换了音频路由（指纹变化）：来源不明，必须保守交还。
         handle.emit(
             kind = EventKind.ROUTE_CHANGED,
             source = ActionSource.UNKNOWN,
-            snapshot = ringingSnapshot().copy(state = CallState.ACTIVE),
+            snapshot = ringingSnapshot().copy(state = CallState.ACTIVE, routeFingerprint = "speaker"),
+            reason = "audio_route_changed",
         )
 
         assertFalse(registry.isPendingAnswer(session))
@@ -321,13 +331,16 @@ class CallRegistryTest {
         val registry = CallRegistry(listener = listener)
         val session = registry.observe(handle)
         assertEquals(CommandResult.Accepted, registry.answer(session))
-        handle.emit(snapshot = ringingSnapshot().copy(state = CallState.ACTIVE), source = ActionSource.MODULE)
+        handle.emit(
+            snapshot = ringingSnapshot().copy(state = CallState.ACTIVE, routeFingerprint = "earpiece"),
+            source = ActionSource.MODULE,
+        )
 
-        // 模块自己标记的路由动作不算“来源不明”，不能交还。
+        // 模块自己标记的路由动作不算“来源不明”，不能交还（即使指纹变化）。
         handle.emit(
             kind = EventKind.ROUTE_CHANGED,
             source = ActionSource.MODULE,
-            snapshot = ringingSnapshot().copy(state = CallState.ACTIVE),
+            snapshot = ringingSnapshot().copy(state = CallState.ACTIVE, routeFingerprint = "speaker"),
         )
 
         assertFalse(registry.isHandedBack(session))
@@ -471,9 +484,7 @@ class CallRegistryTest {
             "conference" to ringingSnapshot().copy(isConference = true),
             "second_active_call" to ringingSnapshot().copy(activeCallCount = 2),
             "outgoing" to ringingSnapshot().copy(direction = CallDirection.OUTGOING),
-            "restricted" to ringingSnapshot().copy(presentation = Presentation.RESTRICTED, number = null),
-            "unknown_presentation" to ringingSnapshot().copy(presentation = Presentation.UNKNOWN, number = null),
-            "payphone" to ringingSnapshot().copy(presentation = Presentation.PAYPHONE),
+            "zero_active_calls" to ringingSnapshot().copy(activeCallCount = 0),
         )
         for ((name, snapshot) in unsafe) {
             val handle = FakeCallHandle(current = snapshot)
@@ -484,6 +495,136 @@ class CallRegistryTest {
             assertEquals(name, 0, handle.answerCount)
             assertFalse(name, registry.isPendingAnswer(session))
         }
+    }
+
+    @Test
+    fun hiddenNumbersReachAnswerBecauseTheCoreOwnsThatPolicy() {
+        // I1：号码可识别性（含隐藏/未知呈现）由 core RuleMatcher 依 handleUnknownNumbers
+        // 裁决；hook 只保留硬排除（紧急/会议/第二路/出站），否则 spec §7 的总开关永远无效。
+        val candidates = listOf(
+            "restricted" to ringingSnapshot().copy(presentation = Presentation.RESTRICTED, number = null),
+            "unknown_presentation" to ringingSnapshot().copy(presentation = Presentation.UNKNOWN, number = null),
+            "payphone" to ringingSnapshot().copy(presentation = Presentation.PAYPHONE, number = null),
+        )
+        for ((name, snapshot) in candidates) {
+            val handle = FakeCallHandle(current = snapshot)
+            val sink = RecordingSink()
+            val registry = CallRegistry(sink = sink)
+            val session = registry.observe(handle)
+
+            assertEquals(name, CommandResult.Accepted, registry.answer(session))
+            assertEquals(name, 1, handle.answerCount)
+            assertEquals(name, ActionSource.MODULE, sink.attempts.single().source)
+        }
+    }
+
+    @Test
+    fun coreRuleMatcherRemainsTheOnlyNumberIdentifiabilityPolicy() {
+        // 同一份隐藏号码快照：开关 ON 由 core 判定可接管，开关 OFF 保留响铃。
+        // hook 不接收配置，因此不能自己再判一次 presentation/number。
+        val account = "SIM1"
+        val hidden = CallSnapshot(
+            id = SessionId(processEpoch = "epoch-1", callId = "call-1"),
+            number = null,
+            state = CallState.RINGING,
+            direction = CallDirection.INCOMING,
+            presentation = Presentation.RESTRICTED,
+            phoneAccount = account,
+            isEmergency = false,
+            isConference = false,
+            activeCallCount = 1,
+        )
+        val enabled = AgentConfig(
+            enabled = true,
+            blacklist = listOf("+8613800000000"),
+            enabledPhoneAccounts = listOf(account),
+            handleUnknownNumbers = true,
+        )
+
+        assertTrue(RuleMatcher.matches(enabled, hidden))
+        assertFalse(
+            "the toggle OFF must keep the ring for a human",
+            RuleMatcher.matches(enabled.copy(handleUnknownNumbers = false), hidden),
+        )
+    }
+
+    @Test
+    fun benignDuplicateRouteEventAfterAnswerDoesNotHandBack() {
+        val handle = FakeCallHandle()
+        val listener = RecordingListener()
+        val registry = CallRegistry(listener = listener)
+        val session = registry.observe(handle)
+        assertEquals(CommandResult.Accepted, registry.answer(session))
+        handle.emit(
+            snapshot = ringingSnapshot().copy(state = CallState.ACTIVE, routeFingerprint = "earpiece"),
+            source = ActionSource.MODULE,
+        )
+
+        // I2(b)：框架在接通后重复上报同一条音频状态/端点，不得当成用户改路由。
+        handle.emit(
+            kind = EventKind.ROUTE_CHANGED,
+            source = ActionSource.UNKNOWN,
+            snapshot = ringingSnapshot().copy(state = CallState.ACTIVE, routeFingerprint = "earpiece"),
+            reason = "audio_route_changed",
+        )
+
+        assertFalse(registry.isHandedBack(session))
+        assertTrue(listener.handbacks.isEmpty())
+        assertEquals("module keeps ownership after a duplicate route report", CommandResult.Accepted, registry.hangup(session))
+        assertEquals(1, handle.disconnectCount)
+    }
+
+    @Test
+    fun routeEventBeforeActiveRebaselinesWithoutHandingBack() {
+        val handle = FakeCallHandle()
+        val listener = RecordingListener()
+        val registry = CallRegistry(listener = listener)
+        val session = registry.observe(handle)
+        assertEquals(CommandResult.Accepted, registry.answer(session))
+
+        // 接听窗口内框架切到听筒：不改所有权，但成为新的基线。
+        handle.emit(
+            kind = EventKind.ROUTE_CHANGED,
+            source = ActionSource.UNKNOWN,
+            snapshot = ringingSnapshot().copy(routeFingerprint = "earpiece"),
+        )
+        handle.emit(
+            snapshot = ringingSnapshot().copy(state = CallState.ACTIVE, routeFingerprint = "earpiece"),
+            source = ActionSource.MODULE,
+        )
+        handle.emit(
+            kind = EventKind.ROUTE_CHANGED,
+            source = ActionSource.UNKNOWN,
+            snapshot = ringingSnapshot().copy(state = CallState.ACTIVE, routeFingerprint = "earpiece"),
+        )
+
+        assertFalse(registry.isHandedBack(session))
+        assertTrue(listener.handbacks.isEmpty())
+        assertEquals(CommandResult.Accepted, registry.hangup(session))
+    }
+
+    @Test
+    fun routeEventWithUnknownFingerprintCannotProveAChange() {
+        val handle = FakeCallHandle()
+        val listener = RecordingListener()
+        val registry = CallRegistry(listener = listener)
+        val session = registry.observe(handle)
+        assertEquals(CommandResult.Accepted, registry.answer(session))
+        handle.emit(
+            snapshot = ringingSnapshot().copy(state = CallState.ACTIVE, routeFingerprint = null),
+            source = ActionSource.MODULE,
+        )
+
+        // 没有可比较的音频状态时不得凭空交还（这正是框架重复事件的误伤路径）。
+        handle.emit(
+            kind = EventKind.ROUTE_CHANGED,
+            source = ActionSource.UNKNOWN,
+            snapshot = ringingSnapshot().copy(state = CallState.ACTIVE, routeFingerprint = null),
+        )
+
+        assertFalse(registry.isHandedBack(session))
+        assertTrue(listener.handbacks.isEmpty())
+        assertEquals(CommandResult.Accepted, registry.hangup(session))
     }
 
     // ------------------------------------------------------------------ fixtures
@@ -502,6 +643,7 @@ class CallRegistryTest {
             isEmergency = false,
             isConference = false,
             activeCallCount = 1,
+            routeFingerprint = "earpiece",
         )
     }
 }

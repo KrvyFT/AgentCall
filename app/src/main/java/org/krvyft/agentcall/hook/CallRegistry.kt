@@ -20,12 +20,17 @@ import org.krvyft.agentcall.core.model.SessionId
  * - 同一门面重复 observe 只注册一个回调，返回同一个 [SessionId]。
  * - 通话结束/显式移除后，所有命令按 [RejectReason.STALE_SESSION] 拒绝。
  * - Answer 只允许 RINGING、会话代次匹配、且本会话没有已下发的模块接听/挂断；
- *   重复 Answer 不会第二次触碰 Telecom。接听前还有一道纵深防御（[isSafeToAnswer]）：
- *   紧急、会议、第二路（activeCallCount > 1）、非入站、受限/未知呈现的通话一律拒绝；
- *   核心 RuleMatcher 在会话层已排除同样的条件，这里不依赖任何单一层。
- * - 用户先接听（非模块来源的 ACTIVE）或来源不明的路由变化会撤销待执行的模块接听；
- *   模块自己接管的 ACTIVE 通话遇到来源不明的路由变化/保持/动作失败时同样保守交还。
- *   会话被标记为已交还人工，后续挂断命令被拒绝。[ActionSource.MODULE] 的路由变化不交还。
+ *   重复 Answer 不会第二次触碰 Telecom。接听前的硬排除（[isSafeToAnswer]）只有：
+ *   紧急、会议、非唯一一路（activeCallCount != 1，含 0）、非入站。号码可识别性
+ *   （presentation/number）不在这里裁决：那是 core RuleMatcher 依据
+ *   handleUnknownNumbers 的单一策略点，hook 拿不到配置，重复判一次会让 spec §7 的
+ *   隐藏号码开关永远失效（I1）。
+ * - 用户先接听（非模块来源的 ACTIVE）会撤销待执行的模块接听；模块自己接管的 ACTIVE
+ *   通话遇到来源不明的真实路由变化/保持/动作失败时保守交还。会话被标记为已交还
+ *   人工，后续挂断命令被拒绝。[ActionSource.MODULE] 的路由变化不交还。
+ * - 路由事件只有“真的换了指纹”才交还：接听窗口内的路由事件只是重新取基线（框架会在
+ *   接通前后重复上报音频状态），接通后重复上报同一指纹也不交还；无法取得指纹时无法
+ *   证明变化，按 no-op 处理（I2）。
  * - 未映射的 Telecom 瞬时状态以 [EventKind.UNKNOWN_STATE] 上报：保留上一次已知状态，
  *   既不猜成 ACTIVE，也不撤销待执行接听。
  * - 终态（DISCONNECTED/DESTROYED）先向监听者发出最终快照，再移除会话，控制器不必等
@@ -56,6 +61,10 @@ class CallRegistry(
         var pendingHangup: Boolean = false,
         var moduleOwned: Boolean = false,
         var handedBack: Boolean = false,
+        /** 最近一次从门面读到的音频路由指纹（CallSnapshot 不携带它）。 */
+        var latestRouteFingerprint: String? = null,
+        /** 模块接听时的音频路由指纹；只有与它不同的事件才算“真的改了路由”。 */
+        var routeBaseline: String? = null,
     )
 
     private val lock = Any()
@@ -87,6 +96,8 @@ class CallRegistry(
             // addCallback 之后重读一次，避免把回调到达前的旧状态当成初始快照。
             registration.snapshot = runCatching { handle.snapshot().toCallSnapshot(session) }
                 .getOrDefault(registration.snapshot)
+            registration.latestRouteFingerprint = runCatching { handle.snapshot().routeFingerprint }
+                .getOrNull()
             if (byCallId[session.callId] === registration) {
                 if (registration.snapshot.state == CallState.DISCONNECTED) {
                     // 已经结束的通话不能留下僵尸会话：先发终态快照，再撤销绑定。
@@ -158,6 +169,8 @@ class CallRegistry(
             if (result == CommandResult.Accepted) {
                 registration.pendingAnswer = true
                 registration.moduleOwned = true
+                // 接听时刻的音频状态是基线；接听窗口内的事件只更新基线、不交还（I2(b)(c)）。
+                registration.routeBaseline = registration.latestRouteFingerprint
             }
             record(id, CallCommand.Answer, result)
             result
@@ -211,6 +224,8 @@ class CallRegistry(
                 incoming
             }
             registration.snapshot = snapshot
+            val fingerprint = event.routeFingerprint ?: event.snapshot.routeFingerprint
+            registration.latestRouteFingerprint = fingerprint ?: registration.latestRouteFingerprint
             if (event.destroyed || snapshot.state == CallState.DISCONNECTED) {
                 // 终态必须先传给控制器，再移除会话；否则控制器只能等心跳超时。
                 registration.pendingAnswer = false
@@ -233,13 +248,18 @@ class CallRegistry(
                         event.source,
                         event.reason.ifBlank { "action_failed" },
                     )
-                    event.kind == EventKind.ROUTE_CHANGED && event.source != ActionSource.MODULE ->
-                        cancelPendingLocked(registration, ActionSource.UNKNOWN, "route_change")
+                    // 接听窗口内的路由/音频端点事件是框架在接通过程中重配音频：只重取基线，
+                    // 既不撤销接听，也不把它当成人工接听（I2(c)）。
+                    event.kind == EventKind.ROUTE_CHANGED -> {
+                        registration.routeBaseline = fingerprint
+                    }
                     event.kind == EventKind.STATE_CHANGED &&
                         snapshot.state == CallState.ACTIVE &&
                         event.source == ActionSource.MODULE -> {
                         registration.pendingAnswer = false
                         registration.moduleOwned = true
+                        // 进入 ACTIVE 后以“当前”音频状态为基线：接通前的事件不再算变化。
+                        registration.routeBaseline = fingerprint
                     }
                     event.kind == EventKind.STATE_CHANGED && snapshot.state != CallState.RINGING -> cancelPendingLocked(
                         registration,
@@ -249,9 +269,24 @@ class CallRegistry(
                 }
             } else if (registration.moduleOwned) {
                 when {
-                    // AI 通话中系统路由变更：来源不明，保守交还；模块自己的路由动作有 MODULE 标记。
-                    event.kind == EventKind.ROUTE_CHANGED && event.source != ActionSource.MODULE ->
-                        handBackLocked(registration, event.source, "route_change")
+                    // 只有确实变了的路由/音频端点才保守交还；框架重复上报同一状态不交还。
+                    // “音频通道已打开”的权威在控制器进程，hook 不可见；模块接管的 ACTIVE
+                    // 是控制器打开通道的前置条件，因此这里用 moduleOwned + ACTIVE 作为可
+                    // 观察代理，避免把接通瞬间的框架重配误判成用户改路由。
+                    event.kind == EventKind.ROUTE_CHANGED -> {
+                        if (event.source == ActionSource.MODULE) {
+                            // 模块自己的路由动作：更新基线，绝不交还。
+                            registration.routeBaseline = fingerprint ?: registration.routeBaseline
+                        } else if (snapshot.state == CallState.ACTIVE && fingerprint != null) {
+                            val baseline = registration.routeBaseline
+                            if (baseline == null) {
+                                // 第一次观测到可比较的音频状态：没有“之前”可比，不交还。
+                                registration.routeBaseline = fingerprint
+                            } else if (fingerprint != baseline) {
+                                handBackLocked(registration, event.source, "route_change")
+                            }
+                        }
+                    }
                     // AI 通话被保持：来源可能是系统/人工，保守交还，不猜测。
                     event.kind == EventKind.STATE_CHANGED && snapshot.state == CallState.HOLDING ->
                         handBackLocked(registration, event.source, "state_holding")
@@ -290,17 +325,19 @@ class CallRegistry(
     private fun lookup(id: SessionId): Registration? = byCallId[id.callId]?.takeIf { it.session == id }
 
     /**
-     * 接听的纵深防御检查：只允许“唯一一路、入站、可识别、非紧急/会议”的 RINGING
-     * 通话。危险字段一律 fail closed，任何一层（会话层 RuleMatcher 或本注册表）漏判
-     * 都不会自动接听。
+     * 接听的硬排除检查：只允许“唯一一路、入站、非紧急/会议”的 RINGING 通话。
+     *
+     * 号码可识别性刻意不在这里：core [org.krvyft.agentcall.core.rules.RuleMatcher]
+     * 已按 handleUnknownNumbers 裁决 presentation/number，是唯一策略点。hook 不接收
+     * 配置，若在这里再要求 presentation == ALLOWED，隐藏号码将永远无法自动接听，spec §7
+     * 的开关变成死开关（I1）。这里只保留任何配置都不能放宽的硬排除；activeCallCount
+     * 必须严格等于 1，0/未知/多路都 fail closed。
      */
     private fun isSafeToAnswer(snapshot: CallSnapshot): Boolean =
         !snapshot.isEmergency &&
             !snapshot.isConference &&
             snapshot.activeCallCount == 1 &&
-            snapshot.direction == CallDirection.INCOMING &&
-            snapshot.presentation == Presentation.ALLOWED &&
-            snapshot.number != null
+            snapshot.direction == CallDirection.INCOMING
 
     private fun allocateSession(): SessionId {
         repeat(MAX_CALL_ID_ATTEMPTS) {
@@ -358,5 +395,5 @@ private fun conservativeSnapshot(id: SessionId): CallSnapshot = CallSnapshot(
     phoneAccount = null,
     isEmergency = false,
     isConference = false,
-    activeCallCount = 1,
+    activeCallCount = 0,
 )

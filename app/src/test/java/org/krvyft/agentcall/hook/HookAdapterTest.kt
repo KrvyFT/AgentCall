@@ -67,4 +67,16 @@ class HookAdapterTest {
         assertFalse("a second handleLoadPackage must not duplicate hooks", HookInstallGuard.claim())
         assertFalse(HookInstallGuard.claim())
     }
+
+    @Test
+    fun aFailedInstallCanReleaseTheClaimAndRetry() {
+        // M6：闸门只能在安装成功后永久占用；安装失败必须能重试，否则一次早期的
+        // PackageManager 未就绪会让本进程永久失去 Hook。
+        HookInstallGuard.resetForTest()
+
+        assertTrue(HookInstallGuard.claim())
+        HookInstallGuard.release()
+        assertTrue(HookInstallGuard.claim())
+        assertFalse(HookInstallGuard.claim())
+    }
 }

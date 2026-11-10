@@ -1,6 +1,8 @@
 package org.krvyft.agentcall.hook
 
 import android.telecom.Call
+import android.telecom.CallAudioState
+import android.telecom.CallEndpoint
 import org.krvyft.agentcall.core.model.CallState
 import org.krvyft.agentcall.core.model.CommandResult
 import org.krvyft.agentcall.core.model.RejectReason
@@ -74,6 +76,45 @@ internal object TelecomDecisions {
 
     private fun defaultSource(mapped: CallState?): ActionSource =
         if (mapped == CallState.ACTIVE) ActionSource.USER else ActionSource.UNKNOWN
+}
+
+/**
+ * 活动通话计数（M4 的纯逻辑）。
+ *
+ * service.calls 为空、全部断开或只看到 DISCONNECTING 时结果就是 0；注册表的安全门要求
+ * 严格等于 1，因此 0 必然 fail closed。绝不能在调用方把 0 抬成 1。
+ */
+internal object CallCounts {
+
+    fun activeCalls(telecomStates: List<Int>): Int =
+        telecomStates.count { it != Call.STATE_DISCONNECTED && it != Call.STATE_DISCONNECTING }
+}
+
+/**
+ * 音频路由/端点的稳定指纹（纯字符串，便于 JVM 侧比较）。
+ *
+ * 框架会在接通、端点切换等时机重复回调同一个音频状态；只有指纹变化才是“用户真的改了
+ * 路由”。任何字段不可读都返回 null（无法证明变化，注册表按 no-op 处理）。
+ */
+internal object RouteFingerprint {
+
+    fun ofAudioState(state: CallAudioState?): String? {
+        if (state == null) return null
+        return try {
+            "audio:" + state.route + ":" + (if (state.isMuted) 1 else 0) + ":" + state.supportedRouteMask
+        } catch (failure: Throwable) {
+            null
+        }
+    }
+
+    fun ofEndpoint(endpoint: CallEndpoint?): String? {
+        if (endpoint == null) return null
+        return try {
+            "endpoint:" + endpoint.identifier + ":" + endpoint.endpointType
+        } catch (failure: Throwable) {
+            null
+        }
+    }
 }
 
 /**

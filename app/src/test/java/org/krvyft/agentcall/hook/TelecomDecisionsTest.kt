@@ -53,6 +53,19 @@ class TelecomDecisionsTest {
         assertEquals(CallState.RINGING, TelecomDecisions.mapSnapshotState(Call.STATE_RINGING))
     }
 
+    @Test
+    fun activeCallCountingNeverInventsAnEmptyOrUnknownCallList() {
+        // M4：service.calls 为空/全断开时活动通话数是 0，必须保持 0（不可接听），
+        // 不能被 coerceAtLeast(1) 伪造成“唯一一路”。
+        assertEquals(0, CallCounts.activeCalls(emptyList()))
+        assertEquals(
+            0,
+            CallCounts.activeCalls(listOf(Call.STATE_DISCONNECTED, Call.STATE_DISCONNECTING)),
+        )
+        assertEquals(1, CallCounts.activeCalls(listOf(Call.STATE_RINGING)))
+        assertEquals(2, CallCounts.activeCalls(listOf(Call.STATE_ACTIVE, Call.STATE_HOLDING)))
+    }
+
     // ------------------------------------------------------------------ 来源认领
 
     @Test

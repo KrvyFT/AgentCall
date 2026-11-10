@@ -2,6 +2,8 @@ package org.krvyft.agentcall.hook
 
 import android.app.Application
 import android.telecom.Call
+import android.telecom.CallAudioState
+import android.telecom.CallEndpoint
 import android.telecom.InCallService
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
@@ -45,9 +47,15 @@ class HookEntry : IXposedHookLoadPackage {
         try {
             val installed = HookRuntime(lpparam.classLoader)
             if (!installed.installFromPackageManager()) {
-                installed.deferUntilApplicationCreated()
+                // 延迟路径同样没装成（连 Instrumentation 都不可用）才释放闸门；成功挂上
+                // 延迟 Hook 后必须继续占位，避免第二个入口重复安装（M6）。
+                if (!installed.deferUntilApplicationCreated()) {
+                    HookInstallGuard.release()
+                }
             }
         } catch (failure: Throwable) {
+            // 安装异常不是“已安装”：允许下一次入口重试（M6）。
+            HookInstallGuard.release()
             logToFramework("hook entry failed: " + failure.javaClass.name + ": " + (failure.message ?: "no message"))
         }
     }
@@ -87,6 +95,10 @@ private class HookRuntime(private val loader: ClassLoader) {
 
     private var transport: HookTransport? = null
 
+    /** InCallService 最近一次公开音频状态/端点的指纹；作为新门面的初始基线。 */
+    @Volatile
+    private var serviceRouteFingerprint: String? = null
+
     init {
         transport = HookTransport(
             processEpoch = registry.processEpoch,
@@ -123,7 +135,7 @@ private class HookRuntime(private val loader: ClassLoader) {
      * Context 尚未就绪时的唯一延迟路径：`Instrumentation.callApplicationOnCreate` 之后
      * 进程一定已有 Application，可安全查询 PackageManager。只安装一次（集合去重）。
      */
-    fun deferUntilApplicationCreated() {
+    fun deferUntilApplicationCreated(): Boolean {
         try {
             val instrumentation = Class.forName("android.app.Instrumentation", false, loader)
             val method = instrumentation.getDeclaredMethod("callApplicationOnCreate", Application::class.java)
@@ -137,6 +149,8 @@ private class HookRuntime(private val loader: ClassLoader) {
                             val methods = ServiceDiscovery.resolve(loader, services, TARGET_PACKAGE)
                             if (methods.isEmpty()) {
                                 log("no InCallService callbacks discovered after Application creation")
+                                // 延迟安装最终失败：释放闸门，允许后续入口再试一次（M6）。
+                                HookInstallGuard.release()
                             } else {
                                 install(methods)
                             }
@@ -145,8 +159,10 @@ private class HookRuntime(private val loader: ClassLoader) {
                 },
             )
             log("deferred discovery until Application creation")
+            return true
         } catch (failure: Throwable) {
             log("cannot defer discovery: " + failure.javaClass.name + ": " + (failure.message ?: "no message"))
+            return false
         }
     }
 
@@ -185,7 +201,16 @@ private class HookRuntime(private val loader: ClassLoader) {
             "onCallAdded" -> (args?.firstOrNull() as? Call)?.let { onCallAdded(service, it) }
             "onCallRemoved" -> (args?.firstOrNull() as? Call)?.let { onCallRemoved(it) }
             // 公开 SDK 的音频路由回调：在本进程内上报，不依赖桥接进程（Task 5）。
-            "onCallAudioStateChanged", "onCallEndpointChanged" -> notifyRouteChanged(methodName)
+            "onCallAudioStateChanged" -> {
+                val fingerprint = RouteFingerprint.ofAudioState(args?.firstOrNull() as? CallAudioState)
+                if (fingerprint != null) serviceRouteFingerprint = fingerprint
+                notifyRouteChanged(methodName, fingerprint)
+            }
+            "onCallEndpointChanged" -> {
+                val fingerprint = RouteFingerprint.ofEndpoint(args?.firstOrNull() as? CallEndpoint)
+                if (fingerprint != null) serviceRouteFingerprint = fingerprint
+                notifyRouteChanged(methodName, fingerprint)
+            }
         }
     }
 
@@ -195,6 +220,11 @@ private class HookRuntime(private val loader: ClassLoader) {
                 call = call,
                 processEpoch = registry.processEpoch,
                 calls = { service.calls },
+                fallbackRouteFingerprint = {
+                    serviceRouteFingerprint
+                        ?: runCatching { RouteFingerprint.ofAudioState(service.callAudioState) }.getOrNull()
+                        ?: runCatching { RouteFingerprint.ofEndpoint(service.currentCallEndpoint) }.getOrNull()
+                },
                 logger = ::log,
             ).also { handles[call] = it }
         }
@@ -211,13 +241,23 @@ private class HookRuntime(private val loader: ClassLoader) {
         }
     }
 
-    /** 路由变化上报给每个存活门面；注册表只在模块接管/待执行时保守交还。 */
-    private fun notifyRouteChanged(methodName: String) {
+    /**
+     * InCallService 的音频路由回调是**服务级**的（参数里没有 Call），无法直接归属到某一路
+     * 通话。
+     *
+     * I2(a)：只有恰好一路存活门面时才把它转给该门面；多路（会议/第二路响铃）时无法判定
+     * 受影响的是哪一路，忽略本次服务级事件而不是广播给所有门面（广播会把无关的 AI 通话
+     * 误交还）。单路时注册表还会按指纹过滤重复上报。
+     */
+    private fun notifyRouteChanged(methodName: String, fingerprint: String?) {
         val current = synchronized(handles) { handles.values.toList() }
-        for (handle in current) {
-            HookSafety.guard("route-change", ::log) {
-                handle.notifyRouteChanged(methodName)
-            }
+        if (current.size > 1) {
+            log("route event ignored: " + current.size + " live calls, affected call unknown")
+            return
+        }
+        val handle = current.singleOrNull() ?: return
+        HookSafety.guard("route-change", ::log) {
+            handle.notifyRouteChanged(methodName, fingerprint)
         }
     }
 

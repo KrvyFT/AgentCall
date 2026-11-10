@@ -69,6 +69,13 @@ data class HandleSnapshot(
     val isEmergency: Boolean,
     val isConference: Boolean,
     val activeCallCount: Int,
+    /**
+     * 当前音频路由/音频状态的稳定指纹（如 "audio:2:0:63" / "endpoint:speaker:2"）。
+     *
+     * 只用于回答“路由是否真的变了”：框架会在接通前后重复上报同一状态，[CallRegistry]
+     * 必须能区分“同一条状态的重复通知”和“用户真的切了路由”。null 表示无法证明变化。
+     */
+    val routeFingerprint: String? = null,
 )
 
 /** 通话变化事件。[source] 区分模块动作、人工动作与来源不明，供保守交还使用。 */
@@ -78,6 +85,8 @@ data class HandleEvent(
     val kind: EventKind,
     val reason: String = "",
     val destroyed: Boolean = false,
+    /** 本次路由/音频事件携带的指纹；null 表示无法证明路由发生了变化。 */
+    val routeFingerprint: String? = null,
 )
 
 /** 事件种类。未知变化必须上报，不能替调用方猜测。 */
