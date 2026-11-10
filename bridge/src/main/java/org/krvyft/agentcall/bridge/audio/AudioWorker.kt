@@ -31,6 +31,7 @@ interface MicrophoneIsolation {
     /** 恢复本机麦克风；仅在通话已确认断开或人工接管后调用。 */
     suspend fun restore(): Boolean
 
+    /** 重新读取系统隔离状态；失败/不可读返回 false（调用方按未隔离处理）。 */
     fun isIsolated(): Boolean
 }
 
@@ -47,14 +48,19 @@ sealed interface ProcessFaultDecision {
 }
 
 /**
- * 监督端依赖的音频端口。生产实现是 [AudioWorker]，测试用假实现替换。
+ * 监督端依赖的音频端口。生产实现是 [AudioWorker]（独立音频工作进程）或
+ * [RemoteSupervisedAudio]（监督进程侧的生命周期代理）；测试用假实现替换。
  */
 interface SupervisedAudio {
+    /** 最后一次确认/读回的隔离状态；只用于状态快照与持久化意图，不能代替 [verifyIsolation]。 */
     val microphoneIsolated: Boolean
 
     suspend fun isolateMicrophone(): Boolean
 
-    /** 只有租约仍有效且已隔离时才允许打开；失败必须抛 [AudioUnavailableException]。 */
+    /** 重新读取系统隔离状态（不是缓存）；读不到或已解除返回 false（调用方 fail closed）。 */
+    suspend fun verifyIsolation(): Boolean
+
+    /** 只有租约仍有效且隔离读回成功时才允许打开；失败必须抛 [AudioUnavailableException]。 */
     suspend fun open(id: SessionId, format: AudioFormatSpec): AudioSession
 
     /** 停止音频但保留隔离。幂等；绝不解除麦克风隔离。 */
@@ -62,10 +68,6 @@ interface SupervisedAudio {
 
     /** 在断开/接管确认之后恢复麦克风。仍持有活动流时返回 false。 */
     suspend fun restoreMicrophone(): Boolean
-
-    fun onProcessFault(code: String, nowMs: Long): ProcessFaultDecision
-
-    fun snapshot(): AudioStateSnapshot
 }
 
 /**
@@ -73,9 +75,9 @@ interface SupervisedAudio {
  *
  * 职责边界：
  * - 只持有 PCM 流与麦克风隔离状态，绝不下发通话命令（没有 CallControl 依赖）；
- * - 打开音频前同时核对最小租约与“已隔离”，缺一即拒绝，避免无租约的音频采集；
- * - 重启预算有界：窗口内超过 [maxRestarts] 次故障返回
- *   [ProcessFaultDecision.RestartExhausted]，由监督端终止通话，不能无限重启；
+ * - 打开音频前同时核对最小租约与“系统读回的隔离状态”，缺一即拒绝；
+ * - 重复 open 先停止旧会话，避免句柄/读取任务泄漏；
+ * - 重启预算已移到监督端（I5），本进程不保存任何能“重启即清零”的预算；
  * - [stopKeepingIsolation] 只停流，不恢复麦克风；恢复必须走 [restoreMicrophone]。
  */
 class AudioWorker(
@@ -83,15 +85,8 @@ class AudioWorker(
     private val isolation: MicrophoneIsolation,
     private val clock: MonotonicClock,
     private val leaseCheck: AudioLeaseCheck,
-    private val maxRestarts: Int = DEFAULT_MAX_RESTARTS,
-    private val restartWindowMs: Long = DEFAULT_RESTART_WINDOW_MS,
     val role: BridgeProcessRole = BridgeProcessRole.AUDIO_WORKER,
 ) : SupervisedAudio, Closeable {
-
-    init {
-        require(maxRestarts > 0) { "maxRestarts must be positive" }
-        require(restartWindowMs > 0L) { "restartWindowMs must be positive" }
-    }
 
     private val lock = Any()
     private var started = false
@@ -103,7 +98,6 @@ class AudioWorker(
     private var downlinkChunks = 0L
     private var uplinkWrites = 0L
     private var isolated = false
-    private val restartTimes = ArrayDeque<Long>()
 
     /** 幂等的进程启动入口；[open] 也会自动调用，便于嵌入不同 app_process 入口。 */
     fun start() {
@@ -125,6 +119,16 @@ class AudioWorker(
         return confirmed
     }
 
+    override suspend fun verifyIsolation(): Boolean {
+        val confirmed = try {
+            isolation.isIsolated()
+        } catch (t: Throwable) {
+            false
+        }
+        synchronized(lock) { isolated = confirmed }
+        return confirmed
+    }
+
     override suspend fun open(id: SessionId, format: AudioFormatSpec): AudioSession {
         start()
         if (!leaseCheck.isAuthorized(id)) {
@@ -134,13 +138,17 @@ class AudioWorker(
                 message = "no live lease for session; audio must not be opened",
             )
         }
-        if (!microphoneIsolated) {
+        // I7：以系统读回为准，不能只用缓存布尔值。
+        if (!verifyIsolation()) {
             throw AudioUnavailableException(
                 code = "audio_not_isolated",
                 failure = AudioFailureCode.OPEN_FAILED,
                 message = "microphone must be isolated before opening call audio",
             )
         }
+
+        // I3：新会话打开前先停止旧会话，不能泄漏句柄与读取任务。
+        stopActiveSession()
 
         synchronized(lock) {
             state = AudioPathState.OPENING
@@ -173,6 +181,15 @@ class AudioWorker(
     }
 
     override suspend fun stopKeepingIsolation() {
+        stopActiveSession()
+        synchronized(lock) {
+            if (state == AudioPathState.OPEN || state == AudioPathState.OPENING) {
+                state = AudioPathState.CLOSED
+            }
+        }
+    }
+
+    private suspend fun stopActiveSession() {
         val session = synchronized(lock) {
             val current = activeSession
             activeSession = null
@@ -183,11 +200,6 @@ class AudioWorker(
         } catch (t: Throwable) {
             // 停止失败也不能解除隔离或伪装成功；保留最后错误供快照诊断。
             synchronized(lock) { failure = AudioFailureCode.STOPPED }
-        }
-        synchronized(lock) {
-            if (state == AudioPathState.OPEN || state == AudioPathState.OPENING) {
-                state = AudioPathState.CLOSED
-            }
         }
     }
 
@@ -204,21 +216,7 @@ class AudioWorker(
         return confirmed
     }
 
-    override fun onProcessFault(code: String, nowMs: Long): ProcessFaultDecision = synchronized(lock) {
-        val cutoff = nowMs - restartWindowMs
-        while (restartTimes.isNotEmpty() && restartTimes.first() <= cutoff) {
-            restartTimes.removeFirst()
-        }
-        failure = AudioFailureCode.PROCESS_LOST
-        if (restartTimes.size >= maxRestarts) {
-            ProcessFaultDecision.RestartExhausted(restartTimes.size)
-        } else {
-            restartTimes.addLast(nowMs)
-            ProcessFaultDecision.RestartAllowed(restartTimes.size)
-        }
-    }
-
-    override fun snapshot(): AudioStateSnapshot = synchronized(lock) {
+    fun snapshot(): AudioStateSnapshot = synchronized(lock) {
         AudioStateSnapshot(
             role = role,
             state = state,
@@ -228,13 +226,12 @@ class AudioWorker(
             downlinkChunks = downlinkChunks,
             uplinkWrites = uplinkWrites,
             failure = failure,
-            restartAttempts = restartTimes.size,
             updatedAtMs = clock.nowMs(),
         )
     }
 
     override fun close() {
-        runBlocking { stopKeepingIsolation() }
+        // 不用 runBlocking 关闭（M8）：只收束状态，音频停止由拥有挂起上下文的调用方执行。
         synchronized(lock) { started = false }
     }
 
@@ -252,13 +249,5 @@ class AudioWorker(
         override suspend fun stop() {
             delegate.stop()
         }
-    }
-
-    companion object {
-        /** 默认重启预算（窗口内最多 3 次）。 */
-        const val DEFAULT_MAX_RESTARTS: Int = 3
-
-        /** 默认重启窗口 60 秒；旧故障不占用新预算。 */
-        const val DEFAULT_RESTART_WINDOW_MS: Long = 60_000L
     }
 }

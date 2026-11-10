@@ -517,7 +517,14 @@ private class FrameworkAudioSession(
     }
 
     private fun pcm16Samples(bytes: ByteArray): ShortArray {
-        require(bytes.size % 2 == 0) { "PCM16 payload must have an even byte count: " + bytes.size }
+        // M2：奇数字节是调用方可分类的音频故障，不是编程错误；不能泄漏 IllegalArgumentException。
+        if (bytes.size % 2 != 0) {
+            throw AudioUnavailableException(
+                code = "audio_odd_pcm_bytes",
+                failure = AudioFailureCode.UNSUPPORTED,
+                message = "PCM16 payload must have an even byte count: " + bytes.size,
+            )
+        }
         return ShortArray(bytes.size / 2) { index ->
             val low = bytes[2 * index].toInt() and 0xFF
             val high = bytes[2 * index + 1].toInt() and 0xFF

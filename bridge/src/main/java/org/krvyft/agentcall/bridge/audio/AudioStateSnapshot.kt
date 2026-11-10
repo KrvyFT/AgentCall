@@ -11,8 +11,9 @@ import org.krvyft.agentcall.core.model.SessionId
  * - [SUPERVISOR] 持有租约、心跳与故障终止能力，绝不读取 PCM；
  * - [AUDIO_WORKER] 持有 PCM 流与麦克风隔离状态，绝不下发通话命令。
  *
- * 两个角色由模块的 service.sh 各自以独立 app_process 启动，互不共享静态可变状态；
- * 本任务只提供各自的启动/停止生命周期与状态快照，设备上的实际进程拉起由任务 8 编排。
+ * 两个角色由模块的 service.sh 以独立 app_process 拉起：监督角色运行在桥接容器
+ * （BridgeMain）内，音频工作角色由 AudioWorkerMain 单独运行。两者只通过 root 私有的
+ * AudioRole 生命周期通道交互，不共享静态可变状态；设备上的实际运行仍属“未验证”。
  */
 enum class BridgeProcessRole(
     /** 该角色是否允许持有通话音频流。 */
@@ -78,7 +79,7 @@ data class AudioCapability(
 /**
  * 音频工作角色的状态快照（spec §8：故障恢复必须可观测）。
  *
- * @property restartAttempts 当前重启窗口内已使用的重启次数（有界）。
+ * 重启预算不在这里：它由监督端持有（I5），音频工作进程重启不会清零预算。
  */
 data class AudioStateSnapshot(
     val role: BridgeProcessRole,
@@ -89,6 +90,5 @@ data class AudioStateSnapshot(
     val downlinkChunks: Long,
     val uplinkWrites: Long,
     val failure: AudioFailureCode?,
-    val restartAttempts: Int,
     val updatedAtMs: Long,
 )
