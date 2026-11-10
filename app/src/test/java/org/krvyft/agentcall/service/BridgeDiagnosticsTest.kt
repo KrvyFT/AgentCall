@@ -13,8 +13,9 @@ import org.krvyft.agentcall.ipc.ControlTransport
 /**
  * 只读诊断客户端的 JVM 测试：三态 HOOK 存在性与环境解析必须 fail closed。
  *
- * 桥接目前不把 status/diagnose 开放给 APP（RolePolicy），生产会得到 forbidden；
- * 这里证明客户端把 forbidden 表达为“不可用”，而不是在线或离线。
+ * Task 7C 起桥接的 APP 固定表已包含 status/diagnose，生产装配（Task 7B3）改由
+ * [org.krvyft.agentcall.ipc.BridgeClient] 读取同一份负载；本类保留为旧客户端的回归测试。
+ * forbidden 仍可能来自旧桥接/角色表不匹配，必须表达为“不可用”，而不是在线或离线。
  */
 class BridgeDiagnosticsTest {
 

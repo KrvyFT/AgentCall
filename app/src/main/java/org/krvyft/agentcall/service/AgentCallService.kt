@@ -36,6 +36,7 @@ import org.krvyft.agentcall.core.port.AudioSession
 import org.krvyft.agentcall.core.port.ConversationPort
 import org.krvyft.agentcall.core.port.MonotonicClock
 import org.krvyft.agentcall.ipc.BridgeClient
+import org.krvyft.agentcall.ipc.BridgeRead
 import org.krvyft.agentcall.ipc.HandoverOutcome
 import org.krvyft.agentcall.ipc.HandoverResult
 import org.krvyft.agentcall.ipc.LocalSocketControlTransport
@@ -58,7 +59,9 @@ data class AgentCallStatus(
     val hookPresence: HookPresence = HookPresence.UNKNOWN,
     /** Google 电话默认角色；null 表示桥接无法确定。 */
     val dialerDefaultRole: Boolean? = null,
-    /** 桥接是否向 APP 提供了 status（当前角色表不允许，恒 false 也可能表示不可达）。 */
+    /** 监督阶段机器码（status.supervisionPhase）；null 表示不可用。 */
+    val supervisionPhase: String? = null,
+    /** 桥接 status 是否真的读到（false 表示不可用/被拒，不等于“离线”）。 */
     val statusAvailable: Boolean = false,
     /** 最近一次影响安全的错误机器码（触发/音频/撤销失败等）。 */
     val lastError: String? = null,
@@ -109,13 +112,17 @@ object AgentCallRuntime {
  * 没有类型的常驻服务，也绝不自动接听。
  *
  * ## 就绪与自动接听
- * - 服务启动请求本身不是就绪：每次循环都调用 [ServiceBootstrap.evaluate] 重新探测全部事实，
- *   任一缺失就把 ReadyChanged(false) 投给协调器（保留原响铃）；
- * - 当前桥接不向 APP 开放 status/diagnose，也不存在 HOOK→APP 快照通道，因此生产环境
- *   的判定会是 NOT_READY（见 7B2 报告的“未验证/阻塞”）。这是 fail closed，不是假成功。
+ * - 服务启动请求本身不是就绪：每次循环都调用 [ServiceBootstrap.evaluate] 重新探测全部事实
+ *   （status/config/diagnose/网络全部经 [BridgeClient]），任一缺失就把 ReadyChanged(false)
+ *   投给协调器（保留原响铃）；
+ * - 真实来电路径由 [SessionEventPoller] 提供：轮询 `session.events`（Task 7C）→ 映射成
+ *   [SessionEvent.StateChanged] → 协调器；协调器自己的 reducer 决定是否以及何时接听；
+ * - 真机仍会是 NOT_READY（`calibration_not_verified`）：桥接 CalibrationStore 没有可验证的
+ *   读写通道，APK 本机校准勾选不能解锁服务就绪。这是 fail closed，不是假成功。
  *
  * ## 生命周期
- * - [BridgeClient] 与 [SessionCoordinator] 懒创建、在 [onDestroy] 关闭；没有 GlobalScope；
+ * - [BridgeClient]、[SessionCoordinator] 与 [SessionEventPoller] 懒创建、在 [onDestroy] 关闭
+ *   （先停轮询再关协调器，停止后不再有任何事件/接听输入）；没有 GlobalScope；
  * - 进程被杀后系统按 START_STICKY 重启：重新创建一切并重新做就绪握手（不会继承旧 READY）；
  * - 通知与协调器 observer 只传机器码/会话身份，不传号码/密钥。
  */
@@ -129,8 +136,8 @@ class AgentCallService : Service() {
     private var notificationManager: NotificationManager? = null
 
     private var bridge: BridgeClient? = null
-    private var diagnostics: BridgeDiagnostics? = null
     private var coordinator: SessionCoordinator? = null
+    private var poller: SessionEventPoller? = null
     private var bootstrapJob: Job? = null
     private var preAnswerRecheck: PreAnswerRecheck? = null
 
@@ -175,23 +182,21 @@ class AgentCallService : Service() {
         bootstrapJob = null
         preAnswerRecheck?.cancel()
         preAnswerRecheck = null
+        // 先停轮询：服务停止后不得再有事件进入协调器（更不得自动接听）。
+        poller?.stop()
+        poller = null
         coordinator?.close()
         coordinator = null
         val client = bridge
         bridge = null
-        val diagnosticsClient = diagnostics
-        diagnostics = null
         // close() 只关 PCM lane 与控制传输，是本地 IO；绝不在主线程 runBlocking（ANR 风险）。
         // 收尾有界（CLIENT_CLOSE_TIMEOUT_MS），完成后才取消服务 scope。
-        if (client == null && diagnosticsClient == null) {
+        if (client == null) {
             scope.cancel()
         } else {
             CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
                 try {
-                    withTimeoutOrNull(CLIENT_CLOSE_TIMEOUT_MS) {
-                        runCatching { client?.close() }
-                    }
-                    runCatching { diagnosticsClient?.close() }
+                    withTimeoutOrNull(CLIENT_CLOSE_TIMEOUT_MS) { runCatching { client.close() } }
                 } finally {
                     scope.cancel()
                 }
@@ -247,15 +252,24 @@ class AgentCallService : Service() {
             scope = scope,
             logger = ::log,
         )
-        val diagnosticsClient = BridgeDiagnostics()
         val evidence = CalibrationEvidenceStore(this)
+        val liveFacts = BridgeLiveFactsProbe { client.status() }
         val probes = ReadinessProbes(
             bridge = BridgeProbe { client.ensureReady() },
-            hook = BridgeHookPresenceProbe(diagnosticsClient),
-            dialer = BridgeDialerRoleProbe(diagnosticsClient),
+            hook = liveFacts,
+            dialer = liveFacts,
             config = RedactedConfigProbe { client.readRedactedConfig() },
-            calibration = BridgeDiagnoseCalibrationProbe(diagnosticsClient, evidence),
+            calibration = BridgeCalibrationProbe(
+                environment = { (client.diagnose() as? BridgeRead.Available)?.value },
+                evidenceFor = { environment -> evidence.evidenceFor(environment) },
+                // 桥接 CalibrationStore（prepareAnswer 的授权权威）没有任何可读/可写通道：
+                // APK 本机勾选不能解锁服务就绪，真机保持 NOT_READY（calibration_not_verified）。
+                // 该通道落地后只需换成真实读取，其余判定仍由 CalibrationPolicy 决定。
+                bridgeCalibrationVerified = { false },
+            ),
             network = AndroidNetworkProbe(this),
+            live = liveFacts,
+            supervision = liveFacts,
         )
         val serviceBootstrap = ServiceBootstrap(probes, logger = ::log)
         val sessionCoordinator = SessionCoordinator(
@@ -280,10 +294,24 @@ class AgentCallService : Service() {
             },
         )
         sessionCoordinator.start()
+        // 真实来电路径：HOOK 快照 → bridge 事件环（7C）→ 500 ms 轮询 → 协调器。
+        // 只有服务运行期间轮询；onDestroy 先 stop 再关协调器，停止后零投递。
+        val eventsPoller = SessionEventPoller(
+            source = client,
+            publish = sessionCoordinator::onEvent,
+            scope = scope,
+            dispatcher = Dispatchers.Default,
+            onError = { code ->
+                // 只把固定机器码写进服务状态；轮询失败绝不静默、绝不伪造事件。
+                AgentCallRuntime.update { it.copy(lastError = code) }
+            },
+            logger = ::log,
+        )
+        eventsPoller.start()
         bridge = client
-        diagnostics = diagnosticsClient
         coordinator = sessionCoordinator
-        bootstrapJob = scope.launch { bootstrapLoop(serviceBootstrap, diagnosticsClient) }
+        poller = eventsPoller
+        bootstrapJob = scope.launch { bootstrapLoop(serviceBootstrap) }
         log("runtime_created")
     }
 
@@ -292,13 +320,10 @@ class AgentCallService : Service() {
      *
      * 循环永不自称就绪：ready 只来自 [ServiceBootstrap.evaluate]。
      */
-    private suspend fun bootstrapLoop(
-        serviceBootstrap: ServiceBootstrap,
-        diagnosticsClient: BridgeDiagnostics,
-    ) {
+    private suspend fun bootstrapLoop(serviceBootstrap: ServiceBootstrap) {
         while (scope.isActive && !stopping.get()) {
             try {
-                evaluateOnce(serviceBootstrap, diagnosticsClient)
+                evaluateOnce(serviceBootstrap)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (failure: Throwable) {
@@ -310,42 +335,25 @@ class AgentCallService : Service() {
         }
     }
 
-    private suspend fun evaluateOnce(
-        serviceBootstrap: ServiceBootstrap,
-        diagnosticsClient: BridgeDiagnostics,
-    ) {
+    private suspend fun evaluateOnce(serviceBootstrap: ServiceBootstrap) {
         val decision = serviceBootstrap.evaluate()
+        // 就绪判定同时带回它观测到的真实 status 事实（hookConnected，监督端 5000 ms 窗口
+        // 内的结论 / dialerDefaultRole / supervisionPhase），UI 与通知直接使用，
+        // 不再多读一次 status，也不会把“不可用”显示成“在线”。
         AgentCallRuntime.update {
             it.copy(
                 ready = decision.ready,
                 blockers = decision.codes,
                 foregroundActive = foregroundStarted,
+                statusAvailable = decision.statusAvailable,
+                hookPresence = decision.hookPresence,
+                dialerDefaultRole = decision.dialerDefaultRole,
+                supervisionPhase = decision.supervisionPhase,
             )
         }
         coordinator?.onEvent(SessionEvent.ReadyChanged(decision.ready))
-        refreshStatusFacts(diagnosticsClient)
         refreshConfig()
         updateNotification()
-    }
-
-    /** 把 status 的只读事实放进 UI 状态；不可用时保持 UNKNOWN，绝不伪造成“在线”。 */
-    private suspend fun refreshStatusFacts(diagnosticsClient: BridgeDiagnostics) {
-        when (val result = diagnosticsClient.status()) {
-            is BridgeStatusResult.Available -> AgentCallRuntime.update {
-                it.copy(
-                    statusAvailable = true,
-                    hookPresence = result.status.hookConnected,
-                    dialerDefaultRole = result.status.dialerDefaultRole,
-                )
-            }
-            is BridgeStatusResult.Unavailable -> AgentCallRuntime.update {
-                it.copy(
-                    statusAvailable = false,
-                    hookPresence = HookPresence.UNKNOWN,
-                    dialerDefaultRole = null,
-                )
-            }
-        }
     }
 
     /**

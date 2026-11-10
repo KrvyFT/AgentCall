@@ -5,13 +5,19 @@ import com.google.gson.JsonParser
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withTimeoutOrNull
 import org.krvyft.agentcall.core.model.AgentConfig
+import org.krvyft.agentcall.core.model.CalibrationEvidence
+import org.krvyft.agentcall.core.model.EnvironmentKey
+import org.krvyft.agentcall.core.policy.CalibrationPolicy
 import org.krvyft.agentcall.core.protocol.RpcCodec
 import org.krvyft.agentcall.core.rules.ConfigValidator
 import org.krvyft.agentcall.core.session.SessionLimits
+import org.krvyft.agentcall.ipc.BridgeRead
+import org.krvyft.agentcall.ipc.BridgeStatusFacts
 
 /**
- * HOOK 进程的存在性事实。三态是必须的：桥接未向 APP 角色暴露 `status` 时，
- * “不知道”不能被当作“在线”，也不能被当作“离线”静默忽略——它必须阻塞自动接听。
+ * HOOK 进程的存在性事实。三态是必须的：桥接明确回答 true/false 之外的一切
+ * （"unknown"、字段缺失、status 不可达/被拒）都是“不知道”，不能被当作“在线”，
+ * 也不能被当作“离线”静默忽略——它必须阻塞自动接听。
  */
 enum class HookPresence {
     /** 5000 ms 心跳窗口内收到过 HOOK 心跳。 */
@@ -35,6 +41,42 @@ enum class HookPresence {
             else -> UNKNOWN
         }
     }
+}
+
+/**
+ * 桥接 `status` 的一次只读快照，供就绪判定与 UI 共用（Task 7B3）。
+ *
+ * [hookPresence] 来自 `status.hookConnected`：监督端只在 5000 ms 心跳窗口内认定 HOOK
+ * 在线，因此这是“窗口内的真实结论”，不是 APP 自己的更长/更短超时。[statusAvailable] 区分
+ * “status 读到了但字段是 unknown”与“status 根本不可用”，两者都仍然 fail closed。
+ */
+data class LiveFacts(
+    val hookPresence: HookPresence,
+    val dialerDefaultRole: Boolean?,
+    val supervisionPhase: String?,
+    val supervisionBlocked: String?,
+    val statusAvailable: Boolean,
+) {
+    companion object {
+        /** status 不可用时的唯一安全表示（UNKNOWN + 无默认角色）；绝不表示“在线”。 */
+        val UNAVAILABLE: LiveFacts = LiveFacts(
+            hookPresence = HookPresence.UNKNOWN,
+            dialerDefaultRole = null,
+            supervisionPhase = null,
+            supervisionBlocked = null,
+            statusAvailable = false,
+        )
+    }
+}
+
+/** 一次 `status` 读取（生产实现 [BridgeLiveFactsProbe]，读 [org.krvyft.agentcall.ipc.BridgeClient.status]）。 */
+fun interface LiveFactsProbe {
+    suspend fun read(): LiveFacts
+}
+
+/** 监督阶段（生产实现读 `status.supervisionPhase`）；null 表示无法确定。 */
+fun interface SupervisionPhaseProbe {
+    suspend fun phase(): String?
 }
 
 /** 公开配置的就绪事实（只含布尔，绝不携带密钥或号码）。 */
@@ -74,6 +116,13 @@ data class ReadinessFacts(
     val config: ConfigFacts,
     val calibrationAllowed: Boolean,
     val networkReachable: Boolean,
+    /**
+     * 监督阶段机器码（观测值，只用于 UI/诊断，不单独构成阻塞项）。
+     *
+     * BLOCKED 时桥接自己会在 `session.request`/prepareAnswer 拒绝新的 AI 会话；
+     * APP 不在这里另造一个阻塞码（固定码表与字符串资源属于既有契约）。
+     */
+    val supervisionPhase: String? = null,
 )
 
 /** 阻止自动接听的具体原因；[code] 是机器可读、无敏感数据的固定短码。 */
@@ -110,6 +159,14 @@ enum class BootstrapBlocker(val code: String) {
 data class BootstrapDecision(
     val ready: Boolean,
     val blockers: List<BootstrapBlocker>,
+    /** 本次判定观测到的 HOOK 存在性（供 UI/通知显示，不改变裁决）。 */
+    val hookPresence: HookPresence = HookPresence.UNKNOWN,
+    /** 本次判定观测到的默认拨号角色；null = 无法确定。 */
+    val dialerDefaultRole: Boolean? = null,
+    /** 本次判定观测到的监督阶段机器码。 */
+    val supervisionPhase: String? = null,
+    /** status 是否真的读到（false 表示 hook/dialer 都是“不可用”，不是“离线”）。 */
+    val statusAvailable: Boolean = false,
 ) {
     val codes: List<String> get() = blockers.map { it.code }
 }
@@ -149,10 +206,10 @@ fun interface BridgeProbe {
 }
 
 /**
- * HOOK 心跳存在性（生产实现读桥接 `status.hookConnected`）。
+ * HOOK 心跳存在性（生产实现读桥接 `status.hookConnected`，Task 7C 起 APP 可读）。
  *
- * 桥接当前只把 `status` 开放给 CLI_ROOT；APP 调用会被 `RolePolicy` 拒绝，此时这里必须
- * 返回 [HookPresence.UNKNOWN]（→ 永不自动接听），不能猜测为在线。
+ * status 不可达/被拒/字段为 "unknown" 时这里必须返回 [HookPresence.UNKNOWN]
+ * （→ 永不自动接听），不能猜测为在线。
  */
 fun interface HookPresenceProbe {
     suspend fun presence(): HookPresence
@@ -182,7 +239,13 @@ fun interface NetworkProbe {
     fun isOnline(): Boolean
 }
 
-/** 一组可注入的就绪探针；生产装配在 [AgentCallService] 内，测试可完全替换。 */
+/**
+ * 一组可注入的就绪探针；生产装配在 [AgentCallService] 内，测试可完全替换。
+ *
+ * [live] 是首选的单次 status 读取：提供时 hook/dialer/supervision 全部来自同一份真实负载
+ * （生产装配用 [BridgeLiveFactsProbe]）。[hook]/[dialer]/[supervision] 是 live 失败时的
+ * 后备（生产仍是同一个桥接探针，绝不是“永远 unknown”的占位实现）。
+ */
 class ReadinessProbes(
     val bridge: BridgeProbe,
     val hook: HookPresenceProbe,
@@ -190,6 +253,8 @@ class ReadinessProbes(
     val config: ConfigProbe,
     val calibration: CalibrationProbe,
     val network: NetworkProbe,
+    val live: LiveFactsProbe? = null,
+    val supervision: SupervisionPhaseProbe = SupervisionPhaseProbe { null },
 )
 
 /**
@@ -213,15 +278,38 @@ class ServiceBootstrap(
 
     /** 完整裁决（含全部阻塞原因），供 UI/诊断显示“到底缺哪一项”。 */
     suspend fun evaluate(): BootstrapDecision {
+        // 首选一次真实 status 读取（生产 BridgeLiveFactsProbe）：三项实时事实同源，避免
+        // 同一判定里的 status 读三次。读取失败时退回桥接探针（生产是同一个实现），
+        // 仍然只能得到 UNKNOWN/null。
+        val live = probes.live?.let { probe("live") { it.read() } }
+        val hookPresence = live?.hookPresence
+            ?: probe("hook") { probes.hook.presence() }
+            ?: HookPresence.UNKNOWN
+        val dialerDefaultRole = if (live != null) {
+            live.dialerDefaultRole
+        } else {
+            probe("dialer") { probes.dialer.isDefault() }
+        }
+        val supervisionPhase = if (live != null) {
+            live.supervisionPhase
+        } else {
+            probe("supervision") { probes.supervision.phase() }
+        }
         val facts = ReadinessFacts(
             bridgeReady = probe("bridge") { probes.bridge.isReachable() } ?: false,
-            hookPresence = probe("hook") { probes.hook.presence() } ?: HookPresence.UNKNOWN,
-            dialerDefaultRole = probe("dialer") { probes.dialer.isDefault() },
+            hookPresence = hookPresence,
+            dialerDefaultRole = dialerDefaultRole,
             config = probe("config") { probes.config.read() } ?: ConfigFacts.UNAVAILABLE,
             calibrationAllowed = probe("calibration") { probes.calibration.canAutoAnswer() } ?: false,
             networkReachable = probe("network") { probes.network.isOnline() } ?: false,
+            supervisionPhase = supervisionPhase,
         )
-        val decision = BootstrapPolicy.evaluate(facts)
+        val decision = BootstrapPolicy.evaluate(facts).copy(
+            hookPresence = hookPresence,
+            dialerDefaultRole = dialerDefaultRole,
+            supervisionPhase = supervisionPhase,
+            statusAvailable = live?.statusAvailable ?: false,
+        )
         for (blocker in decision.blockers) logger("bootstrap.not_ready code=" + blocker.code)
         return decision
     }
@@ -244,6 +332,63 @@ class ServiceBootstrap(
 
         /** 单个探针的上界；取 HOOK 心跳窗口，保证一次判定不会晚于失联窗口太多。 */
         const val PROBE_TIMEOUT_MS: Long = HOOK_PRESENCE_WINDOW_MS
+    }
+}
+
+/**
+ * 生产 status 探针：一次 `BridgeClient.status()` 派生 [LiveFacts]，并同时实现三个
+ * 单事实探针（live 读取失败时的后备，仍然是同一份真实负载，不是占位值）。
+ *
+ * [BridgeRead.Unavailable] 一律表达为 [LiveFacts.UNAVAILABLE]：status 被拒（旧桥接/角色表
+ * 不匹配）与桥接不可达都不能变成“在线”或“默认拨号器”。RPC 机器码由 BridgeClient 原样
+ * 返回并记日志，本类不做二次猜测。
+ */
+class BridgeLiveFactsProbe(
+    private val readStatus: suspend () -> BridgeRead<BridgeStatusFacts>,
+) : LiveFactsProbe, HookPresenceProbe, DialerDefaultRoleProbe, SupervisionPhaseProbe {
+
+    override suspend fun read(): LiveFacts = when (val result = readStatus()) {
+        is BridgeRead.Available -> LiveFacts(
+            hookPresence = HookPresence.fromStatusField(result.value.hookConnected),
+            dialerDefaultRole = result.value.dialerDefaultRole,
+            supervisionPhase = result.value.supervisionPhase,
+            supervisionBlocked = result.value.supervisionBlocked,
+            statusAvailable = true,
+        )
+        is BridgeRead.Unavailable -> LiveFacts.UNAVAILABLE
+    }
+
+    override suspend fun presence(): HookPresence = read().hookPresence
+
+    override suspend fun isDefault(): Boolean? = read().dialerDefaultRole
+
+    override suspend fun phase(): String? = read().supervisionPhase
+}
+
+/**
+ * 生产校准探针：真实 diagnose 的 [EnvironmentKey] + 本机人工证据 + core [CalibrationPolicy]
+ * + **桥接校准授权**（Task 7B3）。
+ *
+ * 为什么多一个 [bridgeCalibrationVerified] 输入：桥接的 `CalibrationStore` 才是
+ * `prepareAnswer` 授权的唯一权威（`AutoAnswerAuthorization`），而它目前**没有任何
+ * 可读/可写通道**。APK 本机勾选五项人工测试不等于桥接已放行；若只看本机证据，服务会
+ * 宣布 READY，却在真正接听时被桥接拒绝。因此生产装配显式传入 `{ false }`，就绪保持
+ * NOT_READY（`calibration_not_verified`），直到桥接提供一条可验证的校准读写通道。
+ *
+ * 这不是“永久禁用”：未来通道落地时，把 [bridgeCalibrationVerified] 换成真实读取即可，
+ * 其余判定（环境绑定、API 37、五项证据、时间戳）完全复用 [CalibrationPolicy]。
+ */
+class BridgeCalibrationProbe(
+    private val environment: suspend () -> EnvironmentKey?,
+    private val evidenceFor: (EnvironmentKey) -> CalibrationEvidence?,
+    private val bridgeCalibrationVerified: suspend () -> Boolean,
+) : CalibrationProbe {
+
+    override suspend fun canAutoAnswer(): Boolean {
+        val current = environment() ?: return false
+        if (!bridgeCalibrationVerified()) return false
+        val evidence = evidenceFor(current) ?: return false
+        return CalibrationPolicy.canAutoAnswer(current, evidence)
     }
 }
 
