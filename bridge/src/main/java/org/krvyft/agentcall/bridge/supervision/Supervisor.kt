@@ -5,6 +5,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.krvyft.agentcall.bridge.audio.AudioUnavailableException
 import org.krvyft.agentcall.bridge.audio.BridgeProcessRole
+import org.krvyft.agentcall.bridge.audio.IsolationProbe
 import org.krvyft.agentcall.bridge.audio.ProcessFaultDecision
 import org.krvyft.agentcall.bridge.audio.SupervisedAudio
 import org.krvyft.agentcall.core.model.AudioFormatSpec
@@ -183,6 +184,18 @@ class Supervisor(
     private var lastFault: String? = null
 
     /**
+     * 启动恢复/隔离读回的可重试未验证状态（评审 I1）。
+     *
+     * 工作进程晚启动或瞬时不可达时，启动恢复不在原地做 3 次 500 ms 重试后永久 BLOCKED，
+     * 而是登记一个总期限，由 [poll] 在期限内继续尝试恢复与读回；期限内只有“确定未隔离”
+     * 或“工作进程明确错误”才立即 BLOCK。超期仍未取得证据才 fail closed。
+     */
+    private var recoveryDeadlineMs: Long? = null
+
+    /** 下一次恢复重试时刻；避免 500 ms 轮询无限重复同一次角色通道往返。 */
+    private var recoveryRetryAtMs: Long? = null
+
+    /**
      * 粘性所有权标记（修复轮 2 / 新增重要缺陷 2）。
      *
      * “本监督端曾经取得过通话所有权，且尚未确认断开/未接听/交还”。它必须与
@@ -299,11 +312,27 @@ class Supervisor(
             return CommandResult.Rejected(RejectReason.UNSUPPORTED)
         }
         // I7：隔离成功也要读回系统状态，不能只信返回值/缓存。
-        if (!audio.verifyIsolation()) {
-            leases.revoke(id)
-            audio.stopKeepingIsolation()
-            block(BLOCKER_ISOLATION_LOST)
-            return CommandResult.Rejected(RejectReason.UNSUPPORTED)
+        // I1：不可达不等于“隔离丢失”，只阻止本次自动接听（可重试），不把它当成永久阻塞证据。
+        when (val probe = probeIsolationSafe()) {
+            is IsolationProbe.Verified -> if (!probe.isolated) {
+                leases.revoke(id)
+                audio.stopKeepingIsolation()
+                block(BLOCKER_ISOLATION_LOST)
+                return CommandResult.Rejected(RejectReason.UNSUPPORTED)
+            }
+            is IsolationProbe.WorkerError -> {
+                leases.revoke(id)
+                audio.stopKeepingIsolation()
+                block(BLOCKER_ISOLATION_UNAVAILABLE)
+                return CommandResult.Rejected(RejectReason.UNSUPPORTED)
+            }
+            is IsolationProbe.Unverified -> {
+                // 没有系统事实：撤销租约、保持隔离意图、不开音频；轮询会在总期限内重试并清除阻塞。
+                leases.revoke(id)
+                audio.stopKeepingIsolation()
+                block(BLOCKER_ISOLATION_UNAVAILABLE)
+                return CommandResult.Rejected(RejectReason.UNSUPPORTED)
+            }
         }
 
         synchronized(stateMonitor) {
@@ -417,11 +446,25 @@ class Supervisor(
             return CommandResult.Rejected(RejectReason.NOT_OWNED)
         }
         // I7：打开前必须读回系统隔离状态。
-        if (!audio.verifyIsolation()) {
-            audio.stopKeepingIsolation()
-            block(BLOCKER_ISOLATION_LOST)
-            terminateOwnedLocked(id, BLOCKER_ISOLATION_LOST)
-            return CommandResult.Failed(BLOCKER_ISOLATION_LOST, "microphone isolation read-back failed")
+        // I1：只有“确定未隔离”或工作进程明确错误才是 BLOCK 证据；不可达只是本次不能打开。
+        when (val probe = probeIsolationSafe()) {
+            is IsolationProbe.Verified -> if (!probe.isolated) {
+                audio.stopKeepingIsolation()
+                block(BLOCKER_ISOLATION_LOST)
+                terminateOwnedLocked(id, BLOCKER_ISOLATION_LOST)
+                return CommandResult.Failed(BLOCKER_ISOLATION_LOST, "microphone isolation read-back failed")
+            }
+            is IsolationProbe.WorkerError -> {
+                audio.stopKeepingIsolation()
+                block(BLOCKER_ISOLATION_LOST)
+                terminateOwnedLocked(id, BLOCKER_ISOLATION_LOST)
+                return CommandResult.Failed(probe.code, "microphone isolation could not be verified")
+            }
+            is IsolationProbe.Unverified -> {
+                // 没有系统事实：不开音频，也不把一次瞬时不可达当成隔离丢失。
+                audio.stopKeepingIsolation()
+                return CommandResult.Failed(ERROR_ISOLATION_UNVERIFIED, "microphone isolation could not be verified")
+            }
         }
         return try {
             audio.open(id, format)
@@ -448,16 +491,15 @@ class Supervisor(
         if (synchronized(stateMonitor) { ownedSession } != id) return emptyList()
         val actions = mutableListOf<SupervisorAction>()
         // I7：读回系统状态，不用缓存布尔值。
-        val stillIsolated = try {
-            audio.verifyIsolation()
-        } catch (t: Throwable) {
-            false
-        }
+        // I1：工作进程不可达没有隔离事实，不能据此 block + 终止；保持隔离意图并开人工接管窗口。
+        val probe = probeIsolationSafe()
         audio.stopKeepingIsolation()
         actions += SupervisorAction.StopAudioKeepingIsolation(id, code)
         synchronized(stateMonitor) { lastFault = code }
 
-        if (!stillIsolated) {
+        val isolationLost = probe is IsolationProbe.Verified && !probe.isolated
+        val workerError = probe is IsolationProbe.WorkerError
+        if (isolationLost || workerError) {
             block(BLOCKER_ISOLATION_LOST)
             actions += SupervisorAction.BlockNewSessions(BLOCKER_ISOLATION_LOST)
             actions += terminateOwnedLocked(id, BLOCKER_ISOLATION_LOST).actions
@@ -611,6 +653,8 @@ class Supervisor(
     suspend fun poll(nowMs: Long = clock.nowMs()): List<SupervisorAction> = transitions.withLock {
         val actions = mutableListOf<SupervisorAction>()
         drainPendingInto(actions)
+        // I1：启动恢复的未验证/可恢复阻塞在轮询里继续重试；只有系统证据才允许清除阻塞。
+        actions += reconcileRecoveryLocked(nowMs)
         // 音频工作进程故障的生产来源：每轮取走一条并计入本监督端的重启预算。
         var audioFault = takeAudioFault()
         while (audioFault != null) {
@@ -641,12 +685,11 @@ class Supervisor(
             isolatedOwner !in handled &&
             liveOwner.first in AUDIO_OWNER_PHASES
         ) {
-            val stillIsolated = try {
-                audio.verifyIsolation()
-            } catch (t: Throwable) {
-                false
-            }
-            if (!stillIsolated) {
+            // I1：只有“确定未隔离”或工作进程明确错误才 block + 终止；不可达留给重启预算。
+            val probe = probeIsolationSafe()
+            val isolationLost = probe is IsolationProbe.Verified && !probe.isolated
+            val workerError = probe is IsolationProbe.WorkerError
+            if (isolationLost || workerError) {
                 audio.stopKeepingIsolation()
                 block(BLOCKER_ISOLATION_LOST)
                 actions += SupervisorAction.BlockNewSessions(BLOCKER_ISOLATION_LOST)
@@ -701,6 +744,81 @@ class Supervisor(
         null
     }
 
+    /** I1：隔离读回的三态封装；端口抛异常按“未验证”处理，绝不冒充“已解除隔离”。 */
+    private suspend fun probeIsolationSafe(): IsolationProbe = try {
+        audio.probeIsolation()
+    } catch (t: Throwable) {
+        IsolationProbe.Unverified(t.javaClass.simpleName)
+    }
+
+    /**
+     * I1：可恢复阻塞的轮询重试。
+     *
+     * 只在“没有拥有的会话且粘性所有权标记为 false”时尝试恢复麦克风并读回；任何情况下都
+     * 绝不解除可能仍活着的 AI 通话隔离。清除阻塞的唯一依据是系统事实“确定未隔离”
+     * （[IsolationProbe.Verified] false），或恢复请求本身的成功应答；不可达/非法响应只会
+     * 在期限内继续重试，超期才 fail closed。
+     */
+    private suspend fun reconcileRecoveryLocked(nowMs: Long): List<SupervisorAction> {
+        val deadline = synchronized(stateMonitor) {
+            val reason = blockedReason
+            if (reason == null || reason !in RECOVERY_RETRY_BLOCKERS) return emptyList()
+            if (ownedSession != null || ownershipMayBeLive) return emptyList()
+            val retryAt = recoveryRetryAtMs
+            if (retryAt != null && nowMs < retryAt) return emptyList()
+            recoveryDeadlineMs
+        }
+
+        val restored = try {
+            audio.restoreMicrophone()
+        } catch (t: Throwable) {
+            false
+        }
+        val probe = probeIsolationSafe()
+        val verified = probe as? IsolationProbe.Verified
+        val definitelyNotIsolated = verified != null && !verified.isolated
+        // 恢复请求的成功应答本身就是工作进程对“已解除隔离”的确认（ok=true 且 isolated=false）。
+        val restoredResponseEvidence = restored && probe is IsolationProbe.Unverified
+        if (definitelyNotIsolated || restoredResponseEvidence) {
+            synchronized(stateMonitor) {
+                blockedReason = null
+                recoveryDeadlineMs = null
+                recoveryRetryAtMs = null
+                if (phase == SupervisorPhase.BLOCKED) phase = SupervisorPhase.IDLE
+            }
+            persist()
+            return emptyList()
+        }
+        if (verified != null && verified.isolated) {
+            val expired = deadline != null && nowMs >= deadline
+            synchronized(stateMonitor) {
+                recoveryRetryAtMs = nowMs + RECOVERY_RETRY_INTERVAL_MS
+                if (expired && blockedReason != SupervisorBootRecovery.BLOCK_STILL_ISOLATED) {
+                    blockedReason = SupervisorBootRecovery.BLOCK_STILL_ISOLATED
+                    phase = SupervisorPhase.BLOCKED
+                }
+            }
+            if (expired) persist()
+            return if (expired) {
+                listOf(SupervisorAction.BlockNewSessions(SupervisorBootRecovery.BLOCK_STILL_ISOLATED))
+            } else {
+                emptyList()
+            }
+        }
+        if (probe is IsolationProbe.WorkerError) {
+            // 工作进程明确回报错误：这是确定证据，保持/进入 BLOCKED。
+            block(SupervisorBootRecovery.BLOCK_RESTORE_FAILED)
+            return listOf(SupervisorAction.BlockNewSessions(SupervisorBootRecovery.BLOCK_RESTORE_FAILED))
+        }
+        val expired = deadline != null && nowMs >= deadline
+        if (!expired) {
+            synchronized(stateMonitor) { recoveryRetryAtMs = nowMs + RECOVERY_RETRY_INTERVAL_MS }
+            return emptyList()
+        }
+        block(SupervisorBootRecovery.BLOCK_RESTORE_FAILED)
+        return listOf(SupervisorAction.BlockNewSessions(SupervisorBootRecovery.BLOCK_RESTORE_FAILED))
+    }
+
     /**
      * 已持有 [transitions] 时的故障裁决。返回裁决与被触发的终止动作，供
      * [poll] 把生产路径的故障直接变成监督动作；[onProcessFault] 是它的挂起入口。
@@ -713,11 +831,18 @@ class Supervisor(
         if (role != BridgeProcessRole.AUDIO_WORKER || this.role != BridgeProcessRole.SUPERVISOR) {
             return ProcessFaultDecision.NotManaged to emptyList()
         }
+        // I1：没有拥有的通话时，启动/恢复探测的瞬时不可达不是“重启”，绝不占用预算；
+        // 否则工作进程晚启动会把预算打满，第一通真实通话的首次故障就直接被终止。
+        val owned = synchronized(stateMonitor) { ownedSession }
+        if (owned == null) {
+            synchronized(stateMonitor) { lastFault = code }
+            persist()
+            return ProcessFaultDecision.RestartAllowed(restartBudget.used(nowMs)) to emptyList()
+        }
         val decision = restartBudget.record(nowMs)
         synchronized(stateMonitor) { lastFault = code }
         val actions = if (decision is ProcessFaultDecision.RestartExhausted) {
-            val owned = synchronized(stateMonitor) { ownedSession }
-            if (owned == null) emptyList() else terminateOwnedLocked(owned, "audio_restart_exhausted").actions
+            terminateOwnedLocked(owned, "audio_restart_exhausted").actions
         } else {
             persist()
             emptyList()
@@ -752,11 +877,39 @@ class Supervisor(
 
     /**
      * 启动恢复失败时由运行时调用：阻止新的 AI 会话，保留隔离，等待人工处理。
+     *
+     * I1：隔离/恢复类阻塞不是“永久死刑”。登记总期限与下次重试时刻，由 [poll] 继续
+     * 尝试恢复麦克风并读回系统状态；只有系统证据“确定未隔离”才清除阻塞。
      */
     fun block(reason: String) {
         synchronized(stateMonitor) {
             blockedReason = reason
             phase = SupervisorPhase.BLOCKED
+            if (reason in RECOVERY_RETRY_BLOCKERS) {
+                if (recoveryDeadlineMs == null) {
+                    recoveryDeadlineMs = clock.nowMs() + SupervisorBootRecovery.DEFAULT_RECOVERY_DEADLINE_MS
+                }
+                recoveryRetryAtMs = clock.nowMs() + RECOVERY_RETRY_INTERVAL_MS
+            } else {
+                recoveryDeadlineMs = null
+                recoveryRetryAtMs = null
+            }
+        }
+        persist()
+    }
+
+    /**
+     * I1：启动恢复未取得隔离证据时的可重试登记（不是 [block]）。
+     *
+     * 自动接听在未验证期间保持关闭（[isReady] 因 blockedReason 非空返回 false），但不会
+     * 永久禁用模块：轮询在 [deadlineAtMs] 前继续重试恢复/读回，取得“确定未隔离”证据后
+     * 自动清除阻塞并回到 IDLE。
+     */
+    fun beginRecovery(reason: String, deadlineAtMs: Long) {
+        synchronized(stateMonitor) {
+            blockedReason = reason
+            recoveryDeadlineMs = deadlineAtMs
+            recoveryRetryAtMs = clock.nowMs()
         }
         persist()
     }
@@ -835,6 +988,26 @@ class Supervisor(
             SupervisorPhase.ANSWER_PENDING,
             SupervisorPhase.ACTIVE,
             SupervisorPhase.HANDOFF_PENDING,
+        )
+
+        /** 隔离读回不可达：本次不能打开音频，但不是“隔离丢失”的证据。 */
+        const val ERROR_ISOLATION_UNVERIFIED: String = "microphone_isolation_unverified"
+
+        /** 可恢复阻塞的轮询重试间隔；与 500 ms 轮询解耦，避免无限重复角色通道往返。 */
+        internal const val RECOVERY_RETRY_INTERVAL_MS: Long = 1_000L
+
+        /**
+         * 可以由“系统确认未隔离”清除的阻塞集合。
+         *
+         * 终止未确认、特权终止不可用、状态写失败等阻塞绝不在其中：它们与麦克风隔离
+         * 无关，不能用一次隔离读回就当成已解决。
+         */
+        internal val RECOVERY_RETRY_BLOCKERS: Set<String> = setOf(
+            BLOCKER_ISOLATION_UNAVAILABLE,
+            BLOCKER_ISOLATION_LOST,
+            BLOCKER_RESTORE_FAILED,
+            SupervisorBootRecovery.BLOCK_RESTORE_FAILED,
+            SupervisorBootRecovery.BLOCK_STILL_ISOLATED,
         )
 
         const val BLOCKER_ISOLATION_UNAVAILABLE: String = "microphone_isolation_unavailable"

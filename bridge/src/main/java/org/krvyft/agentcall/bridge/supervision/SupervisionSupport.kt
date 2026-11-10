@@ -11,6 +11,7 @@ import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import kotlinx.coroutines.delay
 import org.krvyft.agentcall.bridge.audio.AudioFailureCode
+import org.krvyft.agentcall.bridge.audio.IsolationProbe
 import org.krvyft.agentcall.bridge.audio.ProcessFaultDecision
 import org.krvyft.agentcall.bridge.audio.SupervisedAudio
 import org.krvyft.agentcall.bridge.config.PrivateFilePermissions
@@ -348,17 +349,26 @@ enum class BootRecoveryOutcome {
     CLEAN,
     RESTORED,
     BLOCKED,
+
+    /**
+     * 工作进程当前不可达/无法确认隔离：本次不阻塞、不解除隔离，只登记可重试的未验证
+     * 阻塞（自动接听保持关闭），由轮询在总期限内继续恢复与读回（评审 I1）。
+     */
+    DEFERRED,
 }
 
 /**
  * 监督进程启动恢复（I5，spec §8）。
  *
- * 启动策略（fail closed）：
+ * 启动策略（fail closed，评审 I1 改为取证式）：
  * 1. 先**总是**尝试恢复麦克风并读回系统状态——上一任监督进程可能在任何时刻被杀，
  *    把系统麦克风留在静音状态；重启后不应等用户手动修；
- * 2. 恢复失败或读回仍为“已隔离” → [BLOCKED]，绝不启用任何 AI 会话；
- * 3. 持久状态损坏/更新 schema → 仍然先尝试恢复，然后 [BLOCKED]（不猜旧状态）；
- * 4. 持久状态里的旧所有权**绝不**绑定到新通话；成功恢复后写回一份干净状态。
+ * 2. 只有**确定证据**才立即 [BLOCKED]：系统读回仍隔离，或工作进程明确回报错误；
+ * 3. 工作进程不可达/响应无法确认 → [DEFERRED]：登记一个有总期限的可重试阻塞，由
+ *    [Supervisor.poll] 继续恢复与读回；自动接听在未验证期间保持关闭，但模块不会因为
+ *    一次“工作进程还没起来”就永久不可用；
+ * 4. 持久状态损坏/更新 schema → 仍然先尝试恢复，然后 [BLOCKED]（不猜旧状态）；
+ * 5. 持久状态里的旧所有权**绝不**绑定到新通话；成功恢复后写回一份干净状态。
  */
 class SupervisorBootRecovery(
     private val audio: SupervisedAudio,
@@ -366,8 +376,11 @@ class SupervisorBootRecovery(
     private val block: (String) -> Unit,
     private val clock: MonotonicClock,
     private val bootId: () -> String? = { null },
-    /** 两次恢复尝试之间的等待；测试注入空实现以避免真实等待。 */
-    private val pause: suspend () -> Unit = { delay(RESTORE_RETRY_DELAY_MS) },
+    /**
+     * 未取得隔离证据时登记可重试阻塞（生产接 [Supervisor.beginRecovery]）。默认空实现
+     * 只服务于不驱动轮询的旧构造点：调用方仍会收到 [BootRecoveryOutcome.DEFERRED]。
+     */
+    private val beginRecovery: (reason: String, deadlineAtMs: Long) -> Unit = { _, _ -> },
 ) {
 
     suspend fun recover(): BootRecoveryOutcome {
@@ -405,32 +418,29 @@ class SupervisorBootRecovery(
             return BootRecoveryOutcome.BLOCKED
         }
 
-        // 音频工作进程是另一个 app_process，桥接启动恢复时它可能还没绑定角色通道：
-        // 一次“不可达”就永久 BLOCKED 会让模块重启后一直不可用，因此有界重试；
-        // 次数用尽仍然 fail closed（保持隔离并阻止新会话）。
-        var restored = false
-        var attempts = 0
-        while (!restored && attempts < DEFAULT_RESTORE_ATTEMPTS) {
-            if (attempts > 0) pause()
-            attempts++
-            restored = try {
-                audio.restoreMicrophone()
-            } catch (t: Throwable) {
-                false
-            }
-        }
-        val stillIsolated = try {
-            audio.verifyIsolation()
+        // 音频工作进程是另一个 app_process，桥接启动时它可能还没绑定角色通道。这里只做
+        // **一次**恢复尝试 + 一次三态读回：
+        // - 系统确认未隔离（或恢复请求自身成功应答）→ 安全，继续写回干净状态；
+        // - 系统确认仍隔离 / 工作进程明确错误 → 确定证据，立即 BLOCKED；
+        // - 不可达/无法确认 → DEFERRED：登记有总期限的可重试阻塞，由轮询继续取证。
+        val restored = try {
+            audio.restoreMicrophone()
         } catch (t: Throwable) {
-            true
+            false
         }
-        if (!restored) {
-            block(BLOCK_RESTORE_FAILED)
-            return BootRecoveryOutcome.BLOCKED
-        }
-        if (stillIsolated) {
-            block(BLOCK_STILL_ISOLATED)
-            return BootRecoveryOutcome.BLOCKED
+        when (val probe = probeIsolation()) {
+            is IsolationProbe.Verified -> if (probe.isolated) {
+                block(BLOCK_STILL_ISOLATED)
+                return BootRecoveryOutcome.BLOCKED
+            }
+            is IsolationProbe.WorkerError -> {
+                block(BLOCK_RESTORE_FAILED)
+                return BootRecoveryOutcome.BLOCKED
+            }
+            is IsolationProbe.Unverified -> if (!restored) {
+                beginRecovery(BLOCK_RESTORE_FAILED, clock.nowMs() + DEFAULT_RECOVERY_DEADLINE_MS)
+                return BootRecoveryOutcome.DEFERRED
+            }
         }
 
         val previous = when (loaded) {
@@ -462,17 +472,24 @@ class SupervisorBootRecovery(
         return if (stale) BootRecoveryOutcome.RESTORED else BootRecoveryOutcome.CLEAN
     }
 
+    /** 三态读回；端口异常按“未验证”处理，绝不冒充“仍隔离/已解除”。 */
+    private suspend fun probeIsolation(): IsolationProbe = try {
+        audio.probeIsolation()
+    } catch (t: Throwable) {
+        IsolationProbe.Unverified(t.javaClass.simpleName)
+    }
+
     private sealed interface LoadResult {
         data class Loaded(val state: SupervisionPersistedState?) : LoadResult
         data class Failed(val code: String) : LoadResult
     }
 
     companion object {
-        /** 启动恢复尝试次数上限；音频工作进程晚于桥接启动时仍能恢复，但次数有界。 */
-        const val DEFAULT_RESTORE_ATTEMPTS: Int = 3
-
-        /** 两次恢复尝试之间的等待（毫秒）。 */
-        const val RESTORE_RETRY_DELAY_MS: Long = 500L
+        /**
+         * 启动恢复的总期限：工作进程晚启动的合法窗口。期限内轮询持续重试恢复/读回，
+         * 超期仍未取得证据才 fail closed（BLOCKED）。
+         */
+        const val DEFAULT_RECOVERY_DEADLINE_MS: Long = 15_000L
 
         const val BLOCK_RESTORE_FAILED: String = "microphone_restore_failed"
         const val BLOCK_STILL_ISOLATED: String = "microphone_still_isolated"
@@ -602,7 +619,14 @@ object SupervisorProductionGraph {
             initialOwnershipMayBeLive = persistedOwnershipMayBeLive(store, clock, platform.bootId()),
             callState = platform.callState(),
         )
-        val recovery = SupervisorBootRecovery(audio, store, supervisor::block, clock, platform::bootId)
+        val recovery = SupervisorBootRecovery(
+            audio,
+            store,
+            supervisor::block,
+            clock,
+            platform::bootId,
+            supervisor::beginRecovery,
+        )
         val loop = SupervisionLoop(
             poll = supervisor::poll,
             clock = clock,

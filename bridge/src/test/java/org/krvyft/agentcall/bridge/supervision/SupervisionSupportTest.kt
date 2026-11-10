@@ -15,6 +15,7 @@ import org.junit.Assert.fail
 import org.junit.Test
 import org.krvyft.agentcall.bridge.audio.AudioFailureCode
 import org.krvyft.agentcall.bridge.audio.BridgeProcessRole
+import org.krvyft.agentcall.bridge.audio.IsolationProbe
 import org.krvyft.agentcall.bridge.audio.ProcessFaultDecision
 import org.krvyft.agentcall.bridge.audio.SupervisedAudio
 import org.krvyft.agentcall.core.model.AudioFormatSpec
@@ -162,22 +163,6 @@ class SupervisorBootRecoveryTest {
     }
 
     @Test
-    fun restoreFailureBlocksNewSessions() = runBlocking {
-        val audio = SupportAudio().apply { restoreResult = false }
-        var blocked: String? = null
-        val recovery = SupervisorBootRecovery(
-            audio,
-            FakeStateStore(null),
-            { blocked = it },
-            SupportClock(),
-            pause = {},
-        )
-
-        assertEquals(BootRecoveryOutcome.BLOCKED, recovery.recover())
-        assertEquals(SupervisorBootRecovery.BLOCK_RESTORE_FAILED, blocked)
-    }
-
-    @Test
     fun stillIsolatedAfterRestoreBlocksNewSessions() = runBlocking {
         val audio = SupportAudio().apply { systemIsolated = true; restoreEffective = false }
         var blocked: String? = null
@@ -186,7 +171,6 @@ class SupervisorBootRecoveryTest {
             FakeStateStore(null),
             { blocked = it },
             SupportClock(),
-            pause = {},
         )
 
         assertEquals(BootRecoveryOutcome.BLOCKED, recovery.recover())
@@ -194,44 +178,50 @@ class SupervisorBootRecoveryTest {
     }
 
     /**
-     * 启动恢复必须有界重试：音频工作进程是另一个 app_process，桥接启动恢复时它可能
-     * 还没绑定角色通道；一次“不可达”就永久 BLOCKED 会让模块重启后一直不可用。
+     * I1：不可达不是“隔离丢失”。工作进程晚启动时启动恢复必须返回 DEFERRED 并登记
+     * 可重试的未验证阻塞，而不是 3×500 ms 后永久 BLOCKED。
      */
     @Test
-    fun bootRecoveryRetriesUntilTheAudioWorkerIsUp() = runBlocking {
-        val audio = SupportAudio().apply { restoreFailuresRemaining = 2 }
+    fun unreachableWorkerDefersRecoveryInsteadOfBlocking() = runBlocking {
+        val audio = SupportAudio().apply {
+            restoreResult = false
+            probeResult = IsolationProbe.Unverified("audio_worker_unreachable")
+        }
         var blocked: String? = null
+        var deferredReason: String? = null
+        var deadlineAtMs = 0L
         val recovery = SupervisorBootRecovery(
             audio,
             FakeStateStore(null),
             { blocked = it },
-            SupportClock(),
-            pause = {},
+            SupportClock(1_000),
+            beginRecovery = { reason, deadline ->
+                deferredReason = reason
+                deadlineAtMs = deadline
+            },
         )
 
-        assertEquals(BootRecoveryOutcome.CLEAN, recovery.recover())
-        assertEquals("工作进程晚到时必须重试恢复而不是直接放弃", 3, audio.restoreCalls)
-        assertNull(blocked)
+        assertEquals(BootRecoveryOutcome.DEFERRED, recovery.recover())
+        assertNull("不可达绝不是永久阻塞的证据", blocked)
+        assertEquals(SupervisorBootRecovery.BLOCK_RESTORE_FAILED, deferredReason)
+        assertEquals(
+            "重试必须有总期限（不是无限重试）",
+            1_000 + SupervisorBootRecovery.DEFAULT_RECOVERY_DEADLINE_MS,
+            deadlineAtMs,
+        )
     }
 
+    /** I1：工作进程明确回报错误是确定证据，仍必须立即 fail closed。 */
     @Test
-    fun bootRecoveryGivesUpAfterTheBoundedAttempts() = runBlocking {
-        val audio = SupportAudio().apply { restoreFailuresRemaining = 99 }
+    fun definiteWorkerErrorBlocksImmediately() = runBlocking {
+        val audio = SupportAudio().apply {
+            restoreResult = false
+            probeResult = IsolationProbe.WorkerError("audio_isolation_read_failed")
+        }
         var blocked: String? = null
-        val recovery = SupervisorBootRecovery(
-            audio,
-            FakeStateStore(null),
-            { blocked = it },
-            SupportClock(),
-            pause = {},
-        )
+        val recovery = SupervisorBootRecovery(audio, FakeStateStore(null), { blocked = it }, SupportClock())
 
         assertEquals(BootRecoveryOutcome.BLOCKED, recovery.recover())
-        assertEquals(
-            "重试必须有界，失败后仍然 fail closed",
-            SupervisorBootRecovery.DEFAULT_RESTORE_ATTEMPTS,
-            audio.restoreCalls,
-        )
         assertEquals(SupervisorBootRecovery.BLOCK_RESTORE_FAILED, blocked)
     }
 
@@ -305,7 +295,7 @@ class SupervisorBootRecoveryTest {
 
             override fun save(state: SupervisionPersistedState) = Unit
         }
-        val recovery = SupervisorBootRecovery(audio, store, { blocked = it }, SupportClock(), pause = {})
+        val recovery = SupervisorBootRecovery(audio, store, { blocked = it }, SupportClock())
 
         assertEquals(BootRecoveryOutcome.BLOCKED, recovery.recover())
         assertEquals(1, audio.restoreCalls)
@@ -643,6 +633,143 @@ class SupervisorProductionGraphTest {
         assertFalse("新开机的普通关闭不得复活旧开机的粘性标记", store.load()!!.ownedCallMayBeLive)
     }
 
+    /**
+     * I1：工作进程晚启动（瞬时不可达）不得永久禁用模块。启动恢复先 DEFERRED，自动接听
+     * 保持关闭；工作进程起来后，轮询取得“系统确认未隔离”证据即清除阻塞并恢复就绪。
+     */
+    @Test
+    fun transientUnreachableWorkerNeverPermanentlyBlocksAndRecoveryClearsTheBlocker() = runBlocking {
+        val audio = SupportAudio().apply {
+            restoreResult = false
+            probeResult = IsolationProbe.Unverified("audio_worker_unreachable")
+        }
+        val platform = FakePlatform(
+            audio = audio,
+            emergency = verifiedEmergency(),
+            authorization = AutoAnswerAuthorization { true },
+        )
+        val graph = SupervisorProductionGraph.build(platform)
+
+        assertEquals(BootRecoveryOutcome.DEFERRED, graph.recovery.recover())
+        assertEquals(
+            "未取得隔离证据期间自动接听必须保持关闭",
+            SupervisorBootRecovery.BLOCK_RESTORE_FAILED,
+            graph.supervisor.snapshot().blockedReason,
+        )
+        graph.supervisor.start()
+        platform.heartbeat(graph.supervisor, session)
+        assertFalse("未验证期间不得就绪", graph.supervisor.isReady())
+        assertEquals(
+            CommandResult.Rejected(org.krvyft.agentcall.core.model.RejectReason.UNSUPPORTED),
+            graph.supervisor.prepareAnswer(session),
+        )
+
+        // 音频工作进程起来了：恢复成功且系统读回确认未隔离。
+        audio.restoreResult = true
+        audio.probeResult = IsolationProbe.Verified(false)
+        platform.clock.advance(Supervisor.RECOVERY_RETRY_INTERVAL_MS)
+        assertFalse(
+            "取证成功的轮询不得再新增长期阻塞",
+            graph.loop.pollOnce().any { it is SupervisorAction.BlockNewSessions },
+        )
+
+        assertNull("取得系统证据后必须清除可恢复阻塞", graph.supervisor.snapshot().blockedReason)
+        assertEquals(SupervisorPhase.IDLE, graph.supervisor.snapshot().phase)
+        assertTrue(graph.supervisor.isReady())
+        audio.probeResult = null
+        assertEquals(CommandResult.Accepted, graph.supervisor.prepareAnswer(session))
+    }
+
+    /** I1：总期限用尽仍未取得证据时仍必须 fail closed（保持隔离并阻止新会话）。 */
+    @Test
+    fun unverifiedRecoveryFailsClosedAfterTheBoundedDeadline() = runBlocking {
+        val audio = SupportAudio().apply {
+            restoreResult = false
+            probeResult = IsolationProbe.Unverified("audio_worker_unreachable")
+        }
+        val clock = SupportClock()
+        val graph = SupervisorProductionGraph.build(
+            FakePlatform(
+                clock = clock,
+                audio = audio,
+                emergency = verifiedEmergency(),
+                authorization = AutoAnswerAuthorization { true },
+            ),
+        )
+        assertEquals(BootRecoveryOutcome.DEFERRED, graph.recovery.recover())
+        graph.supervisor.start()
+
+        // 启动恢复登记的期限从 0 开始：超过 DEFAULT_RECOVERY_DEADLINE_MS 后轮询必须阻塞。
+        clock.advance(SupervisorBootRecovery.DEFAULT_RECOVERY_DEADLINE_MS + 1)
+        val actions = graph.loop.pollOnce()
+
+        assertTrue(
+            "超期仍未取得证据必须显式阻止新会话",
+            actions.any { it is SupervisorAction.BlockNewSessions },
+        )
+        assertEquals(
+            SupervisorBootRecovery.BLOCK_RESTORE_FAILED,
+            graph.supervisor.snapshot().blockedReason,
+        )
+        assertFalse(graph.supervisor.isReady())
+    }
+
+    /** I1：之后任一轮读回系统确认“未隔离”，可恢复阻塞必须被清除。 */
+    @Test
+    fun verifiedNotIsolatedClearsAPreviousRecoveryBlock() = runBlocking {
+        val audio = SupportAudio().apply {
+            restoreResult = false
+            probeResult = IsolationProbe.Unverified("audio_worker_unreachable")
+        }
+        val clock = SupportClock()
+        val graph = SupervisorProductionGraph.build(
+            FakePlatform(
+                clock = clock,
+                audio = audio,
+                emergency = verifiedEmergency(),
+                authorization = AutoAnswerAuthorization { true },
+            ),
+        )
+        graph.recovery.recover()
+        graph.supervisor.start()
+        clock.advance(SupervisorBootRecovery.DEFAULT_RECOVERY_DEADLINE_MS + 1)
+        graph.loop.pollOnce()
+        assertEquals(SupervisorBootRecovery.BLOCK_RESTORE_FAILED, graph.supervisor.snapshot().blockedReason)
+
+        audio.probeResult = IsolationProbe.Verified(false)
+        clock.advance(Supervisor.RECOVERY_RETRY_INTERVAL_MS)
+        graph.loop.pollOnce()
+
+        assertNull("系统确认未隔离后必须清除恢复阻塞", graph.supervisor.snapshot().blockedReason)
+        assertEquals(SupervisorPhase.IDLE, graph.supervisor.snapshot().phase)
+    }
+
+    /** I1：拥有的通话在 ACTIVE 期间遇到“不可达”不得 block + 终止；确认未隔离才 fail closed。 */
+    @Test
+    fun unverifiedIsolationDuringActiveCallDoesNotTerminateOrBlock() = runBlocking {
+        val platform = platform()
+        val graph = SupervisorProductionGraph.build(platform)
+        graph.recovery.recover()
+        graph.supervisor.start()
+        platform.heartbeat(graph.supervisor, session)
+        assertEquals(CommandResult.Accepted, graph.supervisor.prepareAnswer(session))
+        assertEquals(CommandResult.Accepted, graph.supervisor.onCallActive(session))
+
+        platform.audio.probeResult = IsolationProbe.Unverified("audio_worker_unreachable")
+        val transient = graph.loop.pollOnce()
+        assertTrue(
+            "一次不可达不得被当成隔离丢失而 block/终止",
+            transient.none { it is SupervisorAction.BlockNewSessions || it is SupervisorAction.TerminateCall },
+        )
+        assertNull(graph.supervisor.snapshot().blockedReason)
+
+        platform.audio.probeResult = IsolationProbe.Verified(false)
+        val definite = graph.loop.pollOnce()
+        assertTrue(definite.any { it is SupervisorAction.BlockNewSessions })
+        assertTrue(definite.any { it is SupervisorAction.TerminateCall })
+        assertFalse(graph.supervisor.isReady())
+    }
+
     private fun FakePlatform.heartbeat(supervisor: Supervisor, id: SessionId) {
         supervisor.heartbeat(id, PeerRole.APP, clock.nowMs())
         supervisor.heartbeat(id, PeerRole.HOOK, clock.nowMs())
@@ -721,6 +848,12 @@ private class SupportAudio : SupervisedAudio {
         if (restoreResult && restoreEffective) systemIsolated = false
         return restoreResult
     }
+
+    /** 覆盖三态读回；null 时退化为“进程内布尔就是系统事实”（旧测试替身语义）。 */
+    var probeResult: IsolationProbe? = null
+
+    override suspend fun probeIsolation(): IsolationProbe =
+        probeResult ?: IsolationProbe.Verified(verifyIsolation())
 }
 
 private class SupportCalls : CallControl {

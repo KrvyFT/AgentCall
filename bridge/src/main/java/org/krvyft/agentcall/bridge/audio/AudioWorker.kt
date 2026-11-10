@@ -48,6 +48,27 @@ sealed interface ProcessFaultDecision {
 }
 
 /**
+ * 麦克风隔离读回的三态结果（最终评审 I1）。
+ *
+ * [SupervisedAudio.verifyIsolation] 把“工作进程不可达”和“系统确认已解除隔离”压成同一个
+ * false；启动恢复与 ACTIVE 轮询若据此判定，一次瞬时不可达就会被当成“隔离丢失”而永久
+ * BLOCKED + 终止通话。只有 [Verified] 是系统事实：
+ * - [Verified] false 才能作为“隔离确实已解除”的证据；
+ * - [WorkerError] 是工作进程明确回报的错误（活着但无法给出隔离状态）；
+ * - [Unverified] 是不可达/响应无法解析：没有系统事实，只能重试或保持“未验证”。
+ */
+sealed interface IsolationProbe {
+    /** 系统读回确认；[isolated] 为 true 表示仍隔离，false 表示确定未隔离。 */
+    data class Verified(val isolated: Boolean) : IsolationProbe
+
+    /** 工作进程明确返回错误（例如无法读取系统隔离状态）。 */
+    data class WorkerError(val code: String) : IsolationProbe
+
+    /** 角色通道不可达/响应无法解析：调用方不得据此认定隔离已丢失。 */
+    data class Unverified(val code: String) : IsolationProbe
+}
+
+/**
  * 监督端依赖的音频端口。生产实现是 [AudioWorker]（独立音频工作进程）或
  * [RemoteSupervisedAudio]（监督进程侧的生命周期代理）；测试用假实现替换。
  */
@@ -59,6 +80,15 @@ interface SupervisedAudio {
 
     /** 重新读取系统隔离状态（不是缓存）；读不到或已解除返回 false（调用方 fail closed）。 */
     suspend fun verifyIsolation(): Boolean
+
+    /**
+     * 三态读回（评审 I1）：区分“确定已解除”与“无法确认”。
+     *
+     * 默认实现把 [verifyIsolation] 的布尔结果当作系统事实（进程内实现可以准确区分）；
+     * 跨进程代理 [RemoteSupervisedAudio] 必须覆盖它，把不可达/非法响应归为
+     * [IsolationProbe.Unverified]，绝不能冒充“隔离丢失”。
+     */
+    suspend fun probeIsolation(): IsolationProbe = IsolationProbe.Verified(verifyIsolation())
 
     /** 只有租约仍有效且隔离读回成功时才允许打开；失败必须抛 [AudioUnavailableException]。 */
     suspend fun open(id: SessionId, format: AudioFormatSpec): AudioSession

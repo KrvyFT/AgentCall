@@ -318,6 +318,24 @@ class RemoteSupervisedAudio(
         return isolated
     }
 
+    /**
+     * I1：把“工作进程不可达”与“系统确认未隔离”分开。
+     *
+     * 不可达/非法响应返回 [IsolationProbe.Unverified]；只有工作进程明确回 ok=true 的
+     * isolated 值才是系统事实，ok=false 是明确的工作进程错误。调用方绝不能把 Unverified
+     * 当成“隔离已丢失”。
+     */
+    override suspend fun probeIsolation(): IsolationProbe {
+        val response = call(AudioRoleRequest.VerifyIsolation)
+            ?: return IsolationProbe.Unverified(pendingFault ?: ERROR_UNREACHABLE)
+        if (!response.ok) {
+            pendingFault = response.code ?: ERROR_WORKER_ERROR
+            return IsolationProbe.WorkerError(response.code ?: ERROR_WORKER_ERROR)
+        }
+        isolated = response.isolated
+        return IsolationProbe.Verified(response.isolated)
+    }
+
     override suspend fun stopKeepingIsolation() {
         // 停止失败也不能解除隔离；保留最后一次确认的隔离意图。
         call(AudioRoleRequest.Stop)
@@ -385,6 +403,9 @@ class RemoteSupervisedAudio(
 
         /** 工作进程回了无法解析的行：同样按进程故障计入重启预算。 */
         const val ERROR_INVALID_RESPONSE: String = "audio_worker_invalid_response"
+
+        /** 工作进程明确回报“无法给出隔离状态”，但没有更具体的 code。 */
+        const val ERROR_WORKER_ERROR: String = "audio_worker_error"
     }
 }
 

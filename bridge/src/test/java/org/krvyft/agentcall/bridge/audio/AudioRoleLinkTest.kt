@@ -280,6 +280,60 @@ class RemoteSupervisedAudioTest {
         assertNull("故障事件不得重复计入重启预算", audio.takeProcessFault())
     }
 
+    /**
+     * I1：三态读回。不可达/非法响应绝不能伪造成“隔离已解除”（false），否则一次瞬时
+     * 不可达就会被监督端当成隔离丢失而 block + 终止；工作进程明确 ok=false 才是确定错误。
+     */
+    @Test
+    fun probeIsolationSeparatesUnreachableFromVerifiedLoss() = runBlocking {
+        val unreachable = RemoteSupervisedAudio(
+            object : AudioRoleTransport {
+                override suspend fun exchange(requestLine: String): String =
+                    throw AudioRoleLinkException("audio_worker_unreachable", "no worker")
+            },
+            object : MonotonicClock {
+                override fun nowMs(): Long = 0L
+            },
+        )
+        val unverified = unreachable.probeIsolation()
+        assertTrue("不可达只能算未验证：$unverified", unverified is IsolationProbe.Unverified)
+
+        var isolated = false
+        val live = RemoteSupervisedAudio(
+            RecordingTransport { request, _ ->
+                when (request) {
+                    AudioRoleRequest.VerifyIsolation -> AudioRoleResponse(ok = true, isolated = isolated)
+                    else -> AudioRoleResponse(ok = true, isolated = isolated)
+                }
+            },
+            object : MonotonicClock {
+                override fun nowMs(): Long = 0L
+            },
+        )
+        assertTrue(live.probeIsolation() is IsolationProbe.Verified)
+        isolated = true
+        assertEquals(IsolationProbe.Verified(true), live.probeIsolation())
+        isolated = false
+        assertEquals("系统确认未隔离才是确定证据", IsolationProbe.Verified(false), live.probeIsolation())
+    }
+
+    @Test
+    fun probeIsolationTreatsWorkerErrorAsDefiniteEvidence() = runBlocking {
+        val audio = RemoteSupervisedAudio(
+            RecordingTransport { _, _ ->
+                AudioRoleResponse(ok = false, code = "audio_isolation_read_failed")
+            },
+            object : MonotonicClock {
+                override fun nowMs(): Long = 0L
+            },
+        )
+
+        assertEquals(
+            IsolationProbe.WorkerError("audio_isolation_read_failed"),
+            audio.probeIsolation(),
+        )
+    }
+
     @Test
     fun openFailureCarriesClassificationAndStopReachesWorker() = runBlocking {
         var failOpen = true
