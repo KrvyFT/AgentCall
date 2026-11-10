@@ -5,6 +5,7 @@ import com.google.gson.JsonParser
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.CountDownLatch
+import org.krvyft.agentcall.bridge.config.ConfigErrorCode
 import org.krvyft.agentcall.bridge.config.ConfigStore
 import org.krvyft.agentcall.bridge.config.ConfigStoreException
 import org.krvyft.agentcall.bridge.diagnostics.AndroidPlatformFacts
@@ -61,9 +62,14 @@ object BridgeMain {
  */
 internal object BridgeRuntime {
 
-    /** args[0] 可选：配置主副本目录；缺省为 [ConfigStore.DEFAULT_ROOT]。 */
+    /** args[0] 可选：配置主副本目录；只允许 [ConfigStore.DEFAULT_ROOT] 及其子目录。 */
     fun run(args: Array<String>): Int {
-        val root = File(args.firstOrNull() ?: ConfigStore.DEFAULT_ROOT)
+        val root = try {
+            resolveConfigRoot(args)
+        } catch (error: ConfigStoreException) {
+            System.err.println(machineErrorJson(error.code, error.message ?: error.code))
+            return 1
+        }
 
         // 没有系统 PackageManager 就无法核验包名/签名：必须失败退出，而不是信任消息自述。
         val packageManager = RootFramework.packageManager()
@@ -131,6 +137,38 @@ internal object BridgeRuntime {
         }
         return 0
     }
+}
+
+/**
+ * 解析并限制生产入口的配置根。
+ *
+ * 运行容器由 root app_process 启动，argv 不能把明文密钥主副本指到任意目录（例如
+ * 非 POSIX 的共享/可移动目录）。只接受 [ConfigStore.DEFAULT_ROOT] 及其规范化后的
+ * 子目录，其余抛 [ConfigErrorCode.CONFIG_ROOT_REJECTED] 并退出，不创建任何目录。
+ *
+ * 测试需要临时目录时走 [ConfigStore] 的构造参数（文档化的 test-only 注入点），
+ * 不通过本入口，因此生产路径没有“测试开关”可被 argv 触发。
+ */
+internal fun resolveConfigRoot(args: Array<String>): File {
+    val configured = args.firstOrNull() ?: ConfigStore.DEFAULT_ROOT
+    val allowed = try {
+        File(ConfigStore.DEFAULT_ROOT).canonicalFile
+    } catch (io: IOException) {
+        throw ConfigStoreException(ConfigErrorCode.CONFIG_ROOT_REJECTED, "config root could not be resolved", io)
+    }
+    val candidate = try {
+        File(configured).canonicalFile
+    } catch (io: IOException) {
+        throw ConfigStoreException(ConfigErrorCode.CONFIG_ROOT_REJECTED, "config root could not be resolved", io)
+    }
+    val withinAllowedRoot = candidate == allowed || candidate.toPath().startsWith(allowed.toPath())
+    if (!withinAllowedRoot) {
+        throw ConfigStoreException(
+            ConfigErrorCode.CONFIG_ROOT_REJECTED,
+            "config root must stay under " + ConfigStore.DEFAULT_ROOT,
+        )
+    }
+    return candidate
 }
 
 /**
@@ -224,21 +262,29 @@ internal class ControlDispatcher(
             ?: return failure(request, "payload_invalid", "packageName is invalid")
         val appSignature = packages.signatureSha256(packageName)
             ?: return failure(request, "pairing_package_unknown", "package signature could not be resolved")
+        val appUid = packages.uidForPackage(packageName)
+            ?: return failure(request, "pairing_package_unknown", "package uid could not be resolved")
         val dialerSignature = packages.signatureSha256(PeerVerifier.DIALER_PACKAGE)
             ?: return failure(request, "pairing_dialer_unknown", "dialer signature could not be resolved")
+        val dialerUid = packages.uidForPackage(PeerVerifier.DIALER_PACKAGE)
+            ?: return failure(request, "pairing_dialer_unknown", "dialer uid could not be resolved")
         val record = store.pair(
             appPackage = packageName,
+            appUid = appUid,
             appSignatureSha256 = appSignature,
             appVersionName = packages.versionName(packageName) ?: ConfigStore.UNKNOWN_VERSION,
             dialerPackage = PeerVerifier.DIALER_PACKAGE,
+            dialerUid = dialerUid,
             dialerSignatureSha256 = dialerSignature,
             dialerVersionName = packages.versionName(PeerVerifier.DIALER_PACKAGE) ?: ConfigStore.UNKNOWN_VERSION,
         )
         val json = JsonObject()
         json.addProperty("appPackage", record.appPackage)
+        json.addProperty("appUid", record.appUid)
         json.addProperty("appSignatureSha256", record.appSignatureSha256)
         json.addProperty("appVersionName", record.appVersionName)
         json.addProperty("dialerPackage", record.dialerPackage)
+        json.addProperty("dialerUid", record.dialerUid)
         json.addProperty("dialerSignatureSha256", record.dialerSignatureSha256)
         json.addProperty("dialerVersionName", record.dialerVersionName)
         json.addProperty("pairedAtMs", record.pairedAtMs)

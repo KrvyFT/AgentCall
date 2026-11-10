@@ -4,13 +4,7 @@ import android.net.LocalServerSocket
 import android.net.LocalSocket
 import java.io.Closeable
 import java.io.IOException
-import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.RejectedExecutionException
-import java.util.concurrent.Semaphore
-import java.util.concurrent.ThreadFactory
-import java.util.concurrent.ThreadPoolExecutor
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -45,8 +39,11 @@ fun interface PcmSink {
  * - **两条通道**：控制通道（[DEFAULT_CONTROL_SOCKET]，JSON 控制帧，最大 64 KiB）与
  *   PCM 通道（[DEFAULT_PCM_SOCKET]，原始 PCM 帧，最大 32 KiB）分开 bind；PCM 只在
  *   注入 [PcmSink] 时启用。两个通道都先用内核凭据核验对端。
- * - **有界资源**：最多 [MAX_CONNECTIONS] 条连接、[MAX_QUEUE_DEPTH] 个排队请求；
- *   连接/队列满时立即关闭新连接并计数，不阻塞 accept 线程，也不阻塞电话 UI。
+ * - **有界资源**：控制通道最多 [MAX_CONNECTIONS] 条连接、[MAX_QUEUE_DEPTH] 个排队
+ *   请求；PCM 通道有独立执行器与独立连接信号量，每条 PCM 连接独占一个线程且上限为
+ *   [maxPcmConnections]（默认 [MAX_PCM_CONNECTIONS]）。PCM 是长生命周期读取循环，
+ *   因此绝不与控制请求共用 worker 池：控制命令不会被 PCM 流饿死。任一 lane 满时
+ *   立即关闭新连接并计数，不阻塞 accept 线程，也不阻塞电话 UI。
  * - **校验顺序**：内核凭据 → 包名/签名/角色 → 帧长度 → 请求 ID/版本/会话 →
  *   [RolePolicy] 固定方法表。任一步失败都回错误帧后关闭连接。
  * - **错误内容**：只回机器可读错误码与固定短消息，异常消息只保留异常类名。
@@ -61,24 +58,20 @@ class ControlServer(
     private val maxQueueDepth: Int = MAX_QUEUE_DEPTH,
     private val readTimeoutMs: Int = READ_TIMEOUT_MS,
     workerCount: Int = WORKER_THREADS,
+    maxPcmConnections: Int = MAX_PCM_CONNECTIONS,
 ) : Closeable {
 
     private val started = AtomicBoolean(false)
     private val closed = AtomicBoolean(false)
-    private val connectionSlots = Semaphore(maxConnections)
     private val activeConnections = AtomicInteger(0)
-    private val rejectedConnections = AtomicLong(0)
     private val openSockets = ConcurrentHashMap.newKeySet<LocalSocket>()
 
-    private val workers = ThreadPoolExecutor(
-        workerCount,
-        workerCount,
-        0L,
-        TimeUnit.MILLISECONDS,
-        ArrayBlockingQueue(maxQueueDepth),
-        ThreadFactory { runnable ->
-            Thread(runnable, "agentcall-control-worker").apply { isDaemon = true }
-        },
+    /** 控制/PCM 两队独立且有界的执行资源，PCM 不可能占用控制 worker。 */
+    private val lanes = ConnectionLanes(
+        controlWorkers = workerCount,
+        controlQueueDepth = maxQueueDepth,
+        maxControlConnections = maxConnections,
+        maxPcmConnections = maxPcmConnections,
     )
 
     private var controlServerSocket: LocalServerSocket? = null
@@ -90,7 +83,7 @@ class ControlServer(
     val activeConnectionCount: Int get() = activeConnections.get()
 
     /** 因连接数/队列饱和被拒绝的次数，用于 status 诊断。 */
-    val rejectedConnectionCount: Long get() = rejectedConnections.get()
+    val rejectedConnectionCount: Long get() = lanes.rejectedSubmissions
 
     /**
      * 绑定 abstract socket 并启动 accept 线程。绑定失败抛 [IOException]；
@@ -128,17 +121,14 @@ class ControlServer(
         closeQuietly(pcmServerSocket)
         controlServerSocket = null
         pcmServerSocket = null
-        workers.shutdown()
-        try {
-            workers.awaitTermination(CLOSE_GRACE_MS, TimeUnit.MILLISECONDS)
-        } catch (interrupted: InterruptedException) {
-            Thread.currentThread().interrupt()
-        }
+        lanes.shutdown()
+        lanes.awaitTermination(CLOSE_GRACE_MS)
+        // 宽限期后仍未结束的长生命周期 PCM 连接由关闭 socket 打破读取循环，随后中断线程。
         for (socket in openSockets) {
             closeQuietly(socket)
         }
         openSockets.clear()
-        workers.shutdownNow()
+        lanes.shutdownNow()
         controlAcceptThread?.interrupt()
         pcmAcceptThread?.interrupt()
     }
@@ -154,36 +144,34 @@ class ControlServer(
                 sleepQuietly()
                 continue
             }
-            if (!connectionSlots.tryAcquire()) {
-                rejectedConnections.incrementAndGet()
-                closeQuietly(socket)
-                continue
-            }
             activeConnections.incrementAndGet()
             openSockets.add(socket)
-            try {
-                workers.execute {
-                    try {
-                        if (isPcm) {
-                            handlePcmConnection(socket)
-                        } else {
-                            handleControlConnection(socket)
-                        }
-                    } finally {
-                        openSockets.remove(socket)
-                        closeQuietly(socket)
-                        activeConnections.decrementAndGet()
-                        connectionSlots.release()
-                    }
-                }
-            } catch (rejected: RejectedExecutionException) {
-                // 队列饱和：有界失败，不排队等待，也不影响接受中的连接。
+            val submitted = if (isPcm) {
+                lanes.submitPcm { serveConnection(socket, isPcm = true) }
+            } else {
+                lanes.submitControl { serveConnection(socket, isPcm = false) }
+            }
+            if (!submitted) {
+                // lane 关闭或槽位/队列饱和：有界失败，不排队等待，也不影响已接受的连接。
                 openSockets.remove(socket)
                 closeQuietly(socket)
                 activeConnections.decrementAndGet()
-                connectionSlots.release()
-                rejectedConnections.incrementAndGet()
             }
+        }
+    }
+
+    /** 连接任务外壳：无论通道、成功或异常，都回收 socket/计数/连接槽（槽位由 lane 释放）。 */
+    private fun serveConnection(socket: LocalSocket, isPcm: Boolean) {
+        try {
+            if (isPcm) {
+                handlePcmConnection(socket)
+            } else {
+                handleControlConnection(socket)
+            }
+        } finally {
+            openSockets.remove(socket)
+            closeQuietly(socket)
+            activeConnections.decrementAndGet()
         }
     }
 
@@ -334,6 +322,10 @@ class ControlServer(
         const val MAX_CONNECTIONS: Int = 8
         const val MAX_QUEUE_DEPTH: Int = 16
         const val WORKER_THREADS: Int = 2
+
+        /** PCM 通道的显式并发上限：每条连接独占一个线程，绝不占用控制 worker。 */
+        const val MAX_PCM_CONNECTIONS: Int = 2
+
         const val READ_TIMEOUT_MS: Int = 10_000
         const val MAX_PCM_FRAME_BYTES: Int = 32 * 1024
         const val MAX_ERROR_MESSAGE_CHARS: Int = 400

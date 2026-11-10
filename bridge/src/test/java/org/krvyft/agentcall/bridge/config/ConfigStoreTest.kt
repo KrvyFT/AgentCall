@@ -1,5 +1,6 @@
 package org.krvyft.agentcall.bridge.config
 
+import com.google.gson.JsonObject
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.attribute.PosixFilePermissions
@@ -40,7 +41,7 @@ class ConfigStoreTest {
         baseDir.deleteRecursively()
     }
 
-    private fun store(root: File = File(baseDir, "agentcall")) = ConfigStore(root) { nowMs }
+    private fun store(root: File = File(baseDir, "agentcall")) = ConfigStore(root, clockMs = { nowMs })
 
     private fun failure(block: () -> Unit): ConfigStoreException {
         try {
@@ -249,6 +250,42 @@ class ConfigStoreTest {
     }
 
     @Test
+    fun nonIntegralOrNegativeSchemaIsRejectedExplicitly() {
+        // asInt 会把 1.5 截断成 1、把 -0.5 截断成 0；两者都必须显式拒绝，
+        // 不能悄悄迁移或读成别的 schema。
+        val cases = listOf(
+            """{"schema":1.5,"revision":2,"enabled":true}""",
+            """{"schema":-0.5,"revision":2,"enabled":true}""",
+            """{"schema":-1,"revision":2,"enabled":true}""",
+        )
+        cases.forEachIndexed { index, json ->
+            val root = File(baseDir, "schema-$index")
+            assertTrue(root.mkdirs())
+            val configFile = File(root, ConfigStore.CONFIG_FILE_NAME)
+            configFile.writeText(json)
+
+            val error = failure { store(root).read() }
+
+            assertEquals(ConfigErrorCode.CORRUPT, error.code)
+            assertEquals(json, configFile.readText())
+        }
+    }
+
+    @Test
+    fun integralSchemaValueIsAcceptedWithoutMigration() {
+        val root = File(baseDir, "integral")
+        assertTrue(root.mkdirs())
+        val json = """{"schema":1.0,"revision":3,"enabled":true}"""
+        File(root, ConfigStore.CONFIG_FILE_NAME).writeText(json)
+
+        val read = store(root).read()
+
+        assertEquals(3L, read.config.revision)
+        assertTrue(read.config.enabled)
+        assertFalse(File(root, "config.schema-1.json.bak").exists())
+    }
+
+    @Test
     fun pairingRecordRoundTripsRootPrivate() {
         val root = File(baseDir, "agentcall")
         val store = store(root)
@@ -256,9 +293,11 @@ class ConfigStoreTest {
 
         val record = PairingRecord(
             appPackage = "org.krvyft.agentcall",
+            appUid = 10_123,
             appSignatureSha256 = "a".repeat(64),
             appVersionName = "1.0",
             dialerPackage = "com.google.android.dialer",
+            dialerUid = 10_124,
             dialerSignatureSha256 = "b".repeat(64),
             dialerVersionName = "100.0",
             pairedAtMs = nowMs,
@@ -267,5 +306,28 @@ class ConfigStoreTest {
 
         assertEquals(record, store(root).readPairing())
         assertPrivateFile(File(root, ConfigStore.PAIRING_FILE_NAME))
+    }
+
+    @Test
+    fun pairingRecordWithoutUidOrVersionFailsClosed() {
+        // 旧版配对文件没有 uid：不能降级成只比包名/签名，必须拒绝并要求重新配对。
+        val root = File(baseDir, "legacy-pairing")
+        assertTrue(root.mkdirs())
+        val legacy = JsonObject().apply {
+            addProperty("appPackage", "org.krvyft.agentcall")
+            addProperty("appSignatureSha256", "a".repeat(64))
+            addProperty("appVersionName", "1.0")
+            addProperty("dialerPackage", "com.google.android.dialer")
+            addProperty("dialerSignatureSha256", "b".repeat(64))
+            addProperty("dialerVersionName", "100.0")
+            addProperty("pairedAtMs", 1_700_000_000_000L)
+        }.toString()
+        val pairingFile = File(root, ConfigStore.PAIRING_FILE_NAME)
+        pairingFile.writeText(legacy)
+
+        val error = failure { store(root).readPairing() }
+
+        assertEquals(ConfigErrorCode.CORRUPT, error.code)
+        assertEquals(legacy, pairingFile.readText())
     }
 }

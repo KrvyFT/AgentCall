@@ -35,6 +35,9 @@ interface PackageIdentitySource {
 
     /** 包版本名；无法解析返回 null。 */
     fun versionName(packageName: String): String?
+
+    /** 包当前安装所属的 Linux uid；未安装或无法解析返回 null。配对时记录，连接时复核。 */
+    fun uidForPackage(packageName: String): Int?
 }
 
 /** [PackageIdentitySource] 的 Android 实现（PackageManager）。 */
@@ -61,6 +64,16 @@ class AndroidPackageIdentitySource(private val packageManager: PackageManager) :
             return null
         }
         return info.versionName
+    }
+
+    override fun uidForPackage(packageName: String): Int? {
+        val info = try {
+            packageManager.getPackageInfo(packageName, 0)
+        } catch (missing: PackageManager.NameNotFoundException) {
+            return null
+        }
+        val applicationInfo = info.applicationInfo ?: return null
+        return applicationInfo.uid
     }
 
     private companion object {
@@ -93,9 +106,14 @@ object RootFramework {
  * 用内核凭据 + 配对记录判定对端角色（spec §6.4）。
  *
  * 判定顺序：uid 0 → CLI_ROOT；其余 uid 必须由 PackageManager 解析出包名，
- * 且包名与签名摘要同时匹配配对记录才能成为 APP 或 HOOK。占用共享 UID 的其他
- * 进程即使能连上 socket，也因包名/签名不匹配被拒绝。消息里自称的 uid/角色/签名
- * 完全不参与判定。
+ * 且包名、配对时记录的 uid、签名摘要与版本名全部匹配配对记录才能成为 APP 或 HOOK。
+ * 占用共享 UID 的其他进程即使能连上 socket，也因包名/uid/签名不匹配被拒绝。
+ * 消息里自称的 uid/角色/签名完全不参与判定。
+ *
+ * 版本判定是显式的 fail-closed 取舍：配对记录里的版本是授权锚定证据的一部分
+ * （spec §6.4 “包名、用户 ID、签名及版本在配对时记录并核验”）。签名未变的包升级后
+ * 会得到 [ERROR_VERSION_MISMATCH]，必须重新执行 root CLI 配对；不静默接受未核验的
+ * 新二进制。旧配对文件缺少 uid/版本字段按损坏处理（重新配对），绝不降级成只比包名。
  */
 class PeerVerifier(
     private val packages: PackageIdentitySource,
@@ -117,31 +135,64 @@ class PeerVerifier(
             return PeerVerification.Rejected(ERROR_UNKNOWN_UID, "uid is not owned by an installed package")
         }
         for (packageName in candidates) {
-            val signature = packages.signatureSha256(packageName) ?: continue
-            if (packageName == record.appPackage && signatureMatches(signature, record.appSignatureSha256)) {
-                return PeerVerification.Trusted(
-                    PeerIdentity(
-                        uid = credentials.uid,
-                        role = PeerRole.APP,
-                        packageName = packageName,
-                        signatureSha256 = signature,
-                        protocolVersion = PROTOCOL_VERSION,
-                    ),
+            if (packageName == record.appPackage) {
+                return verifyPairedLane(
+                    uid = credentials.uid,
+                    expectedUid = record.appUid,
+                    packageName = packageName,
+                    expectedSignature = record.appSignatureSha256,
+                    expectedVersion = record.appVersionName,
+                    role = PeerRole.APP,
                 )
             }
-            if (packageName == record.dialerPackage && signatureMatches(signature, record.dialerSignatureSha256)) {
-                return PeerVerification.Trusted(
-                    PeerIdentity(
-                        uid = credentials.uid,
-                        role = PeerRole.HOOK,
-                        packageName = packageName,
-                        signatureSha256 = signature,
-                        protocolVersion = PROTOCOL_VERSION,
-                    ),
+            if (packageName == record.dialerPackage) {
+                return verifyPairedLane(
+                    uid = credentials.uid,
+                    expectedUid = record.dialerUid,
+                    packageName = packageName,
+                    expectedSignature = record.dialerSignatureSha256,
+                    expectedVersion = record.dialerVersionName,
+                    role = PeerRole.HOOK,
                 )
             }
         }
-        return PeerVerification.Rejected(ERROR_UNTRUSTED, "uid/package/signature does not match the pairing record")
+        return PeerVerification.Rejected(ERROR_UNTRUSTED, "uid/package does not match the pairing record")
+    }
+
+    /**
+     * 一个已配对 lane 的完整核验：签名 → uid → 版本。任何一项不符都拒绝，
+     * 错误码区分“包/签名不可信”“uid 已不属于该包”“配对后版本变了”。
+     */
+    private fun verifyPairedLane(
+        uid: Int,
+        expectedUid: Int,
+        packageName: String,
+        expectedSignature: String,
+        expectedVersion: String,
+        role: PeerRole,
+    ): PeerVerification {
+        val signature = packages.signatureSha256(packageName)
+            ?: return PeerVerification.Rejected(ERROR_UNTRUSTED, "package signature could not be resolved")
+        if (!signatureMatches(signature, expectedSignature)) {
+            return PeerVerification.Rejected(ERROR_UNTRUSTED, "package signature does not match the pairing record")
+        }
+        if (uid != expectedUid) {
+            // 卸载重装会换 uid：同一包名也不再是配对时的那份身份。
+            return PeerVerification.Rejected(ERROR_UID_MISMATCH, "uid no longer belongs to the paired package")
+        }
+        val version = packages.versionName(packageName) ?: UNKNOWN_VERSION
+        if (version != expectedVersion) {
+            return PeerVerification.Rejected(ERROR_VERSION_MISMATCH, "package version changed since pairing; re-pair required")
+        }
+        return PeerVerification.Trusted(
+            PeerIdentity(
+                uid = uid,
+                role = role,
+                packageName = packageName,
+                signatureSha256 = signature,
+                protocolVersion = PROTOCOL_VERSION,
+            ),
+        )
     }
 
     private fun signatureMatches(actual: String, expected: String): Boolean =
@@ -157,10 +208,19 @@ class PeerVerifier(
         /** AgentCall APK 包名（配对时的默认 APP 候选）。 */
         const val AGENTCALL_PACKAGE: String = "org.krvyft.agentcall"
 
+        /** 配对记录缺少可解析的版本名时的显式占位（与 [org.krvyft.agentcall.bridge.config.ConfigStore.UNKNOWN_VERSION] 一致）。 */
+        private const val UNKNOWN_VERSION: String = "UNKNOWN"
+
         const val ERROR_CREDENTIALS_INVALID: String = "peer_credentials_invalid"
         const val ERROR_UNPAIRED: String = "peer_unpaired"
         const val ERROR_UNKNOWN_UID: String = "peer_unknown_uid"
         const val ERROR_UNTRUSTED: String = "peer_untrusted"
+
+        /** 内核 uid 已不属于配对时记录的 uid（卸载重装/包被替换）。 */
+        const val ERROR_UID_MISMATCH: String = "peer_uid_mismatch"
+
+        /** 包版本与配对记录不一致：必须重新配对。 */
+        const val ERROR_VERSION_MISMATCH: String = "peer_version_mismatch"
 
         fun sha256Hex(bytes: ByteArray): String {
             val digest = MessageDigest.getInstance("SHA-256").digest(bytes)

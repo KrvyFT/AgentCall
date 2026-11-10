@@ -9,7 +9,6 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
-import java.nio.file.attribute.PosixFilePermissions
 import org.krvyft.agentcall.core.model.AgentConfig
 import org.krvyft.agentcall.core.model.ApiEndpoint
 import org.krvyft.agentcall.core.model.ConfigPatch
@@ -45,6 +44,9 @@ object ConfigErrorCode {
 
     /** 配对记录字段不合法。 */
     const val PAIRING_INVALID: String = "pairing_invalid"
+
+    /** 生产入口收到的配置根不在 /data/adb/agentcall 之下。 */
+    const val CONFIG_ROOT_REJECTED: String = "config_root_rejected"
 }
 
 class ConfigStoreException(
@@ -56,16 +58,19 @@ class ConfigStoreException(
 /**
  * 配对时记录并核验的对端身份（root CLI 首次配对时写入）。
  *
- * 包名、签名摘要与版本都由 bridge 进程在配对时从 PackageManager 重新解析，
- * 不接受消息自述。签名摘要是后续授权锚点；版本只作为配对时的证据记录，
- * Google 电话升级后仍需按 spec §9 重新探测能力（不需要重新配对）。
- * 普通请求不能自注册信任。
+ * 包名、用户 ID（uid）、签名摘要与版本都由 bridge 进程在配对时从 PackageManager
+ * 重新解析，不接受消息自述。四者都是连接时复核的授权锚定证据（spec §6.4）：
+ * uid 必须仍由该包拥有，版本必须与配对时一致；任一不符都拒绝并要求重新配对。
+ * 签名摘要是最强锚点；版本变化（即使签名未变）也意味着当前二进制未经配对核验，
+ * 因此按 fail-closed 处理，不静默放行。普通请求不能自注册信任。
  */
 data class PairingRecord(
     val appPackage: String,
+    val appUid: Int,
     val appSignatureSha256: String,
     val appVersionName: String,
     val dialerPackage: String,
+    val dialerUid: Int,
     val dialerSignatureSha256: String,
     val dialerVersionName: String,
     val pairedAtMs: Long,
@@ -85,12 +90,16 @@ data class PairingRecord(
  * - 单写者：同一进程内用锁串行化；跨进程并发不在本类承诺内
  *   （特权进程是唯一写入者），需要时由上层保证。
  *
- * @param root 主副本目录；生产为 [DEFAULT_ROOT]，测试注入临时目录。
+ * @param root 主副本目录；生产为 [DEFAULT_ROOT]，测试注入临时目录。这是文档化的
+ *   test-only 注入点：生产装配必须先用
+ *   [org.krvyft.agentcall.bridge.resolveConfigRoot] 把根限制在 [DEFAULT_ROOT] 之下。
  * @param clockMs 配对时间来源，测试可注入固定值。
+ * @param permissions 权限执行器，默认 [PrivateFilePermissions]；测试可注入失败路径。
  */
 class ConfigStore(
     root: File,
     private val clockMs: () -> Long = { System.currentTimeMillis() },
+    private val permissions: (File, Boolean) -> Unit = PrivateFilePermissions::enforce,
 ) {
 
     private val rootDirectory: File = root
@@ -105,7 +114,7 @@ class ConfigStore(
             throw ConfigStoreException(ConfigErrorCode.STORAGE_FAILED, "config root is not a directory")
         }
         try {
-            restrict(rootDirectory, directory = true)
+            permissions(rootDirectory, true)
         } catch (io: IOException) {
             throw ConfigStoreException(ConfigErrorCode.STORAGE_FAILED, "config root permissions could not be restricted", io)
         }
@@ -161,20 +170,27 @@ class ConfigStore(
         }
         val json = parsed.asJsonObject
         val appPackage = stringOrNull(json, "appPackage")
+        val appUid = intOrNull(json, "appUid")
         val appSignature = stringOrNull(json, "appSignatureSha256")
         val dialerPackage = stringOrNull(json, "dialerPackage")
+        val dialerUid = intOrNull(json, "dialerUid")
         val dialerSignature = stringOrNull(json, "dialerSignatureSha256")
         val pairedAt = longOrNull(json, "pairedAtMs")
-        if (appPackage == null || appSignature == null || dialerPackage == null ||
-            dialerSignature == null || pairedAt == null
+        // 旧版配对文件缺 uid/版本、或 uid 不是合法非 root uid 时按损坏处理：
+        // 重新配对，绝不降级为只比包名/签名而放过未经核验的身份。
+        if (appPackage == null || appUid == null || appSignature == null || dialerPackage == null ||
+            dialerUid == null || dialerSignature == null || pairedAt == null ||
+            !isValidUid(appUid) || !isValidUid(dialerUid)
         ) {
             throw ConfigStoreException(ConfigErrorCode.CORRUPT, "pairing record is incomplete")
         }
         PairingRecord(
             appPackage = appPackage,
+            appUid = appUid,
             appSignatureSha256 = appSignature,
             appVersionName = stringOrNull(json, "appVersionName") ?: UNKNOWN_VERSION,
             dialerPackage = dialerPackage,
+            dialerUid = dialerUid,
             dialerSignatureSha256 = dialerSignature,
             dialerVersionName = stringOrNull(json, "dialerVersionName") ?: UNKNOWN_VERSION,
             pairedAtMs = pairedAt,
@@ -184,7 +200,9 @@ class ConfigStore(
     /** 写入配对记录（调用方必须已确认 root CLI 身份）。 */
     fun writePairing(record: PairingRecord) = synchronized(lock) {
         if (!isValidPackageName(record.appPackage) ||
+            !isValidUid(record.appUid) ||
             !isValidPackageName(record.dialerPackage) ||
+            !isValidUid(record.dialerUid) ||
             !isValidSignature(record.appSignatureSha256) ||
             !isValidSignature(record.dialerSignatureSha256) ||
             !isValidVersion(record.appVersionName) ||
@@ -194,9 +212,11 @@ class ConfigStore(
         }
         val json = JsonObject()
         json.addProperty("appPackage", record.appPackage)
+        json.addProperty("appUid", record.appUid)
         json.addProperty("appSignatureSha256", record.appSignatureSha256)
         json.addProperty("appVersionName", record.appVersionName)
         json.addProperty("dialerPackage", record.dialerPackage)
+        json.addProperty("dialerUid", record.dialerUid)
         json.addProperty("dialerSignatureSha256", record.dialerSignatureSha256)
         json.addProperty("dialerVersionName", record.dialerVersionName)
         json.addProperty("pairedAtMs", record.pairedAtMs)
@@ -206,17 +226,21 @@ class ConfigStore(
     /** 记录一次配对（时间来自注入时钟），返回实际写入的记录。 */
     fun pair(
         appPackage: String,
+        appUid: Int,
         appSignatureSha256: String,
         appVersionName: String,
         dialerPackage: String,
+        dialerUid: Int,
         dialerSignatureSha256: String,
         dialerVersionName: String,
     ): PairingRecord {
         val record = PairingRecord(
             appPackage = appPackage,
+            appUid = appUid,
             appSignatureSha256 = appSignatureSha256,
             appVersionName = appVersionName,
             dialerPackage = dialerPackage,
+            dialerUid = dialerUid,
             dialerSignatureSha256 = dialerSignatureSha256,
             dialerVersionName = dialerVersionName,
             pairedAtMs = clockMs(),
@@ -263,14 +287,25 @@ class ConfigStore(
         return Stored(config, decodeSecrets(json))
     }
 
+    /**
+     * 显式校验 schema 数值：拒绝非整数（1.5、-0.5）、负数、溢出与非有限值。
+     *
+     * 不能用 [com.google.gson.JsonPrimitive.getAsInt] 截断：1.5 会变成 1（读成当前 schema），
+     * -0.5 会变成 0（触发“旧 schema 迁移”并重写文件），两者都是静默改语义。
+     */
     private fun schemaOf(json: JsonObject): Int {
         val element = json.get("schema") ?: return 0
         if (!element.isJsonPrimitive || !element.asJsonPrimitive.isNumber) {
             throw ConfigStoreException(ConfigErrorCode.CORRUPT, "config schema field is invalid")
         }
-        val schema = element.asInt
-        if (schema < 0) throw ConfigStoreException(ConfigErrorCode.CORRUPT, "config schema field is invalid")
-        return schema
+        val asDouble = element.asDouble
+        if (!asDouble.isFinite() || asDouble != Math.floor(asDouble)) {
+            throw ConfigStoreException(ConfigErrorCode.CORRUPT, "config schema field is invalid")
+        }
+        if (asDouble < 0.0 || asDouble > Int.MAX_VALUE.toDouble()) {
+            throw ConfigStoreException(ConfigErrorCode.CORRUPT, "config schema field is invalid")
+        }
+        return asDouble.toInt()
     }
 
     private fun decodeSecrets(json: JsonObject): Map<EndpointKind, String> {
@@ -384,7 +419,7 @@ class ConfigStore(
                 output.flush()
                 output.fd.sync()
             }
-            restrict(temp, directory = false)
+            permissions(temp, false)
             try {
                 Files.move(
                     temp.toPath(),
@@ -405,20 +440,6 @@ class ConfigStore(
         }
     }
 
-    private fun restrict(target: File, directory: Boolean) {
-        val permissions = PosixFilePermissions.fromString(if (directory) "rwx------" else "rw-------")
-        try {
-            Files.setPosixFilePermissions(target.toPath(), permissions)
-        } catch (unsupported: UnsupportedOperationException) {
-            target.setReadable(false, false)
-            target.setWritable(false, false)
-            target.setExecutable(false, false)
-            target.setReadable(true, true)
-            target.setWritable(true, true)
-            if (directory) target.setExecutable(true, true)
-        }
-    }
-
     private fun isValidPackageName(value: String): Boolean =
         value.length in 3..128 && PACKAGE_PATTERN.matches(value)
 
@@ -427,10 +448,23 @@ class ConfigStore(
     private fun isValidVersion(value: String): Boolean =
         value.isNotEmpty() && value.length <= 128 && value.none { it.isISOControl() }
 
+    /** 已配对应用必须是普通应用 uid（非 root、非负）。 */
+    private fun isValidUid(uid: Int): Boolean = uid > 0
+
     private fun stringOrNull(json: JsonObject, name: String): String? {
         val element = json.get(name) ?: return null
         if (!element.isJsonPrimitive || !element.asJsonPrimitive.isString) return null
         return element.asString
+    }
+
+    private fun intOrNull(json: JsonObject, name: String): Int? {
+        val element = json.get(name) ?: return null
+        if (!element.isJsonPrimitive || !element.asJsonPrimitive.isNumber) return null
+        val asDouble = element.asDouble
+        val asLong = element.asLong
+        if (asDouble != asLong.toDouble()) return null
+        if (asLong < 0L || asLong > Int.MAX_VALUE.toLong()) return null
+        return asLong.toInt()
     }
 
     private fun longOrNull(json: JsonObject, name: String): Long? {

@@ -45,6 +45,7 @@ object AgentCallCli {
     const val ERROR_PAYLOAD_TOO_LARGE: String = "payload_too_large"
     const val ERROR_PAIR_REQUIRES_ROOT: String = "pair_requires_root"
     const val ERROR_TRANSPORT: String = "transport_failed"
+    const val ERROR_RESPONSE_ID_MISMATCH: String = "response_id_mismatch"
     const val ERROR_CLI_FAILED: String = "cli_failed"
 
     private val COMMANDS = setOf("status", "config-get", "config-set", "pair", "diagnose", "shutdown")
@@ -118,6 +119,16 @@ object AgentCallCli {
 
         return try {
             val response = transport.call(request)
+            // 请求 ID 强制验证（spec §6.4）也必须由客户端执行：错配/串线的响应
+            // 不得被当成命令结果打印，负载内容也不回显。
+            if (response.id != request.id) {
+                return failure(
+                    stdout,
+                    ERROR_RESPONSE_ID_MISMATCH,
+                    "response request id does not match the request",
+                    EXIT_TRANSPORT,
+                )
+            }
             val error = response.error
             if (error != null) {
                 failure(stdout, error.code, error.message, EXIT_SERVER_ERROR)

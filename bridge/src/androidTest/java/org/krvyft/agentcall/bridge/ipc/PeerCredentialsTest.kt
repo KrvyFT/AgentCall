@@ -11,6 +11,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.krvyft.agentcall.bridge.config.ConfigStore
 import org.krvyft.agentcall.bridge.config.PairingRecord
 import org.krvyft.agentcall.core.model.PeerRole
 
@@ -68,9 +69,11 @@ class PeerCredentialsTest {
 
         val record = PairingRecord(
             appPackage = context.packageName,
+            appUid = Process.myUid(),
             appSignatureSha256 = ownSignature!!,
-            appVersionName = "1.0",
+            appVersionName = packages.versionName(context.packageName) ?: ConfigStore.UNKNOWN_VERSION,
             dialerPackage = PeerVerifier.DIALER_PACKAGE,
+            dialerUid = 10_001,
             dialerSignatureSha256 = "0".repeat(64),
             dialerVersionName = "UNKNOWN",
             pairedAtMs = 0L,
@@ -98,9 +101,11 @@ class PeerCredentialsTest {
 
         val record = PairingRecord(
             appPackage = "org.example.not.installed",
+            appUid = Process.myUid(),
             appSignatureSha256 = ownSignature!!,
             appVersionName = "1.0",
             dialerPackage = PeerVerifier.DIALER_PACKAGE,
+            dialerUid = 10_001,
             dialerSignatureSha256 = "0".repeat(64),
             dialerVersionName = "UNKNOWN",
             pairedAtMs = 0L,

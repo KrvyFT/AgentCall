@@ -320,14 +320,15 @@ GRADLE_EXIT=1
 ### 5.3 TDD 绿灯与最终验证
 
 ```console
-$ ./gradlew :core:testDebugUnitTest :bridge:testDebugUnitTest :bridge:assembleDebug --rerun-tasks
+$ ./gradlew :core:testDebugUnitTest :bridge:testDebugUnitTest :bridge:assembleDebug :app:assembleDebug --rerun-tasks
 ...
+> Task :app:assembleDebug
+> Task :bridge:assembleDebug
 > Task :core:testDebugUnitTest
 > Task :bridge:testDebugUnitTest
-> Task :bridge:assembleDebug
 
-BUILD SUCCESSFUL in 2s
-66 actionable tasks: 66 executed
+BUILD SUCCESSFUL in 3s
+98 actionable tasks: 98 executed
 GRADLE_EXIT:0
 ```
 
@@ -341,7 +342,12 @@ GRADLE_EXIT:0
 | `core.session.SessionReducerTest`（任务 2 回归） | 34 | 0 | 0 | 0 |
 | `core.protocol.RpcCodecTest` | 16 | 0 | 0 | 0 |
 | `core.protocol.RolePolicyTest` | 8 | 0 | 0 | 0 |
-| `bridge.config.ConfigStoreTest` | 8 | 0 | 0 | 0 |
+| `bridge.AgentCallCliTest` | 2 | 0 | 0 | 0 |
+| `bridge.ConfigRootTest` | 5 | 0 | 0 | 0 |
+| `bridge.config.ConfigStoreTest` | 11 | 0 | 0 | 0 |
+| `bridge.config.FilePermissionsTest` | 4 | 0 | 0 | 0 |
+| `bridge.ipc.ConnectionLanesTest` | 3 | 0 | 0 | 0 |
+| `bridge.ipc.PeerVerifierTest` | 12 | 0 | 0 | 0 |
 
 仪器测试只编译、未执行（本机无设备）：
 
@@ -354,6 +360,23 @@ BUILD SUCCESSFUL
 响应 payload 与 error 互斥、HOOK 无法读取配置与密钥、消息自称 uid/role 不提权、角色与内核 uid 一致性、
 CAS 冲突不改旧配置、空密钥拒绝、损坏/未来 schema 失败关闭、密钥 Keep/Replace/Clear、脱敏导出不含密钥、
 端点空值归一化为 null、0700/0600 权限与无临时文件残留、schema 迁移先备份。
+
+修复轮（task 3 fix 1）新增的 JVM 覆盖：
+
+- `PeerVerifierTest`（12 项，fake `PackageIdentitySource`）：uid 0 → CLI_ROOT；未配对、未知 uid、
+  uid 拥有的包与配对包不符、签名缺失/不符、配对后版本变化、配对记录里的 uid 被其他 uid 冒用
+  全部拒绝；已配对 APP/Google 电话分别得到 APP/HOOK，身份 uid 只来自内核凭据；签名大小写不敏感；
+  版本名缺失（UNKNOWN）与配对记录一致时不误拒。
+- `ConnectionLanesTest`（3 项）：两条 PCM 长连接占满 PCM lane 时控制请求仍在 2 s 内被服务；
+  PCM 第三条连接有界失败且不消耗控制槽位；关闭后提交立即有界失败。
+- `FilePermissionsTest`（4 项）：非 POSIX 回退返回 false 时 `config_storage_failed` 失败关闭；
+  回退成功时不报错；回退实现真实得到 0600/0700；注入权限执行器失败时 ConfigStore 构造失败关闭。
+- `ConfigRootTest`（5 项）：生产入口只接受 `/data/adb/agentcall` 及其规范化子目录；
+  任意临时目录、同前缀兄弟目录、`..` 越界路径都以 `config_root_rejected` 拒绝且不创建目录。
+- `AgentCallCliTest`（2 项）：响应请求 ID 与请求不一致时客户端拒绝（`response_id_mismatch`，
+  不打印负载）；一致时正常输出。
+- `ConfigStoreTest` 新增：schema 1.5 / -0.5 / -1 显式 `config_corrupt`（不截断、不迁移），
+  schema 1.0 按整数接受且不触发迁移；旧配对文件缺 uid 时 `config_corrupt`（重新配对，不降级信任）。
 
 ### 5.4 DEX 与公开签名证据
 
@@ -379,9 +402,15 @@ $ grep -l -a -F 'Lcom/google/gson/Gson;' /tmp/bridge-dex/classes*.dex
   未验证；获取失败时实现选择退出（`package_manager_unavailable`），不降级信任。
 - `LocalSocket#getPeerCredentials` 返回真实 uid/pid、不同 UID 被拒绝、SELinux 可达性：
   仅写了 `BI/ipc/PeerCredentialsTest.kt`，本机无设备未执行。
-- 配对记录保存配对时从 PackageManager 解析的 AgentCall/Google 电话版本名（签名仍是授权锚点）；
-  该字段已写入配对 JSON，但真机配对与升级后的版本核对未验证。
+- 配对记录保存配对时从 PackageManager 解析的包名、uid、签名与 AgentCall/Google 电话版本名；
+  连接期四者都复核（uid 不匹配 `peer_uid_mismatch`，版本变化 `peer_version_mismatch`，必须重新配对）。
+  旧配对文件缺 uid/版本按 `config_corrupt` 处理。上述 JVM 判定由 fake PackageIdentitySource 覆盖，
+  真机上 PackageManager 的 uid/版本解析与重新配对流程未验证。
 - 配对与 CLI 在真机上的 root 身份、WebView 桥（任务 8）未验证。
-- PCM 通道已实现独立 bind/限长/凭据校验，但本任务没有音频生产者，`:bridge` 运行容器未注入 sink；
-  真正音频接入属任务 5。
+- PCM 通道已实现独立 bind/限长/凭据校验，并有独立执行器与连接上限
+  （`ConnectionLanes`，控制 lane 不会被 PCM 流饿死）；本任务没有音频生产者，`:bridge` 运行容器
+  未注入 sink，真正音频接入属任务 5。真实 socket 下的并发行为仍未在设备上验证。
+- 生产入口 `BridgeMain` 的配置根限制（只允许 `/data/adb/agentcall` 及其子目录）由
+  `ConfigRootTest` 覆盖；测试注入临时目录走 `ConfigStore` 构造参数（文档化 test-only 门），
+  生产路径没有 argv 可触发的测试开关。真机 app_process 启动未验证。
 - 未运行 `:bridge:assembleRelease` 的收缩验证（任务 9 负责真实 DEX 容器与 keep 规则检查）。
