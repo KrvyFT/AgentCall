@@ -127,12 +127,14 @@ class SessionReducerTest {
         assertTrue(reducer.reduce(SessionEvent.Tick, 3_000).isEmpty())
 
         val ready = reducer.reduce(SessionEvent.ReadyChanged(ready = true), 4_000)
+        // READY 确认后进入 PREPARING：接听前的租约/隔离在倒计时窗口内就绪。
         assertTrue(ready.contains(SessionEffect.AcquireLease(id)))
         assertTrue(ready.contains(SessionEffect.IsolateMicrophone))
-        assertEquals(SessionState.ANSWER_PENDING, reducer.state)
+        assertEquals(SessionState.PREPARING, reducer.state)
 
         assertEquals(0, reducer.reduce(SessionEvent.Tick, 6_999).answerCommands().size)
         assertEquals(1, reducer.reduce(SessionEvent.Tick, 7_000).answerCommands().size)
+        assertEquals(SessionState.ANSWER_PENDING, reducer.state)
     }
 
     @Test
@@ -370,5 +372,213 @@ class SessionReducerTest {
 
         assertEquals(0, next.reduce(SessionEvent.Tick, 9_999).answerCommands().size)
         assertEquals(1, next.reduce(SessionEvent.Tick, 10_000).answerCommands().size)
+    }
+
+    // ---- 复查修复：可观察的 PREPARING 窗口与完整状态路径 ----
+
+    @Test
+    fun observedStatePathIsIdleEligiblePreparingAnswerPendingActiveAi() {
+        val reducer = SessionReducer(id = id, config = Fixtures.config())
+        val observed = mutableListOf(reducer.state)
+
+        // READY 晚于 RINGING：ELIGIBLE 与 PREPARING 各自可观察。
+        reducer.reduce(SessionEvent.StateChanged(Fixtures.ringing()), 0L)
+        observed += reducer.state
+        reducer.reduce(SessionEvent.ReadyChanged(ready = true), 0L)
+        observed += reducer.state
+
+        // 倒计时基准点是进入 PREPARING 的时刻：2999 不接听，3000 恰好一次。
+        assertEquals(0, reducer.reduce(SessionEvent.Tick, 2_999).answerCommands().size)
+        observed += reducer.state
+        assertEquals(1, reducer.reduce(SessionEvent.Tick, 3_000).answerCommands().size)
+        observed += reducer.state
+
+        reducer.reduce(SessionEvent.StateChanged(Fixtures.answered()), 3_000)
+        observed += reducer.state
+
+        // 依次观察到 IDLE→ELIGIBLE→PREPARING→ANSWER_PENDING→ACTIVE_AI；
+        // 2999 ms 的 Tick 不得离开 PREPARING 窗口。
+        assertEquals(
+            listOf(
+                SessionState.IDLE,
+                SessionState.ELIGIBLE,
+                SessionState.PREPARING,
+                SessionState.PREPARING,
+                SessionState.ANSWER_PENDING,
+                SessionState.ACTIVE_AI,
+            ),
+            observed,
+        )
+    }
+
+    @Test
+    fun preparingEmitsLeaseAndIsolationOnEntryWhenReadyFirst() {
+        val reducer = SessionReducer(id = id, config = Fixtures.config())
+        reducer.reduce(SessionEvent.ReadyChanged(ready = true), 0L)
+
+        // READY 已就绪：名单命中后立即进入 PREPARING，并在进入时声明接听前的租约与麦克风隔离。
+        val prep = reducer.reduce(SessionEvent.StateChanged(Fixtures.ringing()), 0L)
+
+        assertEquals(SessionState.PREPARING, reducer.state)
+        assertEquals(
+            listOf(SessionEffect.AcquireLease(id), SessionEffect.IsolateMicrophone),
+            prep,
+        )
+        assertEquals(0, reducer.reduce(SessionEvent.Tick, 2_999).answerCommands().size)
+        assertEquals(1, reducer.reduce(SessionEvent.Tick, 3_000).answerCommands().size)
+        assertEquals(SessionState.ANSWER_PENDING, reducer.state)
+    }
+
+    // ---- 复查修复：总开关关闭在每个状态都有明确行为 ----
+
+    @Test
+    fun disableInIdleLatchesAndRefusesLaterRinging() {
+        val reducer = SessionReducer(id = id, config = Fixtures.config())
+
+        // 本通 RINGING 尚未到达时关闭总开关：IDLE 不得丢弃停用信号。
+        assertTrue(reducer.onConfigChanged(Fixtures.config(enabled = false)).isEmpty())
+        reducer.reduce(SessionEvent.ReadyChanged(ready = true), 0L)
+
+        assertTrue(reducer.reduce(SessionEvent.StateChanged(Fixtures.ringing()), 0L).isEmpty())
+        assertEquals(SessionState.IDLE, reducer.state)
+        assertEquals(0, reducer.reduce(SessionEvent.Tick, 2_999).answerCommands().size)
+        assertEquals(0, reducer.reduce(SessionEvent.Tick, 3_000).answerCommands().size)
+        assertEquals(0, reducer.reduce(SessionEvent.Tick, 30_000).answerCommands().size)
+    }
+
+    @Test
+    fun disableInEligibleHandsBackWithoutCommand() {
+        val reducer = SessionReducer(id = id, config = Fixtures.config())
+        reducer.reduce(SessionEvent.StateChanged(Fixtures.ringing()), 0L)
+        assertEquals(SessionState.ELIGIBLE, reducer.state)
+
+        val effects = reducer.onConfigChanged(Fixtures.config(enabled = false))
+
+        // ELIGIBLE 还没有租约/隔离：没有资源要撤销，但必须交还人工并停在这里。
+        assertEquals(SessionState.HANDOFF, reducer.state)
+        assertTrue(effects.none { it is SessionEffect.SendCommand })
+        assertTrue(reducer.reduce(SessionEvent.Tick, 3_000).answerCommands().isEmpty())
+        // READY 迟到也不得重新准备接听。
+        assertTrue(
+            reducer.reduce(SessionEvent.ReadyChanged(ready = true), 4_000)
+                .none { it == SessionEffect.AcquireLease(id) },
+        )
+    }
+
+    @Test
+    fun disableInPreparingRevokesLeaseAndRestoresMicrophone() {
+        val reducer = startedReducer()
+        assertEquals(SessionState.PREPARING, reducer.state)
+
+        val effects = reducer.onConfigChanged(Fixtures.config(enabled = false))
+
+        assertTrue(effects.contains(SessionEffect.RevokeLease(id)))
+        assertTrue(effects.contains(SessionEffect.RestoreMicrophone(id)))
+        assertTrue(effects.none { it is SessionEffect.SendCommand })
+        assertEquals(SessionState.HANDOFF, reducer.state)
+        assertTrue(reducer.reduce(SessionEvent.Tick, 3_000).answerCommands().isEmpty())
+    }
+
+    @Test
+    fun disableInAnswerPendingTerminatesIssuedCall() {
+        val reducer = startedReducer()
+        assertEquals(1, reducer.reduce(SessionEvent.Tick, 3_000).answerCommands().size)
+        assertEquals(SessionState.ANSWER_PENDING, reducer.state)
+
+        val effects = reducer.onConfigChanged(Fixtures.config(enabled = false))
+
+        // 接听命令已下发、ACTIVE 尚未确认：不能再交还人工，必须终止并保持隔离。
+        assertTrue(effects.hasHangup())
+        assertTrue(effects.contains(SessionEffect.RevokeLease(id)))
+        assertTrue(effects.none { it is SessionEffect.RestoreMicrophone })
+        assertEquals(SessionState.ENDING, reducer.state)
+    }
+
+    @Test
+    fun disableDuringAudioFailureWindowTerminatesImmediately() {
+        val reducer = activeReducer(activeAt = 3_000)
+        reducer.onAudioFailure(4_000)
+        assertEquals(SessionState.HANDOFF, reducer.state)
+
+        // 音频故障的 10 s 窗口仍在等待人工接管，但总开关关闭必须立即终止，不能等窗口到期。
+        val effects = reducer.onConfigChanged(Fixtures.config(enabled = false))
+
+        assertTrue(effects.hasHangup())
+        assertTrue(effects.contains(SessionEffect.RevokeLease(id)))
+        assertEquals(SessionState.ENDING, reducer.state)
+        assertTrue(reducer.reduce(SessionEvent.Tick, 13_999).none { it is SessionEffect.SendCommand })
+    }
+
+    // ---- 复查修复：已知失联的对端不得进入接听 ----
+
+    @Test
+    fun peerLostInIdleRefusesRingingUntilHeartbeatReturns() {
+        val reducer = SessionReducer(id = id, config = Fixtures.config())
+        reducer.heartbeat(PeerRole.HOOK, 0L)
+        assertTrue(reducer.reduce(SessionEvent.PeerLost(PeerRole.HOOK), 1_000).isEmpty())
+        assertEquals(SessionState.IDLE, reducer.state)
+        reducer.reduce(SessionEvent.ReadyChanged(ready = true), 1_000)
+
+        // 已知失联的对端尚未恢复：不得进入 ELIGIBLE，更不得进入倒计时。
+        assertTrue(reducer.reduce(SessionEvent.StateChanged(Fixtures.ringing()), 1_000).isEmpty())
+        assertEquals(SessionState.IDLE, reducer.state)
+        assertEquals(0, reducer.reduce(SessionEvent.Tick, 4_000).answerCommands().size)
+
+        // 心跳恢复证明对端重新在线，之后的 RINGING 才允许接管。
+        reducer.heartbeat(PeerRole.HOOK, 5_000)
+        val prep = reducer.reduce(SessionEvent.StateChanged(Fixtures.ringing()), 5_000)
+        assertTrue(prep.contains(SessionEffect.AcquireLease(id)))
+        assertEquals(SessionState.PREPARING, reducer.state)
+        assertEquals(1, reducer.reduce(SessionEvent.Tick, 8_000).answerCommands().size)
+    }
+
+    // ---- 复查修复：接听前拒接/挂断后不再执行自动命令（spec §8） ----
+
+    @Test
+    fun disconnectDuringPreparingCancelsPendingAnswer() {
+        val reducer = startedReducer()
+        assertEquals(SessionState.PREPARING, reducer.state)
+
+        val effects = reducer.reduce(SessionEvent.StateChanged(Fixtures.disconnected()), 1_000)
+
+        assertTrue(effects.contains(SessionEffect.RevokeLease(id)))
+        assertTrue(effects.contains(SessionEffect.RestoreMicrophone(id)))
+        assertEquals(SessionState.ENDED, reducer.state)
+        assertTrue(reducer.reduce(SessionEvent.Tick, 3_000).answerCommands().isEmpty())
+        assertTrue(reducer.reduce(SessionEvent.Tick, 30_000).none { it is SessionEffect.SendCommand })
+    }
+
+    @Test
+    fun disconnectAfterAnswerIssuedSuppressesFurtherCommands() {
+        val reducer = startedReducer()
+        assertEquals(1, reducer.reduce(SessionEvent.Tick, 3_000).answerCommands().size)
+        assertEquals(SessionState.ANSWER_PENDING, reducer.state)
+
+        val effects = reducer.reduce(SessionEvent.StateChanged(Fixtures.disconnected()), 3_500)
+
+        assertTrue(effects.contains(SessionEffect.RevokeLease(id)))
+        assertTrue(effects.none { it is SessionEffect.SendCommand })
+        assertEquals(SessionState.ENDED, reducer.state)
+        assertTrue(reducer.reduce(SessionEvent.Tick, 4_000).isEmpty())
+    }
+
+    // ---- 复查修复：API/会话失败立即终止，不共享音频失败的 10 s 窗口 ----
+
+    @Test
+    fun apiFailureTerminatesOwnedCallWithoutHandoffWindow() {
+        val reducer = activeReducer(activeAt = 3_000)
+
+        val effects = reducer.onApiFailure()
+
+        // 有故障提示（是否有有效上行由调用方判定），随后立即终止 AI 通话。
+        assertTrue(effects.any { it is SessionEffect.NotifyUser })
+        assertTrue(effects.contains(SessionEffect.StopConversation))
+        assertTrue(effects.hasHangup())
+        assertTrue(effects.contains(SessionEffect.RevokeLease(id)))
+        // 没有 10000 ms 人工接管窗口；麦克风保持隔离直到 DISCONNECTED 确认。
+        assertTrue(effects.none { it is SessionEffect.RestoreMicrophone })
+        assertEquals(SessionState.ENDING, reducer.state)
+        assertTrue(reducer.reduce(SessionEvent.Tick, 3_001).none { it is SessionEffect.SendCommand })
+        assertTrue(reducer.reduce(SessionEvent.Tick, 13_000).none { it is SessionEffect.SendCommand })
     }
 }
