@@ -3,20 +3,30 @@
 - 依据：`docs/superpowers/specs/2026-11-10-agentcall-design.md` §8（会话状态与故障恢复）、§9（音频与校准）。
 - 范围：受限通话音频提取/注入、PCM16 单声道与重采样、麦克风隔离、心跳故障终止、人工接管、特权 Telecom 终止、持久校准证据。
 - 记录时间：2026-11-11（Asia/Shanghai）。
-- 最终代码 HEAD：`438cbbd`（`master`）。
+- 最终代码 HEAD：`ae8c70f`（`master`；docs 同步提交在它之后，产物哈希绑定这个代码 HEAD）。
 - **当前结论：本文件所有验证项均为「未验证」。没有任何一行被真机执行过，也没有任何一行被标记为「已验证」。**
   交付时没有连接设备（`adb devices` 为空），用户也明确禁止设备侧验证。
 - JVM 单元测试（`:core:testDebugUnitTest`、`:bridge:testDebugUnitTest`）只证明无设备可测的逻辑；它们不是、也不能代替任何一行真机结论。
 
-## 当前状态（HEAD `438cbbd`，2026-11-11）
+## 当前状态（代码 HEAD `ae8c70f`，2026-11-11）
 
-- JVM/构建矩阵（HEAD `438cbbd`）：225 个 Gradle task，BUILD SUCCESSFUL；JVM core 126 /
-  bridge 360 / app 359，合计 **845**，0 failures / 0 errors / 0 skipped；lint 0 errors /
-  15 warnings；WebUI node 116/116（Task 11K 安装回归）；Python 59/59。APK 与模块 ZIP 的
-  大小与 SHA-256 见 `docs/verification.md` 4.5（Task 11K 只重打模块 ZIP，APK 字节未变）。
+- JVM/构建矩阵（代码 HEAD `ae8c70f`）：BUILD SUCCESSFUL；JVM core 126 / bridge 390 /
+  app 359，合计 **875**，0 failures / 0 errors / 0 skipped；lint 0 errors / 15 warnings；
+  WebUI node 141/141（含 exec+env 回退、env 探测、密钥卫生与 stop.lock 回归）；Python 59/59。
+  APK 与模块 ZIP 都在该 HEAD 重新构建，大小与 SHA-256 见 `docs/verification.md` 4.5；
+  哈希只对应 `ae8c70f` 的这次构建，更晚提交重建会改变字节。
 - **交付时 `adb devices` 为空，没有设备连接。** 实现期间曾只读观察到 XQ-DQ72（API 37），
   但 shell uid 2000 没有 `su`，所以没有安装模块、启动桥接、发起通话或执行任何音频测试。
-- 结论不变：**D01–D12 每一行仍为「未验证」**；最终 JVM 计数不构成任何一行真机结论，
+- **本轮（11N/11O）是设备驱动修复**，依据是两处设备侧失败证据，但都不是本仓库执行的验证：
+  1. 管理器把 `ksu.io` 暴露为**函数**，没有 `File`/`FileOutputStream`（WebUI 诊断：
+     `ioForm=function`、`ioSupport=null`、`ioVersion=0`、`hasFile=false`、
+     `hasFileOutputStream=false`），所以首选文件保存通道不可用；11O 增加 exec+env 回退
+     （探测通过才启用，否则 `env_unavailable` fail closed）。
+  2. 同一类设备（XQ-DQ72 / API 37）上 `app_process` 桥接曾以
+     `package_manager_unavailable` 退出，WebUI 只能显示 `transport_failed`；11N 改为
+     context → appglobals → binder → shell 的分层 provider，只有四层全失败才以同一机器码
+     退出。修复后的落点、env 探测与 stop.lock 行为**均未在设备上确认**。
+- 结论不变：**D01–D12 每一行仍为「未验证」**；最终 JVM/node 计数不构成任何一行真机结论，
   也不能把任何一行改成「已验证通过/已验证不支持」。
 
 ## 1. 状态定义与翻绿规则
@@ -369,9 +379,9 @@ adb shell grep @org.krvyft.agentcall.control /proc/net/unix \
 
 ## 7. 任务 5 的 JVM 证据（不是真机证据）
 
-> 本节的 108 / 161 是任务 5 当时的历史计数；当前（HEAD `438cbbd`）的计数是
-> core 126 / bridge 360 / app 359，合计 845，见 `docs/verification.md`。本节保留历史记录，
-> 不用它冒充最终数字。
+> 本节的 108 / 161 是任务 5 当时的历史计数；当前（代码 HEAD `ae8c70f`）的计数是
+> core 126 / bridge 390 / app 359，合计 875，另加 WebUI node 141/141 与 Python 59/59，
+> 见 `docs/verification.md`。本节保留历史记录，不用它冒充最终数字。
 
 已执行（可复现）：
 
@@ -412,6 +422,17 @@ BUILD SUCCESSFUL
   阻止自动接听，`ReflectiveTelecomTermination` 未在目标 ROM 验证。
 - 音频 HAL/受限方法：未在任何真机上确认三个 AOSP 受限方法可见、可调用、可创建对象，更未确认对端能听到注入。
 - 锁屏、重启、双 SIM、VoWiFi、蓝牙、通知权限、人工接管界面、麦克风隔离与 TTS 共存：均未在真机执行。
+- 分层 PackageManager provider（11N）：`appglobals`/`binder` 的 `AppGlobals.getPackageManager`、
+  `ServiceManager` + `IPackageManager$Stub` 反射在真实 `app_process` 中是否可用、最终落在
+  `package_provider=context|appglobals|binder|shell` 哪一层，均未验证；只有宿主 JVM 的
+  顺序/缓存/失败回落/日志码证据。
+- WebUI exec+env 保存通道（11O）：真实 KernelSU WebView 是否透传 `ksu.exec` 的
+  `options.env`、诊断页 `ioMode` 是否按预期从 `none` 提升为 `env`，未验证；只有 node
+  管理器替身证据。设备上已知 `ksu.io` 为函数且无 `File`/`FileOutputStream`，但回退本身
+  未在真机执行。
+- stop.lock 行为（11N）：`app_process` 子进程不继承锁 fd、桥接退出后的清理只做非阻塞取锁
+  （`stop_lock_busy`/`stop_lock_unavailable`）与桥接存活时的串行化，只有宿主真实 `flock`
+  + 替身证据；真机 KernelSU 停止/卸载时序未验证。
 
 ## 9. 维护规则
 

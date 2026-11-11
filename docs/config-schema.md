@@ -1,6 +1,7 @@
 # AgentCall 配置 schema、CAS 与固定 CLI
 
-本文是 AgentCall 配置主副本与 WebUI/CLI 之间的接口约定。适用代码：
+本文是 AgentCall 配置主副本与 WebUI/CLI 之间的接口约定。适用的代码 HEAD：`ae8c70f`；
+主要实现文件：
 
 - `bridge/src/main/java/org/krvyft/agentcall/bridge/config/ConfigStore.kt`（主副本、CAS、密钥）
 - `core/src/main/java/org/krvyft/agentcall/core/protocol/RpcCodec.kt`（编解码与字段表）
@@ -150,7 +151,10 @@ inbox 中的一次性明文负载只在一次保存期间存在（仅 ksu.io 首
   dialerPackageVersion/frameworkVersion/bridgeVersion/audioPolicyDigest/simCarrier/
   transport/route）、`downlinkExtraction`、`uplinkInjection`、`microphoneIsolation`、
   `privilegedTermination`、`checkedAtMs`、`notes`（已脱敏），以及**与 status 相同的
-  `calibration` 对象**（同一份只读校准视图）。
+  `calibration` 对象**（同一份只读校准视图）。`notes` 是单行事实串，含
+  `dialerPackage=`、`dialerVersion=`、`dialerSignatureSha256=`、`hiddenApi=` 与
+  `packageProvider=<context|appglobals|binder|shell|UNKNOWN>`；后者是 11N 分层包事实
+  来源的实际落点，shell 路径的签名显式为 `UNKNOWN`（不可验证，fail closed）。
 
 ---
 
@@ -320,6 +324,30 @@ inbox 中的一次性明文负载只在一次保存期间存在（仅 ksu.io 首
 模块侧 `restart` 另有 `service_not_running`、`module_disabled`、`restart_unconfirmed`、
 `restart_refused`（关闭裁决不干净/仍隔离/缺失）。
 
+### 7.5 桥接/模块日志机器码（不是 RPC 错误码）
+
+这些行只出现在 `service.log`/stderr，用于设备排障；它们不是控制 socket 的错误响应，
+也不能被 WebUI 当成操作结果。
+
+| 日志行 | 含义 |
+| --- | --- |
+| `package_provider=<context\|appglobals\|binder\|shell>` | 本进程选中的包事实来源，每进程只解析一次 |
+| `package_provider_attempt=<code> result=unavailable` | 该层构造失败，链继续下一层（每层各一行） |
+| `package_provider_unavailable candidates=...` | 四层全失败；桥接随后以 `package_manager_unavailable` 退出（fail closed） |
+| `package_manager_unavailable` | 没有任何包事实 provider：stderr 机器错误 JSON，桥接退出码 1 |
+| `stop_lock_wait path=... timeout=<n>s` | 桥接仍存活时进入有界等待（与 `uninstall.sh` 串行化） |
+| `stop_lock_acquired path=...` | 取得停止锁；桥接退出后的清理会带 `nonblocking=1` |
+| `stop_lock_reentrant path=... held=<n>` | 本进程已持锁，清理路径不重复申请（避免自锁） |
+| `! stop_lock_timeout waited=<n>s` | 有界等待超时；只应在桥接仍存活且对端长期持锁时出现 |
+| `! stop_lock_busy ... nonblocking=1` | 桥接已退出后的清理取锁失败；只跳过重复优雅关闭 |
+| `stop_lock_unavailable path=... reason=open_failed` | 锁文件无法打开；继续有界回收，不伪造“已串行化” |
+| `bridge_shutdown_skipped reason=stop_lock_unavailable` | 因未取到锁跳过一次重复 `shutdown` |
+| `bridge_exit attempt=<n> code=<c>` | 桥接退出容器每次退出；`code=1` 是启动失败（例如没有 provider） |
+| `bridge_exit_clean` / `bridge_exit_unclean` | 持久裁决干净/不干净；不干净时绝不打印 clean |
+
+所有 `app_process` 子进程启动都带 `9>&-`：锁 fd 不继承给子进程，否则父脚本退出后锁仍被
+同一打开文件描述持有，清理只能等满 40 s（11N 修复）。
+
 ---
 
 ## 8. 固定 CLI 映射
@@ -336,7 +364,7 @@ inbox 中的一次性明文负载只在一次保存期间存在（仅 ksu.io 首
 | `calibrate` | 无（argv 负载一律拒绝） | 必须：`{steps:{...五项布尔}, expectedEnvironment?, operatorAttestation?}` JSON | 校准记录结果 `{recorded, environment, operatorAttestation, steps, verified, blockers, calibratedAtMs}` | 0 | CLI_ROOT |
 | `pair` | 可选一个包名（默认 `org.krvyft.agentcall`） | 不用 | 配对成功负载 | 0 | 仅 root |
 | `diagnose` | 无 | 不用 | 能力/环境报告 | 0 | CLI_ROOT |
-| `shutdown` | 无 | 不用 | `{"stopping":true,"clean":<bool>,"shutdownCode":<string|null>,"supervision":{"clean":<bool>,"ownedSession":<bool>,"termination":<string|null>,"ownershipResolved":<bool>,"disconnected":<bool>,"microphoneIsolated":<bool>,"code":<string|null>}}` | 0 | CLI_ROOT |
+| `shutdown` | 无 | 不用 | `{"stopping":true,"clean":<bool>,"shutdownCode":<string\|null>,"supervision":{"clean":<bool>,"ownedSession":<bool>,"termination":<string\|null>,"ownershipResolved":<bool>,"disconnected":<bool>,"microphoneIsolated":<bool>,"code":<string\|null>}}` | 0 | CLI_ROOT |
 
 `restart` 是模块侧控制动作，不是 AgentCallCli 命令（见 §10）。
 
@@ -460,8 +488,22 @@ CLI 只对 `shutdown` 把 socket 超时放宽到 20 s。
 `supervision_state_schema_unsupported`），绝不把旧状态当成干净启动。
 
 **停止顺序（模块侧硬契约）**：`service.sh` 的停止/退出路径与 `uninstall.sh` 都先取
-`/data/adb/agentcall/stop.lock`（`flock`，最多等待 40 s；无 flock 时退回 `mkdir` 原子目录锁），
-再发固定 CLI `shutdown` 并等待桥接退出，再停音频工作进程，最后有界升级 TERM→KILL。
+`/data/adb/agentcall/stop.lock`（`flock`；桥接仍存活时最多等待 40 s，无 flock 时退回
+`mkdir` 原子目录锁），再发固定 CLI `shutdown` 并等待桥接退出，再停音频工作进程，
+最后有界升级 TERM→KILL。
+
+11N 起锁的获取分两条路径（等待预算不变）：
+
+- **桥接仍存活** → `acquire_stop_lock`：有界等待对端释放，日志 `stop_lock_wait` →
+  `stop_lock_acquired`；超时才 `! stop_lock_timeout`。
+- **桥接已退出后的清理** → `acquire_stop_lock_cleanup`：只做一次非阻塞 `flock -n`。
+  失败记录 `! stop_lock_busy`（锁文件打不开则 `stop_lock_unavailable`），跳过重复的
+  优雅关闭（`bridge_shutdown_skipped reason=stop_lock_unavailable`）后继续有界回收，
+  **不再等满 40 s**。
+- 本进程已经持锁时记录 `stop_lock_reentrant` 并直接返回，避免同一进程重复 `flock` 自锁。
+- 每个 `app_process` 子进程启动都显式 `9>&-`：锁 fd 不继承。否则子进程持有同一打开
+  文件描述，父脚本退出后锁仍不释放，清理路径只能等超时。
+
 锁使两个脚本的优雅关闭序列串行化：没有它，第二个 CLI shutdown 可能在第一个的恢复窗口内
 杀音频工作进程（11F / I4）。等待预算与 11E 的 20 s CLI socket 超时对齐：`service.sh` 等
 CLI 结果最多 25 s、等桥接退出最多 10 s；`uninstall.sh` 相同，最终 status 探测单独最多 5 s。
@@ -489,6 +531,23 @@ CLI 结果最多 25 s、等桥接退出最多 10 s；`uninstall.sh` 相同，最
 | `readonly`（`env_unavailable`） | 有 `ksu.exec`，但 `ksu.io` 不可用，且 env 探测失败/被忽略/exec 抛错 | 读取/诊断/配对/关闭可用；**保存一律拒绝**（`secret_transport_unsupported`），绝不降级为 base64/echo argv |
 | `readonly`（`module_dir_unresolved`） | `moduleInfo()` **明确给出**不可信的 `moduleDir` | 需要执行 CLI 的命令禁用；固定路径日志读取仍可用（日志不依赖模块目录）；保存拒绝 |
 | `demo` | 普通浏览器，没有管理器注入 | 明确标注“演示数据”，保存、配对、日志均不可用；不发起任何网络请求 |
+
+诊断页显示上述判断的**原始字段**（本次页面会话，不跨会话缓存）：
+
+| 字段 | 取值 | 说明 |
+| --- | --- | --- |
+| `ioForm` | `object` / `function` / `none` | `ksu.io` 的存在形式（对象或旧式函数） |
+| `ioSupport` | `true` / `false` / `null` | 管理器自述的 `support`；`null` 表示未提供 |
+| `ioVersion` | 数字，缺失为 0 | 管理器自述的 `version` |
+| `hasFile` | bool | `File` 构造器是否可用 |
+| `hasFileOutputStream` | bool | `FileOutputStream` 构造器是否可用 |
+| `ioMode` | `file` / `env` / `none` | 本次页面会话选中的保存通道 |
+| `envProbe` | `skipped` / `pending` / `ok` / `unavailable` | exec+env 探测状态（`ioMode=env` 只在 `ok` 后成立） |
+
+设备证据（不是验证）：目标设备的管理器把 `ksu.io` 暴露为函数，但没有 `File`/
+`FileOutputStream`（`ioForm=function`、`ioSupport=null`、`ioVersion=0`、
+`hasFile=false`、`hasFileOutputStream=false`），因此文件通道不可用，只能走 env 回退或
+只读；该回退在真机 WebView 中**未验证**。
 
 模块目录解析规则（版本偏差不再一刀切）：
 
@@ -562,7 +621,9 @@ WebUI 不加载任何在线 CDN、不发起 fetch/XHR、不用 `innerHTML` 渲�
   （socket 存在不等于 CLI 可执行），并固定以下顺序（任务 11D2b）：
   1. 收回待处理的 `restart.requested`；
   2. 取 `/data/adb/agentcall/stop.lock`（`flock`，最多等 40 s）与 `service.sh` 串行化；
-     拿不到锁时打印 `stop_lock_timeout` 并跳过重复的关闭请求，只做有界 PID 回退；
+     桥接仍存活时拿不到锁打印 `stop_lock_timeout` 并跳过重复的关闭请求，只做有界 PID
+     回退；桥接已退出后的清理只做一次非阻塞取锁，失败打印 `! stop_lock_busy` /
+     `stop_lock_unavailable`；
   3. 两者都可用 → 固定 CLI `shutdown`，分别有界等待 CLI 返回（`STOP_WAIT_SECONDS`，
      默认 25 s，覆盖 11E 的 20 s socket 超时）与桥接进程/socket 消失（`BRIDGE_EXIT_WAIT_SECONDS`，
      默认 10 s）；桥接在响应前完成终止/交还 + 麦克风读回；
@@ -662,6 +723,12 @@ WebUI 不加载任何在线 CDN、不发起 fetch/XHR、不用 `innerHTML` 渲�
   环境探针**未验证**。`frameworkVersion`/`simCarrier` 观测为 UNKNOWN 时，以及从不观测的
   `transport`/`route`，只有 root 操作员背书才能补齐；`UNKNOWN` 背书不完整时仍按
   `calibration_environment_unknown` 拒绝，不会伪造环境事实。APP/HOOK 不能背书。
+- **分层 PackageManager provider 未上机**：11N 的 context → appglobals → binder → shell
+  链只有 JVM 证据（顺序/缓存/失败回落/日志码/签名不可验证时的 fail closed）。真实
+  `app_process` 中 `AppGlobals`/`ServiceManager`/`IPackageManager` 的反射签名、隐藏
+  API 策略、binder 权限，以及最终落在哪一层（`package_provider=`），都**未验证**；
+  shell 路径还会让 `pair` 报 `pairing_package_unknown`、非 root 对端被
+  `peer_untrusted` 拒绝（预期 fail closed）。
 - **产品阻塞项**：校准记录只是自动接听的一道闸门；默认 `UnverifiedCallIdentityVerifier`
   仍 `blocksAutoAnswer=true`，没有设备验证过的、按通话身份定位的特权 Telecom 终止路径，
   所以即使记录齐全自动接听也不会开启。APK 只有 debug 签名、不可分发。
