@@ -172,6 +172,9 @@ private class HookRuntime(private val loader: ClassLoader) {
             processEpoch = registry.processEpoch,
             liveSessions = { registry.liveSessions() },
             onCommand = { session, command -> dispatchCommand(session, command) },
+            // 传输诊断走现有框架日志（XposedBridge -> logcat），设备上才能看到
+            // hook_transport connect_failed/server_untrusted/protocol_violation。
+            logger = ::log,
         )
     }
 

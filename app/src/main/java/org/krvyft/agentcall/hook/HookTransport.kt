@@ -1,7 +1,5 @@
 package org.krvyft.agentcall.hook
 
-import android.net.LocalSocket
-import android.net.LocalSocketAddress
 import java.io.IOException
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeUnit
@@ -54,6 +52,10 @@ class HookTransport(
     private val requestTimeoutMs: Int = REQUEST_TIMEOUT_MS,
     private val queueCapacity: Int = QUEUE_CAPACITY,
     private val clock: () -> Long = { System.nanoTime() },
+    private val socketFactory: () -> HookSocketLink = {
+        AndroidHookSocketLink(socketName, requestTimeoutMs)
+    },
+    private val logger: (String) -> Unit = {},
 ) {
 
     init {
@@ -82,6 +84,10 @@ class HookTransport(
     private val untrustedServers = AtomicLong(0)
     private val rejectedCommands = AtomicLong(0)
     private val requestCounter = AtomicLong(0)
+
+    /** 每个机器码最近一次**实际输出**日志的注入时钟时刻（限流用；计数器不受影响）。 */
+    private val failureLogStamps = HashMap<String, Long>()
+    private val failureLogLock = Any()
 
     @Volatile
     private var worker: Thread? = null
@@ -163,11 +169,15 @@ class HookTransport(
 
     private fun loop() {
         val nextHeartbeat = HashMap<String, Long>()
+        var nextPresence: Long? = null
         while (running.get()) {
             // 心跳先于出站队列：桥接卡住时一次 snapshot 请求最长会占用 REQUEST_TIMEOUT_MS，
             // 若把心跳排在它后面，连续卡顿会把“下一次心跳”推过 5000 ms 失联窗口。
             // 到期时间按发送**开始**时刻计算，请求耗时不会把节奏往后顺延（M5）。
-            sendDueHeartbeats(nextHeartbeat)
+            val startedAt = clock()
+            // Task 11Q：即使零存活会话也要报存在性，否则空闲 Hook 对桥接完全静默。
+            nextPresence = sendDuePresence(startedAt, nextPresence)
+            sendDueHeartbeats(startedAt, nextHeartbeat)
 
             val outbound = try {
                 queue.poll(POLL_INTERVAL_MS, TimeUnit.MILLISECONDS)
@@ -183,9 +193,22 @@ class HookTransport(
         }
     }
 
+    /**
+     * 发送到期的空闲存在性（Task 11Q）：无会话、无负载的 `hook.presence`。
+     *
+     * 与按会话心跳同一线程、同一到期规则：先记下一次到期再发，请求耗时不会顺延节奏。
+     *
+     * @return 下一次到期时刻（注入时钟纳秒）。
+     */
+    private fun sendDuePresence(startedAt: Long, nextPresence: Long?): Long {
+        if (nextPresence != null && startedAt < nextPresence) return nextPresence
+        val next = startedAt + heartbeatIntervalMs * NANOS_PER_MILLI
+        sendRequest(RolePolicy.METHOD_HOOK_PRESENCE, session = null, payload = "")
+        return next
+    }
+
     /** 对每个仍存活的本次进程代次会话发送到期心跳；到期时间以发送开始时刻为准。 */
-    private fun sendDueHeartbeats(nextHeartbeat: HashMap<String, Long>) {
-        val startedAt = clock()
+    private fun sendDueHeartbeats(startedAt: Long, nextHeartbeat: HashMap<String, Long>) {
         val sessions = try {
             liveSessions()
         } catch (failure: Throwable) {
@@ -207,7 +230,7 @@ class HookTransport(
     }
 
     private fun sendSnapshot(outbound: Outbound.Snapshot) {
-        val response = request(
+        val response = sendRequest(
             method = RolePolicy.METHOD_HOOK_SNAPSHOT,
             session = outbound.snapshot.id,
             payload = HookWireFormat.encodeSnapshot(outbound.snapshot, outbound.source, outbound.handbackReason),
@@ -216,7 +239,7 @@ class HookTransport(
     }
 
     private fun sendCommandResult(attempt: CommandAttempt) {
-        val response = request(
+        val response = sendRequest(
             method = RolePolicy.METHOD_CALL_COMMAND_RESULT,
             session = attempt.session,
             payload = HookWireFormat.encodeCommandResult(
@@ -232,14 +255,23 @@ class HookTransport(
     }
 
     private fun sendHeartbeat(session: SessionId) {
-        val response = request(method = RolePolicy.METHOD_HOOK_HEARTBEAT, session = session, payload = "")
+        val response = sendRequest(method = RolePolicy.METHOD_HOOK_HEARTBEAT, session = session, payload = "")
         acceptCommands(response)
     }
 
-    private fun request(method: String, session: SessionId, payload: String): RpcResponse? {
+    /**
+     * 发一条请求并等待本次请求的响应（Task 11Q 起公开给传输循环与 JVM 测试）。
+     *
+     * 安全语义与旧 `request` 完全一致：先连接、再核验服务端 uid 为 0、最后才写；
+     * abstract 名字可以被任意应用抢先绑定，所以校验顺序不能调换。
+     *
+     * @param session 会话身份；`hook.presence` 传 null（无会话）。
+     * @return 对应本请求的响应；任何失败返回 null 并计入相应计数器。
+     */
+    fun sendRequest(method: String, session: SessionId?, payload: String): RpcResponse? {
         if (!HookWireFormat.isAllowedOutboundMethod(method)) {
             // 固定出站方法表：配置/密钥/音频/会话方法在客户端就被拒绝，永不发出。
-            protocolViolations.incrementAndGet()
+            recordFailure(CODE_PROTOCOL_VIOLATION, protocolViolations)
             return null
         }
         val request = RpcRequest(
@@ -248,26 +280,31 @@ class HookTransport(
             sessionId = session,
             payload = payload,
         )
-        val socket = LocalSocket()
+        val link = try {
+            socketFactory()
+        } catch (failure: Throwable) {
+            recordFailure(CODE_CONNECT_FAILED, transportFailures)
+            return null
+        }
         return try {
-            socket.connect(LocalSocketAddress(socketName, LocalSocketAddress.Namespace.ABSTRACT))
+            link.connect()
             // 先核验服务端，再发送任何快照/命令：abstract 名字可以被任意应用抢先绑定。
-            if (!HookServerTrust.isTrustedUid(peerUidOf(socket))) {
-                untrustedServers.incrementAndGet()
+            if (!HookServerTrust.isTrustedUid(link.peerUid)) {
+                recordFailure(CODE_SERVER_UNTRUSTED, untrustedServers)
                 return null
             }
-            socket.soTimeout = requestTimeoutMs
-            socket.outputStream.write(RpcCodec.encodeRequestFrame(request))
-            socket.outputStream.flush()
-            when (val result = RpcCodec.readResponseFrame(socket.inputStream)) {
+            link.soTimeoutMs = requestTimeoutMs
+            link.output.write(RpcCodec.encodeRequestFrame(request))
+            link.output.flush()
+            when (val result = RpcCodec.readResponseFrame(link.input)) {
                 is RpcCodec.ResponseResult.Rejected -> {
-                    protocolViolations.incrementAndGet()
+                    recordFailure(CODE_PROTOCOL_VIOLATION, protocolViolations)
                     null
                 }
                 is RpcCodec.ResponseResult.Accepted -> {
                     if (result.response.id != request.id) {
                         // 响应必须对应本请求；错配的负载绝不解析。
-                        protocolViolations.incrementAndGet()
+                        recordFailure(CODE_PROTOCOL_VIOLATION, protocolViolations)
                         null
                     } else {
                         result.response
@@ -275,31 +312,49 @@ class HookTransport(
                 }
             }
         } catch (io: IOException) {
-            transportFailures.incrementAndGet()
+            recordFailure(CODE_CONNECT_FAILED, transportFailures)
             null
         } catch (protocol: RpcProtocolException) {
-            protocolViolations.incrementAndGet()
+            recordFailure(CODE_PROTOCOL_VIOLATION, protocolViolations)
             null
         } catch (failure: Exception) {
             // 传输线程不能因单个异常退出；未知异常按传输失败计数。
-            transportFailures.incrementAndGet()
+            recordFailure(CODE_CONNECT_FAILED, transportFailures)
             null
         } finally {
-            runCatching { socket.close() }
+            runCatching { link.close() }
         }
     }
 
-    private fun peerUidOf(socket: LocalSocket): Int? = try {
-        socket.peerCredentials?.uid
-    } catch (failure: Throwable) {
-        // 凭据不可读等价于不可信；不发送任何请求。
-        null
+    /**
+     * 失败诊断：先计数，再按 [FAILURE_LOG_INTERVAL_MS] 限流输出**固定机器码**日志。
+     *
+     * 日志只含机器码与本类计数器，不含负载、会话 id 或异常消息；限流只抑制日志，
+     * 计数器始终递增，设备上 `failures=<n>` 仍能反映真实失败总量。
+     */
+    private fun recordFailure(code: String, counter: AtomicLong, amount: Long = 1L) {
+        val failures = counter.addAndGet(amount)
+        val now = clock()
+        val shouldLog = synchronized(failureLogLock) {
+            val last = failureLogStamps[code]
+            if (last == null || now - last >= FAILURE_LOG_INTERVAL_MS * NANOS_PER_MILLI) {
+                failureLogStamps[code] = now
+                true
+            } else {
+                false
+            }
+        }
+        if (shouldLog) {
+            logger("hook_transport " + code + " failures=" + failures)
+        }
     }
 
     private fun acceptCommands(response: RpcResponse?) {
         if (response == null || response.error != null) return
         val parsed = HookWireFormat.parseCommands(response.payload)
-        if (parsed.invalidLines > 0) protocolViolations.addAndGet(parsed.invalidLines.toLong())
+        if (parsed.invalidLines > 0) {
+            recordFailure(CODE_PROTOCOL_VIOLATION, protocolViolations, parsed.invalidLines.toLong())
+        }
         for (command in parsed.commands) {
             val session = SessionId(processEpoch, command.callId)
             val live = try {
@@ -336,8 +391,20 @@ class HookTransport(
         const val REQUEST_TIMEOUT_MS: Int = 2_000
         const val QUEUE_CAPACITY: Int = 16
 
+        /**
+         * 同一机器码两条诊断日志之间的最小间隔（Task 11Q）。
+         *
+         * 失联时传输每 2 s 重试一次，若每次都写 logcat，诊断本身会淹没其它日志；
+         * 限流只抑制日志，计数器继续累加。设备上应看到约 5 s 一条。
+         */
+        const val FAILURE_LOG_INTERVAL_MS: Long = 5_000L
+
         private const val POLL_INTERVAL_MS: Long = 200L
         private const val NANOS_PER_MILLI: Long = 1_000_000L
+
+        private const val CODE_CONNECT_FAILED: String = "connect_failed"
+        private const val CODE_SERVER_UNTRUSTED: String = "server_untrusted"
+        private const val CODE_PROTOCOL_VIOLATION: String = "protocol_violation"
     }
 }
 
@@ -379,6 +446,8 @@ internal object HookWireFormat {
     private val ALLOWED_OUTBOUND_METHODS: Set<String> = setOf(
         RolePolicy.METHOD_HOOK_SNAPSHOT,
         RolePolicy.METHOD_HOOK_HEARTBEAT,
+        // Task 11Q：无会话的空闲存在性；仍然不含任何 config.* / 会话方法。
+        RolePolicy.METHOD_HOOK_PRESENCE,
         RolePolicy.METHOD_CALL_COMMAND_RESULT,
     )
 
