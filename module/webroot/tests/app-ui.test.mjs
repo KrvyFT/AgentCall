@@ -215,6 +215,89 @@ test("页面渲染真实状态与诊断数据（textContent，不用 innerHTML�
   );
 });
 
+test("对象形式 ksu.io（support: true）：页面进入 kernelsu、保存可用且真实发起 config-set（Task 11M）", async () => {
+  const holder = {};
+  const fake = fakeManager({
+    ioForm: "object",
+    ioSupport: true,
+    ioVersionStyle: "number",
+    ioVersion: 1,
+    handlers: defaultHandlers(holder),
+  });
+  holder.current = fake;
+  const { doc, app } = await boot({ fake });
+
+  assert.equal(app.bridge.mode, "kernelsu", "上游对象形式 io 不得再被判定为只读");
+  for (const id of ["ov-save-switch", "rules-save", "ai-save", "dlg-save"]) {
+    assert.equal(doc.getElementById(id).disabled, false, id + " 在对象形式 io 下必须可用");
+  }
+
+  const diag = doc.getElementById("diag-io-source").textContent;
+  assert.match(diag, /形式 object/);
+  assert.match(diag, /support true/);
+  assert.match(diag, /version 1/);
+  assert.match(diag, /File 有/);
+  assert.match(diag, /FileOutputStream 有/);
+
+  doc.getElementById("ov-enabled").checked = true;
+  doc.getElementById("ov-save-switch").click();
+  await tick(20);
+  assert.equal(
+    fake.commands.filter((command) => command.indexOf(" config-set ") !== -1).length,
+    1,
+    "对象形式 io 下保存必须真正执行一次 config-set",
+  );
+});
+
+test("对象形式 ksu.io support: false：仍为只读，保存禁用，诊断显示 support false（Task 11M）", async () => {
+  const holder = {};
+  const fake = fakeManager({
+    ioForm: "object",
+    ioSupport: false,
+    ioVersionStyle: "number",
+    ioVersion: 1,
+    handlers: defaultHandlers(holder),
+  });
+  holder.current = fake;
+  const { doc, app } = await boot({ fake });
+
+  assert.equal(app.bridge.mode, "readonly");
+  assert.equal(app.bridge.support.reason, "io_missing");
+  for (const id of ["ov-save-switch", "rules-save", "ai-save", "dlg-save"]) {
+    assert.equal(doc.getElementById(id).disabled, true, id + " 在 support: false 下必须禁用");
+  }
+  assert.match(doc.getElementById("diag-io-source").textContent, /support false/);
+});
+
+test("io 存在但缺少 FileOutputStream：readonly io_missing，诊断指出缺类（Task 11M）", async () => {
+  const holder = {};
+  const fake = fakeManager({
+    ioForm: "object",
+    ioSupport: true,
+    ioVersionStyle: "number",
+    ioVersion: 1,
+    fileOutputStream: false,
+    handlers: defaultHandlers(holder),
+  });
+  holder.current = fake;
+  const { doc, app } = await boot({ fake });
+
+  assert.equal(app.bridge.mode, "readonly");
+  assert.equal(app.bridge.support.reason, "io_missing");
+  assert.equal(doc.getElementById("ov-save-switch").disabled, true);
+  const diag = doc.getElementById("diag-io-source").textContent;
+  assert.match(diag, /File 有/);
+  assert.match(diag, /FileOutputStream 无/);
+});
+
+test("演示态诊断也如实显示 io 形式 none/support null/version 0（Task 11M）", async () => {
+  const { doc } = await boot({});
+  const diag = doc.getElementById("diag-io-source").textContent;
+  assert.match(diag, /形式 none/);
+  assert.match(diag, /support null/);
+  assert.match(diag, /version 0/);
+});
+
 test("页面保存只提交本页字段：规则页保存不得夹带 AI 密钥", async () => {
   const holder = {};
   const fake = fakeManager({ handlers: defaultHandlers(holder) });

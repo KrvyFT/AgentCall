@@ -136,6 +136,15 @@ export function fakeManager(options) {
 
   if (opts.randomAccess === false) delete io.RandomAccessFile;
   if (opts.fileInputStream === false) delete io.FileInputStream;
+  // Task 11M：上游 KernelSU 的 ksu.io 是对象（不是函数），support 是布尔、version 是数字。
+  // 这里用 ioForm / ioSupport / ioVersionStyle 覆盖对象形式、缺失版本与缺类等变体。
+  if (opts.fileOutputStream === false) delete io.FileOutputStream;
+  if (opts.ioSupport !== undefined) io.support = opts.ioSupport;
+  const versionStyle = opts.ioVersionStyle || "function";
+  if (versionStyle === "missing") delete io.version;
+  else if (versionStyle === "number") io.version = ioVersion;
+  else if (versionStyle === "string") io.version = String(ioVersion);
+  else io.version = () => ioVersion;
 
   const ksu = {
     exec(command, optionsJson, callbackName) {
@@ -162,7 +171,11 @@ export function fakeManager(options) {
       ksu.moduleInfo = () => JSON.stringify({ id: "agentcall", moduleDir: opts.moduleDir || MODULE_DIR });
     }
   }
-  if (opts.io !== false) ksu.io = () => io;
+  if (opts.io !== false) {
+    // 默认保持旧的函数形式；ioForm: "object" 模拟当前上游声明 `declare const io: KsuIO`。
+    if (opts.ioForm === "object") ksu.io = io;
+    else ksu.io = () => io;
+  }
 
   return { ksu, commands, files, writes, dirs, perms, io };
 }

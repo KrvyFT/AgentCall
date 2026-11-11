@@ -436,6 +436,29 @@
     }
   }
 
+  /** 管理器 io 探测结果（诊断页小字）：对象/函数形式、support、version 与必需类是否齐全。 */
+  function supportDiagnosticText() {
+    var support = bridge.support || {};
+    var ioSupport = support.ioSupport === true ? "true" : support.ioSupport === false ? "false" : "null";
+    var version = typeof support.ioVersion === "number" ? support.ioVersion : 0;
+    return (
+      "管理器 io：形式 " +
+      (support.ioForm || "none") +
+      " · support " +
+      ioSupport +
+      " · version " +
+      version +
+      " · File " +
+      (support.hasFile ? "有" : "无") +
+      " · FileOutputStream " +
+      (support.hasFileOutputStream ? "有" : "无")
+    );
+  }
+
+  function renderSupportDiagnostics() {
+    setText($("diag-io-source"), supportDiagnosticText());
+  }
+
   /**
    * 保存按钮可用性：唯一入口。真实桥 + 已加载基线（已知 revision）+ 非保存中才启用；
    * demo/readonly/加载失败/未知 revision 一律禁用（fail closed）。
@@ -958,6 +981,7 @@
     lines.push("AgentCall 诊断（脱敏）");
     lines.push("生成时间：" + formatTime(Date.now()));
     lines.push("桥接模式：" + bridge.mode + "（" + bridge.support.reason + "）");
+    lines.push(supportDiagnosticText());
     if (state.status) {
       lines.push("桥接版本：" + (state.status.bridgeVersion || "—"));
       lines.push("协议版本：" + state.status.protocolVersion);
@@ -1218,6 +1242,7 @@
 
   function init() {
     setModeBadge();
+    renderSupportDiagnostics();
     wireTabs();
     wireInputs();
     wireSecretButtons();

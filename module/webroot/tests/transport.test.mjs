@@ -322,11 +322,13 @@ test("moduleInfo 抛错或返回非法 JSON 时也回退固定模块路径", asy
   }
 });
 
-test("io 版本为 0：视为没有受控文件接口（readonly io_missing），保存被拒绝", async () => {
-  const fake = fakeManager({ ioVersion: 0, handlers: statusHandler });
+test("io.support === false：视为没有受控文件接口（readonly io_missing），保存被拒绝", async () => {
+  const fake = fakeManager({ ioForm: "object", ioSupport: false, ioVersionStyle: "number", ioVersion: 0, handlers: statusHandler });
   const bridge = bridgeWith(fake);
   assert.equal(bridge.mode, "readonly");
   assert.equal(bridge.support.reason, "io_missing");
+  assert.equal(bridge.support.ioForm, "object");
+  assert.equal(bridge.support.ioSupport, false);
   assert.equal(bridge.support.ioVersion, 0);
   assert.equal(bridge.support.hasIo, false);
 
@@ -334,6 +336,93 @@ test("io 版本为 0：视为没有受控文件接口（readonly io_missing）�
   assert.equal(save.ok, false);
   assert.equal(save.code, "secret_transport_unsupported");
   assert.equal(fake.commands.some((command) => command.indexOf(" config-set ") !== -1), false);
+});
+
+test("对象形式 ksu.io（support: true、version: 1）识别为 kernelsu，保存可用", async () => {
+  const fake = fakeManager({
+    ioForm: "object",
+    ioSupport: true,
+    ioVersionStyle: "number",
+    ioVersion: 1,
+    handlers: {
+      ...statusHandler,
+      "config-set": () => ({ errno: 0, stdout: redacted({ enabled: true, revision: 1 }), stderr: "" }),
+    },
+  });
+  const bridge = bridgeWith(fake);
+  assert.equal(bridge.mode, "kernelsu");
+  assert.equal(bridge.support.reason, "ok");
+  assert.equal(bridge.support.ioForm, "object");
+  assert.equal(bridge.support.ioSupport, true);
+  assert.equal(bridge.support.ioVersion, 1);
+  assert.equal(bridge.support.hasFile, true);
+  assert.equal(bridge.support.hasFileOutputStream, true);
+
+  const save = await bridge.call("config-set", { expectedRevision: 0, patch: { enabled: true } });
+  assert.equal(save.ok, true);
+  assert.equal(fake.commands.filter((command) => command.indexOf(" config-set ") !== -1).length, 1);
+});
+
+test("对象形式 io 的 version 缺失：不抛错，support: true 仍为 kernelsu（诊断版本为 0）", async () => {
+  const fake = fakeManager({ ioForm: "object", ioSupport: true, ioVersionStyle: "missing", handlers: statusHandler });
+  const bridge = bridgeWith(fake);
+  assert.equal(bridge.mode, "kernelsu");
+  assert.equal(bridge.support.ioForm, "object");
+  assert.equal(bridge.support.ioSupport, true);
+  assert.equal(bridge.support.ioVersion, 0);
+});
+
+test("对象形式 io 的 version 为数字/数字字符串均可解析，且不当作方法调用", async () => {
+  const numeric = bridgeWith(fakeManager({ ioForm: "object", ioSupport: true, ioVersionStyle: "number", ioVersion: 2, handlers: statusHandler }));
+  assert.equal(numeric.mode, "kernelsu");
+  assert.equal(numeric.support.ioVersion, 2);
+
+  const stringVersion = bridgeWith(fakeManager({ ioForm: "object", ioSupport: true, ioVersionStyle: "string", ioVersion: "3", handlers: statusHandler }));
+  assert.equal(stringVersion.mode, "kernelsu");
+  assert.equal(stringVersion.support.ioVersion, 3);
+});
+
+test("旧式函数形式 ksu.io() 仍可用：version() 返回数字时识别为 kernelsu", async () => {
+  const fake = fakeManager({ handlers: statusHandler });
+  const bridge = bridgeWith(fake);
+  assert.equal(bridge.mode, "kernelsu");
+  assert.equal(bridge.support.ioForm, "function");
+  assert.equal(bridge.support.ioSupport, null);
+  assert.equal(bridge.support.ioVersion, 1);
+  assert.equal(bridge.support.hasFile, true);
+  assert.equal(bridge.support.hasFileOutputStream, true);
+});
+
+test("io 存在但缺少 FileOutputStream：readonly io_missing，保存被拒绝（诊断指出缺类）", async () => {
+  const fake = fakeManager({ ioForm: "object", ioSupport: true, ioVersionStyle: "number", ioVersion: 1, fileOutputStream: false, handlers: statusHandler });
+  const bridge = bridgeWith(fake);
+  assert.equal(bridge.mode, "readonly");
+  assert.equal(bridge.support.reason, "io_missing");
+  assert.equal(bridge.support.hasFile, true);
+  assert.equal(bridge.support.hasFileOutputStream, false);
+
+  const save = await bridge.call("config-set", { expectedRevision: 0, patch: { enabled: true } });
+  assert.equal(save.ok, false);
+  assert.equal(save.code, "secret_transport_unsupported");
+  assert.equal(fake.commands.some((command) => command.indexOf(" config-set ") !== -1), false);
+});
+
+test("对象形式 io 可用但模块目录不可信：仍以 module_dir_unresolved 为准（不放宽）", async () => {
+  const fake = fakeManager({ ioForm: "object", ioSupport: true, ioVersionStyle: "number", ioVersion: 1, moduleDir: "/tmp/attacker" });
+  const bridge = bridgeWith(fake);
+  assert.equal(bridge.mode, "readonly");
+  assert.equal(bridge.support.reason, "module_dir_unresolved");
+  assert.equal(bridge.support.hasIo, true);
+  assert.deepEqual(fake.commands, []);
+});
+
+test("对象形式 ksu.io 同样可读取日志：不再把 io 当函数调用（Task 11M）", async () => {
+  const fake = fakeManager({ ioForm: "object", ioSupport: true, ioVersionStyle: "number", ioVersion: 1, logText: "object-form-log\n" });
+  const bridge = bridgeWith(fake);
+  const result = await bridge.readLog(4096);
+  assert.equal(result.ok, true);
+  assert.equal(result.text, "object-form-log\n");
+  assert.equal(fake.commands.length, 0);
 });
 
 test("readLog 通过 RandomAccessFile 读取尾部并标记 truncated，且做脱敏", async () => {

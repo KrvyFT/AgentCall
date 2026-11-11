@@ -312,37 +312,121 @@
     return null;
   }
 
+  /**
+   * 解析管理器注入的 io 句柄（Task 11M）。
+   *
+   * 上游 KernelSU 的 JS API 声明是 `declare const io: KsuIO`：io 是对象，support 是布尔，
+   * version 是数字。只有少数旧管理器/分支把 io 暴露成函数。两种形式都必须接受，
+   * 且解析失败只按“缺失”处理，不能抛出。
+   */
+  function resolveIoHandle(ksu) {
+    var raw = ksu ? ksu.io : undefined;
+    if (raw === undefined || raw === null) return { form: "none", io: null };
+    var form = "object";
+    var io = raw;
+    if (typeof raw === "function") {
+      form = "function";
+      try {
+        io = raw();
+      } catch (error) {
+        io = null;
+      }
+    }
+    if (!io || typeof io !== "object") return { form: form, io: null };
+    return { form: form, io: io };
+  }
+
+  function resolveIoSupport(io) {
+    if (!io) return null;
+    var value = io.support;
+    if (typeof value === "boolean") return value;
+    if (typeof value === "function") {
+      try {
+        var returned = value.call(io);
+        return typeof returned === "boolean" ? returned : null;
+      } catch (error) {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  /** 版本只用于诊断：数字、数字字符串、返回数字的函数都接受；缺失/异常一律 0。 */
+  function resolveIoVersion(io) {
+    if (!io) return 0;
+    try {
+      var value = io.version;
+      if (typeof value === "function") value = value.call(io);
+      if (typeof value === "number" && isFinite(value)) return value;
+      if (typeof value === "string" && trimText(value) !== "") {
+        var parsed = Number(value);
+        if (isFinite(parsed)) return parsed;
+      }
+    } catch (error) {
+      /* 仅诊断用途：版本不可读时退回 0，不影响能力判定。 */
+    }
+    return 0;
+  }
+
+  function inspectIo(ksu) {
+    var handle = resolveIoHandle(ksu);
+    var io = handle.io;
+    var hasFile = !!(io && typeof io.File === "function");
+    var hasFileOutputStream = !!(io && typeof io.FileOutputStream === "function");
+    var ioSupport = resolveIoSupport(io);
+    // 上游语义：support === false 明确不支持；support === true（含 version 为 0/缺失）
+    // 或旧版/分支没有 support 字段时，只要两个必需类存在即支持。
+    var supported = !!(io && hasFile && hasFileOutputStream && ioSupport !== false);
+    return {
+      ioForm: handle.form,
+      ioSupport: ioSupport,
+      ioVersion: resolveIoVersion(io),
+      hasFile: hasFile,
+      hasFileOutputStream: hasFileOutputStream,
+      supported: supported,
+    };
+  }
+
   function detectSupport(scope) {
     var source = scope || root || {};
     var ksu = source.ksu;
     if (!ksu || typeof ksu !== "object") {
-      return { mode: "demo", hasBridge: false, hasExec: false, hasIo: false, ioVersion: 0, moduleDir: null, reason: "no_manager_bridge" };
+      return { mode: "demo", hasBridge: false, hasExec: false, hasIo: false, ioVersion: 0, moduleDir: null, reason: "no_manager_bridge", ioForm: "none", ioSupport: null, hasFile: false, hasFileOutputStream: false };
     }
     if (typeof ksu.exec !== "function") {
-      return { mode: "demo", hasBridge: false, hasExec: false, hasIo: false, ioVersion: 0, moduleDir: null, reason: "exec_missing" };
+      return { mode: "demo", hasBridge: false, hasExec: false, hasIo: false, ioVersion: 0, moduleDir: null, reason: "exec_missing", ioForm: "none", ioSupport: null, hasFile: false, hasFileOutputStream: false };
     }
     var moduleDir = readModuleDir(ksu);
-    var ioVersion = 0;
-    var hasIo = false;
-    if (typeof ksu.io === "function") {
-      try {
-        var io = ksu.io();
-        if (io && typeof io.FileOutputStream === "function" && typeof io.File === "function") {
-          ioVersion = typeof io.version === "function" ? Number(io.version()) || 0 : 0;
-          hasIo = ioVersion >= 1;
-        }
-      } catch (error) {
-        hasIo = false;
-        ioVersion = 0;
-      }
-    }
+    var inspected = inspectIo(ksu);
+    var hasIo = inspected.supported;
+    var support = {
+      mode: "kernelsu",
+      hasBridge: true,
+      hasExec: true,
+      hasIo: true,
+      ioVersion: inspected.ioVersion,
+      moduleDir: moduleDir,
+      reason: "ok",
+      ioForm: inspected.ioForm,
+      ioSupport: inspected.ioSupport,
+      hasFile: inspected.hasFile,
+      hasFileOutputStream: inspected.hasFileOutputStream,
+    };
+    // 模块目录不可信优先于 io：它决定命令路径是否可执行，绝不放宽。
     if (moduleDir === null) {
-      return { mode: "readonly", hasBridge: true, hasExec: true, hasIo: hasIo, ioVersion: ioVersion, moduleDir: null, reason: "module_dir_unresolved" };
+      support.mode = "readonly";
+      support.hasIo = hasIo;
+      support.moduleDir = null;
+      support.reason = "module_dir_unresolved";
+      return support;
     }
     if (!hasIo) {
-      return { mode: "readonly", hasBridge: true, hasExec: true, hasIo: false, ioVersion: 0, moduleDir: moduleDir, reason: "io_missing" };
+      support.mode = "readonly";
+      support.hasIo = false;
+      support.reason = "io_missing";
+      return support;
     }
-    return { mode: "kernelsu", hasBridge: true, hasExec: true, hasIo: true, ioVersion: ioVersion, moduleDir: moduleDir, reason: "ok" };
+    return support;
   }
 
   // ---------------------------------------------------------------- 固定命令执行
@@ -473,12 +557,8 @@
     }
 
     function writeInbox(text, inboxPath) {
-      var io;
-      try {
-        io = ksu.io();
-      } catch (error) {
-        return { ok: false, reason: "io" };
-      }
+      var io = resolveIoHandle(ksu).io;
+      if (!io) return { ok: false, reason: "io" };
       try {
         var directory = io.File(INBOX_DIR);
         if (!directory.exists() && !directory.mkdirs() && !directory.exists()) {
@@ -524,7 +604,9 @@
 
     function deleteInbox(inboxPath) {
       try {
-        var file = ksu.io().File(inboxPath);
+        var io = resolveIoHandle(ksu).io;
+        if (!io) return;
+        var file = io.File(inboxPath);
         if (file.exists()) file.delete();
       } catch (error) {
         /* 删除失败不改变保存结论 */
@@ -618,7 +700,9 @@
         return Promise.resolve({ ok: false, code: CODE.IO_UNAVAILABLE, message: errorText(CODE.IO_UNAVAILABLE) });
       }
       try {
-        var io = ksu.io();
+        // 与 detectSupport 相同：上游 io 是对象，旧管理器才暴露成函数。
+        var io = resolveIoHandle(ksu).io;
+        if (!io) return Promise.resolve({ ok: false, code: CODE.IO_UNAVAILABLE, message: errorText(CODE.IO_UNAVAILABLE) });
         var file = io.File(LOG_PATH);
         if (!file.exists() || !file.isFile()) return Promise.resolve({ ok: true, text: "", truncated: false });
         var limit = typeof maxBytes === "number" && maxBytes > 0 ? Math.min(maxBytes, LOG_TAIL_BYTES) : LOG_TAIL_BYTES;
