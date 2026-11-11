@@ -11,6 +11,8 @@ const require = createRequire(import.meta.url);
 const B = require("../bridge.js");
 
 const SECRET = "sk-live-DO-NOT-LEAK-9f8e7d6c";
+const ENV_PROBE_COMMAND = 'printf \'%s\' "$AGENTCALL_PROBE"';
+const ENV_CONFIG_COMMAND = 'printf \'%s\' "$AGENTCALL_CFG_PAYLOAD" | ' + CTL + " config-set";
 
 function redacted(overrides, secrets) {
   return JSON.stringify({
@@ -249,27 +251,30 @@ test("对象形式 ksu.io（support: true）：页面进入 kernelsu、保存可
   );
 });
 
-test("对象形式 ksu.io support: false：仍为只读，保存禁用，诊断显示 support false（Task 11M）", async () => {
+test("对象形式 ksu.io support: false 且 env 不可用：只读 env_unavailable，保存禁用，诊断显示 support false 与通道 none", async () => {
   const holder = {};
   const fake = fakeManager({
     ioForm: "object",
     ioSupport: false,
     ioVersionStyle: "number",
     ioVersion: 1,
+    envSupport: false,
     handlers: defaultHandlers(holder),
   });
   holder.current = fake;
   const { doc, app } = await boot({ fake });
 
   assert.equal(app.bridge.mode, "readonly");
-  assert.equal(app.bridge.support.reason, "io_missing");
+  assert.equal(app.bridge.support.reason, "env_unavailable");
+  assert.equal(app.bridge.support.ioMode, "none");
   for (const id of ["ov-save-switch", "rules-save", "ai-save", "dlg-save"]) {
-    assert.equal(doc.getElementById(id).disabled, true, id + " 在 support: false 下必须禁用");
+    assert.equal(doc.getElementById(id).disabled, true, id + " 在两种通道都不可用下必须禁用");
   }
   assert.match(doc.getElementById("diag-io-source").textContent, /support false/);
+  assert.match(doc.getElementById("diag-io-source").textContent, /保存通道 none/);
 });
 
-test("io 存在但缺少 FileOutputStream：readonly io_missing，诊断指出缺类（Task 11M）", async () => {
+test("io 存在但缺少 FileOutputStream 且 env 不可用：只读 env_unavailable，诊断指出缺类", async () => {
   const holder = {};
   const fake = fakeManager({
     ioForm: "object",
@@ -277,13 +282,14 @@ test("io 存在但缺少 FileOutputStream：readonly io_missing，诊断指出�
     ioVersionStyle: "number",
     ioVersion: 1,
     fileOutputStream: false,
+    envSupport: false,
     handlers: defaultHandlers(holder),
   });
   holder.current = fake;
   const { doc, app } = await boot({ fake });
 
   assert.equal(app.bridge.mode, "readonly");
-  assert.equal(app.bridge.support.reason, "io_missing");
+  assert.equal(app.bridge.support.reason, "env_unavailable");
   assert.equal(doc.getElementById("ov-save-switch").disabled, true);
   const diag = doc.getElementById("diag-io-source").textContent;
   assert.match(diag, /File 有/);
@@ -606,4 +612,127 @@ test("索引页包含重试服务入口，并明确它执行固定 agentcallctl 
   const html = readFileSync(join(webroot, "index.html"), "utf8");
   assert.match(html, /id="diag-retry-service"[^>]*disabled/, "重试服务初始必须禁用，真实桥接后再启用");
   assert.match(html, /agentcallctl restart/, "页面必须说明固定命令契约");
+});
+
+// ---------------------------------------------------------------- exec + env 回退
+
+test("exec-only 管理器（env 可用）：启动探测后进入 kernelsu/env，保存走固定命令 + env", async () => {
+  const holder = {};
+  const fake = fakeManager({ io: false, handlers: defaultHandlers(holder) });
+  holder.current = fake;
+  const { doc, app } = await boot({ fake });
+
+  assert.equal(app.bridge.mode, "kernelsu");
+  assert.equal(app.bridge.support.ioMode, "env");
+  assert.equal(app.bridge.support.envProbe, "supported");
+  assert.equal(app.state.canSave, true);
+  for (const id of ["ov-save-switch", "rules-save", "ai-save", "dlg-save"]) {
+    assert.equal(doc.getElementById(id).disabled, false, id + " 在 env 回退下必须可用");
+  }
+
+  const note = doc.getElementById("mode-note").textContent;
+  assert.match(note, /exec\s*\+\s*env|环境变量/);
+  assert.match(note, /密钥/);
+  const banner = doc.getElementById("banner-text").textContent;
+  assert.match(banner, /环境变量|exec\s*\+\s*env/);
+  assert.match(banner, /argv|URL|日志/);
+  assert.match(banner, /升级管理器|更新管理器/);
+  assert.match(doc.getElementById("diag-io-source").textContent, /保存通道 env/);
+  assert.match(doc.getElementById("diag-io-source").textContent, /env 探测 supported/);
+
+  doc.getElementById("ov-enabled").checked = true;
+  doc.getElementById("ov-save-switch").click();
+  await tick(30);
+
+  assert.equal(fake.commands.filter((command) => command === ENV_PROBE_COMMAND).length, 1, "探测一次");
+  assert.equal(fake.commands.filter((command) => command === ENV_CONFIG_COMMAND).length, 1);
+  assert.equal(JSON.parse(fake.envPayloads[0]).patch.enabled, true);
+  assert.match(doc.getElementById("toast").textContent, /已开启自动接管/);
+  assert.match(doc.getElementById("toast").textContent, /exec\+env/, "成功提示必须标明实际通道");
+  const secretBase64 = B.toBase64Utf8(SECRET);
+  for (const command of fake.commands) {
+    assert.equal(command.includes(SECRET), false);
+    assert.equal(command.includes(secretBase64), false);
+  }
+});
+
+test("exec-only 管理器（env 被忽略）：启动探测后只读 env_unavailable，横幅给出升级管理器或 CLI stdin", async () => {
+  const fake = fakeManager({ io: false, envSupport: false });
+  const { doc, app } = await boot({ fake });
+
+  assert.equal(app.bridge.mode, "readonly");
+  assert.equal(app.bridge.support.reason, "env_unavailable");
+  assert.equal(app.bridge.support.ioMode, "none");
+  assert.equal(app.state.canSave, false);
+  assert.equal(doc.getElementById("ov-save-switch").disabled, true, "两种通道都不可用时保存必须禁用");
+  assert.equal(fake.commands.filter((command) => command === ENV_PROBE_COMMAND).length, 1);
+  assert.equal(fake.commands.some((command) => /\sconfig-set$/.test(command)), false, "不得执行 config-set");
+
+  const note = doc.getElementById("mode-note").textContent;
+  assert.match(note, /agentcallctl config-set/);
+  assert.match(note, /stdin/);
+  const banner = doc.getElementById("banner-text").textContent;
+  assert.match(banner, /升级管理器|更新管理器/);
+  assert.match(banner, /agentcallctl config-set/);
+  assert.match(banner, /stdin/);
+  assert.match(banner, /只读|保存已禁用/);
+});
+
+test("env 回退保存密钥：密钥只出现在 env 负载，页面/DOM/localStorage/toast 不再回显", async () => {
+  const holder = {};
+  const fake = fakeManager({ io: false, handlers: defaultHandlers(holder) });
+  holder.current = fake;
+  const { doc, dom } = await boot({ fake });
+
+  doc.getElementById("ai-llm-url").value = "https://api.example.com/v1";
+  doc.getElementById("ai-llm-model").value = "example-model";
+  doc.getElementById("ai-llm-replace").click();
+  doc.getElementById("ai-llm-secret").value = SECRET;
+  doc.getElementById("ai-save").click();
+  await tick(40);
+
+  assert.equal(fake.envPayloads.length, 1);
+  assert.match(fake.envPayloads[0], new RegExp(SECRET));
+  const secretBase64 = B.toBase64Utf8(SECRET);
+  for (const command of fake.commands) {
+    assert.equal(command.includes(SECRET), false);
+    assert.equal(command.includes(secretBase64), false);
+  }
+  assert.equal(doc.getElementById("ai-llm-secret").value, "", "保存成功后密钥输入框必须清空");
+  assert.equal(doc.body.textContent.includes(SECRET), false, "密钥不得出现在 DOM 文本");
+  assert.equal(JSON.stringify([...dom.storage]).includes(SECRET), false, "密钥不得进入 localStorage");
+  assert.equal(doc.getElementById("toast").textContent.includes(SECRET), false);
+  assert.match(doc.getElementById("toast").textContent, /已保存/);
+});
+
+test("env 回退下并发保存仍串行化：保存进行中再次点击不会发出第二个 config-set", async () => {
+  const holder = {};
+  const fake = fakeManager({ io: false, handlers: defaultHandlers(holder) });
+  holder.current = fake;
+  const pending = [];
+  const baseExec = fake.ksu.exec.bind(fake.ksu);
+  fake.ksu.exec = (command, optionsJson, callbackName) => {
+    if (command === ENV_CONFIG_COMMAND) {
+      // 挂起 config-set 回调，模拟一次保存仍在进行中。
+      pending.push(() => baseExec(command, optionsJson, callbackName));
+      return undefined;
+    }
+    return baseExec(command, optionsJson, callbackName);
+  };
+
+  const { doc } = await boot({ fake });
+  doc.getElementById("ov-enabled").checked = true;
+  doc.getElementById("ov-save-switch").click();
+  await tick(5);
+  doc.getElementById("ov-save-switch").click();
+  await tick(5);
+
+  assert.equal(pending.length, 1, "第二次点击必须被串行化拒绝，不能并发写两次");
+  assert.match(doc.getElementById("toast").textContent, /上一项保存还在进行|请稍候/);
+
+  pending[0]();
+  await tick(30);
+  assert.equal(fake.envPayloads.length, 1);
+  assert.match(doc.getElementById("toast").textContent, /已开启自动接管/);
+  assert.match(doc.getElementById("toast").textContent, /exec\+env/);
 });

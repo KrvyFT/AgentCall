@@ -420,27 +420,88 @@
     var badge = $("mode-badge");
     var note = $("mode-note");
     if (bridge.mode === "kernelsu") {
-      setBadge(badge, "真实桥接", "ok");
-      setText(note, "已连接 KernelSU 管理器：配置经固定 CLI 与 stdin 文件通道提交，保存前需通过后端 CAS 校验。");
+      if (bridge.support.ioMode === "env") {
+        setBadge(badge, "真实桥接（兼容）", "ok");
+        setText(
+          note,
+          "已连接 KernelSU 管理器：管理器没有可用的 ksu.io，保存走 exec+env 回退（固定命令 + AGENTCALL_CFG_PAYLOAD 环境变量），JSON 只进入 CLI 的 stdin；密钥不进入 argv、URL 或日志。管理器升级后会自动回到受控文件通道，长期仍建议更新。",
+        );
+      } else {
+        setBadge(badge, "真实桥接", "ok");
+        setText(note, "已连接 KernelSU 管理器：配置经受控文件接口（ksu.io）写入 stdin，保存前需通过后端 CAS 校验。");
+      }
     } else if (bridge.mode === "readonly") {
       setBadge(badge, "只读", "warn");
-      setText(
-        note,
-        bridge.support.reason === "io_missing"
-          ? "当前管理器没有受控文件写入接口：可读取状态，但保存已禁用（密钥不会通过 base64 命令行参数提交）。"
-          : "moduleInfo() 给出的模块目录不可信：已禁用需要 CLI 的命令与保存；固定路径日志仍可读取。",
-      );
+      if (bridge.support.reason === "env_unavailable") {
+        setText(
+          note,
+          "当前管理器既不支持 ksu.io，也不支持 ksu.exec 的环境变量通道：可读取状态，但保存已禁用。请升级管理器（推荐），或在 root shell 用 agentcallctl config-set 从 stdin 提交；密钥不会经 base64/argv 提交。",
+        );
+      } else if (bridge.support.reason === "env_probe_pending") {
+        setText(note, "正在探测管理器的 ksu.exec 环境变量通道：探测完成前保存保持禁用。");
+      } else if (bridge.support.reason === "io_missing") {
+        setText(note, "当前管理器没有受控文件写入接口：可读取状态，但保存已禁用（密钥不会通过 base64 命令行参数提交）。");
+      } else {
+        setText(note, "moduleInfo() 给出的模块目录不可信：已禁用需要 CLI 的命令与保存；固定路径日志仍可读取。");
+      }
     } else {
       setBadge(badge, "演示（只读）", "warn");
       setText(note, "未检测到 KernelSU 管理器注入的真实桥接：本页显示演示数据，任何保存都会被拒绝。");
     }
   }
 
-  /** 管理器 io 探测结果（诊断页小字）：对象/函数形式、support、version 与必需类是否齐全。 */
+  var ENV_FALLBACK_BANNER =
+    "当前管理器没有可用的 ksu.io 受控文件接口（受控文件接口不可用），已启用 exec+env 回退：保存执行固定命令，JSON 只经 AGENTCALL_CFG_PAYLOAD 环境变量进入 CLI 的 stdin，密钥不进入 argv、URL 或日志。管理器升级后会自动回到受控文件通道；长期仍建议更新管理器。";
+
+  function readonlyBannerText(reason) {
+    if (reason === "env_unavailable") {
+      return (
+        "当前管理器既不提供 ksu.io 受控文件接口，也不支持 ksu.exec 的环境变量通道：配置可以读取，但保存已禁用（只读）。" +
+        "请升级管理器（推荐以获得受控文件通道），或在 root shell 执行 agentcallctl config-set 并从 stdin 提交负载；密钥不会经 argv/base64/URL 提交。"
+      );
+    }
+    if (reason === "env_probe_pending") {
+      return "正在探测 ksu.exec 的环境变量通道：探测完成前保存保持禁用（只读）。";
+    }
+    if (reason === "io_missing") {
+      return "当前管理器不提供 ksu.io 受控文件接口：保存已禁用（只读）。密钥不会以 base64 命令行参数的方式提交；请升级管理器，或在 root shell 用 agentcallctl config-set 从 stdin 提交。";
+    }
+    return "moduleInfo() 给出的模块目录不可信：已禁用需要 CLI 的命令与保存（固定路径日志仍可读取）。";
+  }
+
+  function showReadonlyBanner(reason) {
+    showBanner("warn", readonlyBannerText(reason), [{ label: "知道了", onClick: hideBanner }]);
+  }
+
+  /** 探测确认两种通道都不可用后，把界面切到既有只读态并禁用保存/编辑。 */
+  function adoptReadonlyState() {
+    state.canSave = false;
+    applySaveAvailability();
+    disableConfigEditing();
+    setModeBadge();
+    renderSupportDiagnostics();
+  }
+
+  /** 成功提示里标注实际使用的保存通道（不伪造成功；回读确认后才显示）。 */
+  function transportSuffix() {
+    return bridge.support.ioMode === "env" ? "（exec+env）" : "";
+  }
+
+  /**
+   * 管理器 io 探测结果（诊断页小字）：对象/函数形式、support、version 与必需类是否齐全，
+   * 以及本次页面会话选中的保存通道（ioMode/diag 与 env 探测结果）。
+   */
   function supportDiagnosticText() {
     var support = bridge.support || {};
     var ioSupport = support.ioSupport === true ? "true" : support.ioSupport === false ? "false" : "null";
     var version = typeof support.ioVersion === "number" ? support.ioVersion : 0;
+    var ioMode =
+      support.ioMode === "file"
+        ? "file（受控文件接口）"
+        : support.ioMode === "env"
+          ? "env（exec+env 回退）"
+          : "none（只读）";
+    var probe = support.envProbe || "skipped";
     return (
       "管理器 io：形式 " +
       (support.ioForm || "none") +
@@ -451,7 +512,11 @@
       " · File " +
       (support.hasFile ? "有" : "无") +
       " · FileOutputStream " +
-      (support.hasFileOutputStream ? "有" : "无")
+      (support.hasFileOutputStream ? "有" : "无") +
+      "；保存通道 " +
+      ioMode +
+      " · env 探测 " +
+      probe
     );
   }
 
@@ -483,7 +548,7 @@
   /**
    * “重试服务”可用性：必须真的有模块桥接（管理器注入 + 可信模块目录）。
    * 演示态没有管理器；module_dir_unresolved 时固定命令路径不可信，同一规则禁用。
-   * 只读（io_missing）仍有可执行 CLI，因此保留重试服务。
+   * 只读（env_unavailable/io_missing）仍有可执行 CLI，因此保留重试服务。
    */
   function retryServiceAvailable() {
     return bridge.mode !== "demo" && bridge.support.moduleDir !== null;
@@ -767,7 +832,7 @@
         renderWarnings(result.warnings);
         hideBanner();
         applySaveAvailability();
-        toast("已保存；后端回读确认 revision " + (result.data && result.data.config ? result.data.config.revision : "?"));
+        toast("已保存；后端回读确认 revision " + (result.data && result.data.config ? result.data.config.revision : "?") + transportSuffix());
         return result;
       }
       var failure = result || { ok: false, code: "unknown_error", issues: [] };
@@ -784,6 +849,9 @@
         ]);
       } else if (failure.repair || B.isRepairRequired(failure.code)) {
         showRepairBanner();
+      } else if (failure.code === "secret_transport_unsupported" && bridge.mode === "readonly") {
+        adoptReadonlyState();
+        showReadonlyBanner(bridge.support.reason);
       } else {
         showBanner("err", "保存失败（" + String(failure.code || "unknown") + "）：" + (failure.message || "") + (blockingCount > 0 ? "；共 " + blockingCount + " 项需要修正。" : ""), [
           { label: "关闭提示", onClick: hideBanner },
@@ -824,7 +892,7 @@
         }
         hideBanner();
         applySaveAvailability();
-        toast(result.form.enabled ? "已开启自动接管" : "已关闭自动接管");
+        toast((result.form.enabled ? "已开启自动接管" : "已关闭自动接管") + transportSuffix());
         // 其它页面的未保存编辑不受影响，因此不在这里清除 dirty 标记。
       } else {
         var failure = result || { ok: false, code: "unknown_error" };
@@ -837,6 +905,9 @@
           ]);
         } else if (failure.repair || B.isRepairRequired(failure.code)) {
           showRepairBanner();
+        } else if (failure.code === "secret_transport_unsupported" && bridge.mode === "readonly") {
+          adoptReadonlyState();
+          showReadonlyBanner(bridge.support.reason);
         } else {
           showBanner("err", "开关保存失败：" + (failure.message || B.errorText(failure.code)), [
             { label: "重新加载", primary: true, onClick: loadAll },
@@ -1240,54 +1311,72 @@
 
   // -------------------------------------------------------------- 启动
 
+  /**
+   * exec+env 能力每页会话探测一次（bridge 内部缓存）。探测完成前不宣称可保存：
+   * 成功才把 mode 提升为 kernelsu，失败则保持只读并给出 env_unavailable。
+   */
+  function probeTransportOnce() {
+    if (!bridge || typeof bridge.probeEnvTransport !== "function") {
+      return Promise.resolve(!!bridge && bridge.mode === "kernelsu");
+    }
+    return Promise.resolve(bridge.probeEnvTransport()).then(
+      function () {
+        return bridge.mode === "kernelsu";
+      },
+      function () {
+        return false;
+      },
+    );
+  }
+
   function init() {
-    setModeBadge();
-    renderSupportDiagnostics();
-    wireTabs();
-    wireInputs();
-    wireSecretButtons();
-    wireButtons();
-    renderRecentErrors();
-    ["ASR", "LLM", "TTS"].forEach(function (kind) {
-      updateSecretBadge(kind);
-    });
-    // 配置加载完成前保存按钮一律禁用（HTML 里也是 disabled）。
-    applySaveAvailability();
-    applyServiceAvailability();
-    renderLiveOverview();
-
-    if (bridge.mode === "demo") {
-      state.baseline = B.DEMO.config;
-      state.status = B.DEMO.status;
-      state.diagnose = B.DEMO.diagnose;
-      state.form = B.formFromRedacted(B.DEMO.config);
-      fillForm(state.form);
-      renderStatus(B.DEMO.status);
-      renderDiagnose(B.DEMO.diagnose);
+    return probeTransportOnce().then(function () {
+      state.demo = bridge.mode === "demo";
+      // env 探测成功后才允许保存；文件通道则一开始就是 kernelsu。
+      state.canSave = bridge.mode === "kernelsu";
+      setModeBadge();
+      renderSupportDiagnostics();
+      wireTabs();
+      wireInputs();
+      wireSecretButtons();
+      wireButtons();
+      renderRecentErrors();
+      ["ASR", "LLM", "TTS"].forEach(function (kind) {
+        updateSecretBadge(kind);
+      });
+      // 配置加载完成前保存按钮一律禁用（HTML 里也是 disabled）。
       applySaveAvailability();
-      disableConfigEditing();
-      mountDemoNote();
-      setText($("diag-log"), "演示状态：未连接真实桥接，无法读取模块日志。");
-      return Promise.resolve();
-    }
+      applyServiceAvailability();
+      renderLiveOverview();
 
-    if (bridge.mode === "readonly") {
-      applySaveAvailability();
-      disableConfigEditing();
-      if (bridge.support.reason === "io_missing") {
-        showBanner(
-          "warn",
-          "当前 KernelSU 管理器不提供 ksu.io 受控文件接口：配置可以读取，但保存已禁用。密钥不会以 base64 命令行参数的方式提交；请升级管理器或使用带安全 stdin/文件通道的版本。",
-          [{ label: "知道了", onClick: hideBanner }],
-        );
-      } else {
-        showBanner("err", "moduleInfo() 给出的模块目录不可信：已禁用需要 CLI 的命令与保存（固定路径日志仍可读取）。", [{ label: "知道了", onClick: hideBanner }]);
+      if (bridge.mode === "demo") {
+        state.baseline = B.DEMO.config;
+        state.status = B.DEMO.status;
+        state.diagnose = B.DEMO.diagnose;
+        state.form = B.formFromRedacted(B.DEMO.config);
+        fillForm(state.form);
+        renderStatus(B.DEMO.status);
+        renderDiagnose(B.DEMO.diagnose);
+        applySaveAvailability();
+        disableConfigEditing();
+        mountDemoNote();
+        setText($("diag-log"), "演示状态：未连接真实桥接，无法读取模块日志。");
+        return Promise.resolve();
       }
-    }
 
-    return loadAll().then(function () {
-      reloadLogIfDiagnose();
-      applySaveAvailability();
+      if (bridge.mode === "readonly") {
+        applySaveAvailability();
+        disableConfigEditing();
+        showReadonlyBanner(bridge.support.reason);
+      } else if (bridge.support.ioMode === "env") {
+        // 探测成功：明确说明保存走 exec+env 回退，而不是受控文件接口。
+        showBanner("warn", ENV_FALLBACK_BANNER, [{ label: "知道了", onClick: hideBanner }]);
+      }
+
+      return loadAll().then(function () {
+        reloadLogIfDiagnose();
+        applySaveAvailability();
+      });
     });
   }
 

@@ -4,11 +4,17 @@
  * 设计边界（spec §6.4/§11）：
  * - 只调用模块内固定包装器 agentcallctl 的六条命令；不存在任意 shell 拼接路径，
  *   任何用户输入都不会进入命令行字符串。
- * - 配置写入只从 stdin 进入：本文件把补丁 JSON 写入 root 私有目录下本次唯一的临时文件，
+ * - 首选配置写入：本文件把补丁 JSON 写入 root 私有目录下本次唯一的临时文件，
  *   命令行里只有该次保存的重定向路径（内部常量 + 随机 token/序号，不含用户输入），
  *   因此密钥不可能出现在 argv。
- * - 管理器缺少受控文件写入接口（ksu.io）时进入 readonly：读取可用，保存一律拒绝，
- *   绝不降级成 base64/echo 之类会泄漏到 argv 的“替代方案”，也绝不显示保存成功。
+ * - 管理器没有可用的受控文件写入接口（ksu.io 的 File + FileOutputStream 不可用）时，
+ *   若 ksu.exec 透传 options.env，则用完全固定的命令
+ *   `printf '%s' "$AGENTCALL_CFG_PAYLOAD" | <moduleDir>/bin/agentcallctl config-set`：
+ *   JSON 只经 env map 进入子进程 stdin，命令字符串里只有环境变量名；不写 URL/日志，
+ *   不把负载 base64 进 argv，也不写 inbox 文件。能力由一条无密钥探测确认（每页会话一次）。
+ * - 两种通道都不可用时进入 readonly（env_unavailable）：读取可用，保存一律拒绝并提示
+ *   “升级管理器（推荐）或在 root CLI 用 config-set 从 stdin 提交”；绝不降级成
+ *   argv/echo，也绝不显示保存成功。
  * - 没有管理器注入接口（普通浏览器）时进入 demo：数据显式标注为演示，保存失败。
  * - 保存成功与否以后端回读为准（revision 与密钥状态同时核对），不伪造成功。
  */
@@ -33,6 +39,18 @@
   var INBOX_FILE_PREFIX = "config-set.";
   var LOG_PATH = DATA_ROOT + "/logs/service.log";
   var MODULE_DIR_PATTERN = /^\/data\/adb\/modules\/[A-Za-z][A-Za-z0-9._-]+$/;
+  // exec + env 回退（Task 11O）：负载只放在 exec options 的 env map，固定命令仅引用变量名。
+  // 变量名与探测命令都是常量；命令字符串永不拼接负载。
+  var ENV_PAYLOAD_KEY = "AGENTCALL_CFG_PAYLOAD";
+  var ENV_PROBE_KEY = "AGENTCALL_PROBE";
+  var ENV_PROBE_COMMAND = "printf '%s' \"$" + ENV_PROBE_KEY + "\"";
+  var IO_MODE_FILE = "file";
+  var IO_MODE_ENV = "env";
+  var IO_MODE_NONE = "none";
+  var ENV_PROBE_SKIPPED = "skipped";
+  var ENV_PROBE_PENDING = "pending";
+  var ENV_PROBE_SUPPORTED = "supported";
+  var ENV_PROBE_UNSUPPORTED = "unsupported";
   // restart 是模块侧控制动作：agentcallctl 写重启请求后执行固定 CLI shutdown，
   // 由 service.sh 在本次开机的有限循环内重新拉起。它不是 AgentCallCli 的 RPC。
   var OPERATIONS = ["status", "config-get", "config-set", "pair", "diagnose", "shutdown", "restart"];
@@ -95,7 +113,8 @@
 
   var ERROR_TEXT = {
     bridge_unavailable: "未检测到 KernelSU 管理器的桥接接口（普通浏览器或未注入）。当前为只读演示状态，无法保存。",
-    secret_transport_unsupported: "当前管理器不提供受控文件写入接口，无法在不暴露密钥的前提下提交配置，已拒绝保存。",
+    secret_transport_unsupported:
+      "当前管理器既不支持 ksu.io 受控文件写入，也不支持 ksu.exec 的环境变量通道，无法在不暴露密钥的前提下提交配置，已拒绝保存。请升级管理器（推荐，升级后自动回到受控文件通道），或在 root shell 用 agentcallctl config-set 从 stdin 提交负载；密钥绝不会放进 argv/base64/URL。",
     module_dir_unresolved: "无法确认模块安装目录，已拒绝执行任何命令。",
     unsupported_operation: "只允许 status/config-get/config-set/pair/diagnose/shutdown/restart 七条固定命令。",
     payload_not_allowed: "该命令不接受参数。",
@@ -387,43 +406,49 @@
     };
   }
 
+  /**
+   * 能力矩阵（Task 11O）：
+   * - 文件接口可用（File + FileOutputStream，且 support !== false）→ kernelsu / ioMode=file；
+   * - 文件接口不可用、但 exec + 模块目录可信 → 先标记 env 候选（readonly/env_probe_pending，
+   *   ioMode=env），由一次无密钥探测决定是否升级为 kernelsu / ioMode=env；
+   * - 探测失败 → readonly/env_unavailable、ioMode=none；
+   * - 模块目录不可信或没有 exec → 只读/演示，ioMode=none。
+   */
   function detectSupport(scope) {
     var source = scope || root || {};
     var ksu = source.ksu;
     if (!ksu || typeof ksu !== "object") {
-      return { mode: "demo", hasBridge: false, hasExec: false, hasIo: false, ioVersion: 0, moduleDir: null, reason: "no_manager_bridge", ioForm: "none", ioSupport: null, hasFile: false, hasFileOutputStream: false };
+      return { mode: "demo", hasBridge: false, hasExec: false, hasIo: false, ioVersion: 0, moduleDir: null, reason: "no_manager_bridge", ioForm: "none", ioSupport: null, hasFile: false, hasFileOutputStream: false, ioMode: IO_MODE_NONE, envProbe: ENV_PROBE_SKIPPED };
     }
     if (typeof ksu.exec !== "function") {
-      return { mode: "demo", hasBridge: false, hasExec: false, hasIo: false, ioVersion: 0, moduleDir: null, reason: "exec_missing", ioForm: "none", ioSupport: null, hasFile: false, hasFileOutputStream: false };
+      return { mode: "demo", hasBridge: false, hasExec: false, hasIo: false, ioVersion: 0, moduleDir: null, reason: "exec_missing", ioForm: "none", ioSupport: null, hasFile: false, hasFileOutputStream: false, ioMode: IO_MODE_NONE, envProbe: ENV_PROBE_SKIPPED };
     }
     var moduleDir = readModuleDir(ksu);
     var inspected = inspectIo(ksu);
-    var hasIo = inspected.supported;
+    var hasFileTransport = inspected.supported;
     var support = {
-      mode: "kernelsu",
+      // 文件通道可用才立即 kernelsu；env 候选必须等探测成功后才能宣称可保存。
+      mode: hasFileTransport ? "kernelsu" : "readonly",
       hasBridge: true,
       hasExec: true,
-      hasIo: true,
+      hasIo: hasFileTransport,
       ioVersion: inspected.ioVersion,
       moduleDir: moduleDir,
-      reason: "ok",
+      reason: hasFileTransport ? "ok" : "env_probe_pending",
       ioForm: inspected.ioForm,
       ioSupport: inspected.ioSupport,
       hasFile: inspected.hasFile,
       hasFileOutputStream: inspected.hasFileOutputStream,
+      ioMode: hasFileTransport ? IO_MODE_FILE : IO_MODE_ENV,
+      envProbe: hasFileTransport ? ENV_PROBE_SKIPPED : ENV_PROBE_PENDING,
     };
-    // 模块目录不可信优先于 io：它决定命令路径是否可执行，绝不放宽。
+    // 模块目录不可信优先于 io/env：它决定命令路径是否可执行，绝不放宽。
     if (moduleDir === null) {
       support.mode = "readonly";
-      support.hasIo = hasIo;
       support.moduleDir = null;
       support.reason = "module_dir_unresolved";
-      return support;
-    }
-    if (!hasIo) {
-      support.mode = "readonly";
-      support.hasIo = false;
-      support.reason = "io_missing";
+      support.ioMode = IO_MODE_NONE;
+      support.envProbe = ENV_PROBE_SKIPPED;
       return support;
     }
     return support;
@@ -472,6 +497,8 @@
     var ksu = hasOwn(opts, "ksu") ? opts.ksu : scope.ksu;
     var support = detectSupport({ ksu: ksu });
     var state = { revision: null, logs: [], sequence: 0 };
+    // env 回退能力每页会话只探测一次；探测结果写回 support（ioMode/envProbe/reason）。
+    var envProbePromise = null;
     // 每个 WebUI 实例一个随机 token；路径只由常量 + 该 token + 递增序号组成，
     // 不含任何用户输入，也不进入 argv 之外的任何位置。
     var instanceToken = Date.now().toString(36) + "-" + (Math.random().toString(36).slice(2, 10) || "0");
@@ -510,17 +537,93 @@
       return control + " " + operation;
     }
 
-    function runCommand(command) {
+    /**
+     * env 回退的固定命令：只有常量壳词、环境变量名与已校验的模块路径。
+     * moduleDir 由 MODULE_DIR_PATTERN 限定为 [A-Za-z0-9._/-]，不含引号或 shell 元字符；
+     * 双引号保证 printf 只读取完整的环境变量值。负载永远不参与字符串拼接。
+     */
+    function envConfigCommand() {
+      return "printf '%s' \"$" + ENV_PAYLOAD_KEY + "\" | " + controlPath() + " config-set";
+    }
+
+    function markEnvUnavailable() {
+      support.ioMode = IO_MODE_NONE;
+      support.envProbe = ENV_PROBE_UNSUPPORTED;
+      support.mode = "readonly";
+      support.reason = "env_unavailable";
+    }
+
+    function markEnvAvailable() {
+      support.ioMode = IO_MODE_ENV;
+      support.envProbe = ENV_PROBE_SUPPORTED;
+      support.mode = "kernelsu";
+      support.reason = "ok";
+    }
+
+    /**
+     * 用一条无密钥 canary 命令确认管理器确实把 options.env 传给子进程（每页会话一次）。
+     * 忽略 env 的管理器会得到空输出/错误输出，exec 抛错则直接失败；两种情况都 fail closed，
+     * 不执行 config-set，更不回退到 argv/base64。
+     */
+    function probeEnvTransport() {
+      if (support.ioMode === IO_MODE_FILE) return Promise.resolve(true);
+      if (support.envProbe === ENV_PROBE_SUPPORTED) return Promise.resolve(true);
+      if (support.envProbe === ENV_PROBE_UNSUPPORTED) return Promise.resolve(false);
+      if (support.ioMode !== IO_MODE_ENV) return Promise.resolve(false);
+      if (support.moduleDir === null) {
+        markEnvUnavailable();
+        return Promise.resolve(false);
+      }
+      if (envProbePromise) return envProbePromise;
+
+      var canary = "agentcall-env-probe-" + Date.now().toString(36) + "-" + (Math.random().toString(36).slice(2, 10) || "0");
+      var probeEnv = {};
+      probeEnv[ENV_PROBE_KEY] = canary;
+      envProbePromise = runCommand(ENV_PROBE_COMMAND, probeEnv).then(
+        function (raw) {
+          // canary 不是密钥，但仍不保留环境对象与字符串引用。
+          probeEnv = null;
+          if (raw.errno === 0 && trimText(raw.stdout) === canary) {
+            markEnvAvailable();
+            return true;
+          }
+          markEnvUnavailable();
+          return false;
+        },
+        function () {
+          probeEnv = null;
+          markEnvUnavailable();
+          return false;
+        },
+      );
+      return envProbePromise;
+    }
+
+    function runCommand(command, env) {
       return new Promise(function (resolve) {
         var callbackName = "__agentcall_cb_" + Date.now() + "_" + state.sequence;
         state.sequence += 1;
         var settled = false;
         var timer = null;
+        var optionsJson = "{}";
+        var envMap = null;
+
+        if (env && typeof env === "object") {
+          // 只接受字符串值；名称/值都不进入 command 字符串。
+          envMap = {};
+          Object.keys(env).forEach(function (key) {
+            envMap[key] = toText(env[key]);
+          });
+          optionsJson = JSON.stringify({ env: envMap });
+        }
 
         function finish(result) {
           if (settled) return;
           settled = true;
           if (timer && typeof timer.unref === "function") timer.unref();
+          // 负载只在 exec 调用期间存在于 options 字符串；回调后立即断开引用。
+          optionsJson = null;
+          envMap = null;
           try {
             delete root[callbackName];
           } catch (error) {
@@ -539,7 +642,7 @@
         if (timer && typeof timer.unref === "function") timer.unref();
 
         try {
-          var returned = ksu.exec(command, "{}", callbackName);
+          var returned = ksu.exec(command, optionsJson, callbackName);
           if (returned && typeof returned.then === "function") {
             returned.then(
               function (value) {
@@ -629,7 +732,8 @@
       return null;
     }
 
-    function saveConfig(payload) {
+    /** 首选通道：ksu.io 写入本次唯一负载文件，CLI 从 stdin 读，随后立即删除。 */
+    function saveConfigViaIo(payload) {
       var validated = validateConfigWritePayload(payload);
       if (!validated.ok) return reject(CODE.PAYLOAD_INVALID, validated.message);
       var text = JSON.stringify(validated.write);
@@ -667,6 +771,58 @@
         });
     }
 
+    /**
+     * 回退通道：先探测（每页会话一次）再执行完全固定的命令；JSON 只经 exec options 的
+     * env map 进入子进程 stdin。不写 inbox，也没有需要删除的磁盘负载；成功判据与 io 路径
+     * 完全一致（revision + 密钥状态回读）。
+     */
+    function saveConfigViaEnv(payload) {
+      var validated = validateConfigWritePayload(payload);
+      if (!validated.ok) return reject(CODE.PAYLOAD_INVALID, validated.message);
+      var write = validated.write;
+      var text = JSON.stringify(write);
+      if (utf8ByteLength(text) > CONFIG_WRITE_LIMIT_BYTES) {
+        return reject(CODE.PAYLOAD_INVALID, "配置补丁超过 stdin 上限（" + CONFIG_WRITE_LIMIT_BYTES + " 字节）");
+      }
+      return probeEnvTransport().then(function (supported) {
+        if (!supported || support.ioMode !== IO_MODE_ENV) {
+          text = null;
+          return reject(CODE.SECRET_TRANSPORT_UNSUPPORTED);
+        }
+        var env = {};
+        env[ENV_PAYLOAD_KEY] = text;
+        // env 已持有唯一副本：立即断开本地字符串引用。
+        text = null;
+        return runCommand(envConfigCommand(), env).then(function (raw) {
+          try {
+            delete env[ENV_PAYLOAD_KEY];
+          } catch (error) {
+            /* 清理失败不影响结果 */
+          }
+          env = null;
+          var parsed = parseCliResult(raw);
+          recordLog("config-set", raw.errno, parsed.ok ? "ok" : parsed.code);
+          if (!parsed.ok) {
+            var failure = { ok: false, code: parsed.code, message: parsed.message, source: "bridge" };
+            if (parsed.code === "config_conflict") failure.conflict = true;
+            return failure;
+          }
+          var problem = verifyWrite(parsed.data, write.expectedRevision, write.patch && write.patch.secrets);
+          if (problem) {
+            return { ok: false, code: problem, message: errorText(problem), source: "bridge" };
+          }
+          state.revision = parsed.data.config.revision;
+          return { ok: true, source: "bridge", data: parsed.data };
+        });
+      });
+    }
+
+    function saveConfig(payload) {
+      if (support.ioMode === IO_MODE_FILE) return saveConfigViaIo(payload);
+      if (support.ioMode === IO_MODE_ENV) return saveConfigViaEnv(payload);
+      return reject(CODE.SECRET_TRANSPORT_UNSUPPORTED);
+    }
+
     function call(operation, payload) {
       var name = toText(operation);
       if (OPERATIONS.indexOf(name) === -1) {
@@ -675,7 +831,7 @@
       if (support.mode === "demo") return reject(CODE.BRIDGE_UNAVAILABLE);
       if (support.moduleDir === null) return reject(CODE.MODULE_DIR_UNRESOLVED);
       if (name === "config-set") {
-        if (!support.hasIo) return reject(CODE.SECRET_TRANSPORT_UNSUPPORTED);
+        // 通道选择在 saveConfig 内：file / env（先探测）/ none（拒绝）。
         return saveConfig(payload);
       }
       if (payload !== undefined && payload !== null) {
@@ -734,8 +890,16 @@
     }
 
     return {
-      mode: support.mode,
+      // mode/ioMode 会随一次成功的 env 探测从 readonly/env_probe_pending 变为
+      // kernelsu/env；必须用 getter，不能捕获初始值。
+      get mode() {
+        return support.mode;
+      },
+      get ioMode() {
+        return support.ioMode;
+      },
       support: support,
+      probeEnvTransport: probeEnvTransport,
       call: call,
       readLog: readLog,
       logs: function () {

@@ -144,12 +144,17 @@ root 操作员（不供 WebUI）：calibrate（JSON 从 stdin）
 
 能力状态：
 
-| 状态 | 条件 | 能力 |
-| --- | --- | --- |
-| `kernelsu` | `ksu.exec` + `ksu.io`（对象形式或旧式函数形式；`support !== false` 且 `File`/`FileOutputStream` 存在）+ 模块目录可信 | WebUI 的七条固定操作，保存可用 |
-| `readonly` | io 明确 `support: false`、缺少 `File`/`FileOutputStream`，或旧版不提供 `ksu.io` | 读取/诊断/配对/关闭可用，**保存被拒绝** |
-| `readonly` | `moduleInfo()` 明确给出不可信 `moduleDir` | 依赖模块目录的命令禁用，固定路径日志仍可读 |
-| `demo` | 普通浏览器无管理器注入 | 明确标注模拟数据，不发起任何请求 |
+| 状态 | 保存通道（`ioMode`） | 条件 | 能力 |
+| --- | --- | --- | --- |
+| `kernelsu` | `file`（受控文件接口，优先） | `ksu.exec` + `ksu.io`（对象或旧式函数形式；`support !== false` 且 `File`/`FileOutputStream` 存在）+ 模块目录可信 | WebUI 的七条固定操作，保存经 ksu.io 文件 + stdin |
+| `kernelsu` | `env`（exec+env 回退） | `ksu.exec` + 模块目录可信；`ksu.io` 不可用，但一条无密钥探测确认 exec 透传 `options.env` | WebUI 的七条固定操作，保存经固定命令 + `AGENTCALL_CFG_PAYLOAD` env |
+| `readonly` | `none`（`env_unavailable`） | `ksu.io` 不可用，且 env 探测被忽略/无回显/exec 抛错 | 读取/诊断/配对/关闭可用；**保存被拒绝**，提示升级管理器或 root CLI stdin |
+| `readonly` | `none`（`module_dir_unresolved`） | `moduleInfo()` 明确给出不可信 `moduleDir` | 依赖模块目录的命令禁用，固定路径日志仍可读 |
+| `demo` | `none` | 普通浏览器无管理器注入 | 明确标注模拟数据，不发起任何请求 |
+
+诊断页的 `管理器 io：…；保存通道 file|env|none · env 探测 …` 一行就是本次页面会话的实际能力，
+不靠猜测：env 回退必须先通过探测才会把状态从 `readonly/env_probe_pending` 提升为
+`kernelsu/env`。
 
 **总开关默认关闭**。未配对、未校准、Hook/桥未连通或无法保持 READY 时不会自动接听。
 概览的默认拨号角色/Hook 连通性来自 `status`；规则、AI、对话三页各有独立的“未保存”
@@ -157,14 +162,49 @@ root 操作员（不供 WebUI）：calibrate（JSON 从 stdin）
 密钥只写在 root 私有目录 `/data/adb/agentcall/config.json`（目录 0700），WebUI 只看到
 `CONFIGURED/MISSING`，不读取原值。
 
+### 5.1 配置保存的两种安全传输（无 ksu.io 时的 exec+env 回退）
+
+1. **受控文件接口（首选，`ioMode=file`）**：WebUI 把 `{expectedRevision, patch}` JSON 写入
+   root 私有目录 `/data/adb/agentcall/inbox/config-set.<token>-<seq>.json`，执行
+   `agentcallctl config-set < <本次唯一负载路径>`。密钥只进入 root 私有文件，不进入 argv；
+   正常路径写后立即删除。
+2. **exec+env 回退（`ioMode=env`）**：管理器的 `ksu.io` 存在但没有可用的
+   `File`/`FileOutputStream`（或 `support: false`）时，WebUI 先执行一条**不含任何密钥**的
+   探测命令，确认管理器确实把 `ksu.exec` 的 `options.env` 透传给子进程。探测通过后执行
+   **完全固定**的命令：
+
+   ```sh
+   printf '%s' "$AGENTCALL_CFG_PAYLOAD" | /data/adb/modules/agentcall/bin/agentcallctl config-set
+   ```
+
+   JSON 只经 exec options 的 env map
+   `{ "env": { "AGENTCALL_CFG_PAYLOAD": "<json>" } }` 传入；命令字符串里只有环境变量名，
+   没有负载。不把负载 base64 进 argv，不写 URL/日志，也不写 inbox 文件（没有需要删除的
+   磁盘负载）。保存成功与否仍以后端回读的 `revision` 与密钥状态为准。
+3. **两者都不可用（`readonly`，原因 `env_unavailable`）**：保存按钮禁用，并明确给出两条
+   出路——升级管理器以获得 `ksu.io`（**推荐**），或在 root shell 用
+   `agentcallctl config-set < <负载文件>` 从 stdin 提交。绝不静默降级到 argv/base64。
+
+   ```sh
+   # 先按第 6 节的引号 heredoc 把负载写入 root 私有文件，然后：
+   su -c '/data/adb/modules/agentcall/bin/agentcallctl config-set < /data/adb/agentcall/inbox/config-set.cli.json'
+   su -c 'rm -f /data/adb/agentcall/inbox/config-set.cli.json'
+   ```
+
+管理器更新仍是**长期推荐方案**：env 回退依赖管理器对 `ksu.exec` options 的透传，属于兼容
+通道；管理器升级后会自动回到首选 `ksu.io` 路径。无论走哪条通道，密钥都不进入 argv、URL、
+日志或错误消息；也绝不显示未经回读确认的“保存成功”。
+
 ## 6. API 配置
 
 在 WebUI 的 AI 页填写三个端点（ASR / LLM / TTS）：每个端点 `baseUrl` + `model`；
 另有 `voice`、`speed`、`openingLine`、`prompt`。**baseUrl 必须是 `https://`**
 （APK 传输层拒绝非 HTTPS，并拒绝重定向到非 HTTPS 或跨主机地址）。
 
-密钥（`ASR/LLM/TTS`）只经 stdin 写入，不进入 argv/URL/日志。手工写入示例（引号 heredoc，
-不做 shell 展开；写完由 CLI 删除临时文件）：
+密钥（`ASR/LLM/TTS`）只经受控通道写入，**永远不进入 argv/URL/日志**：首选 ksu.io 文件 +
+stdin；没有 ksu.io 时走固定命令 + `AGENTCALL_CFG_PAYLOAD` env（见 §5.1）；两者都不可用时
+保存被拒绝。手工写入示例使用同一 stdin 契约（引号 heredoc，不做 shell 展开；写完手工删除
+临时文件）：
 
 ```sh
 su -c 'cat > /data/adb/agentcall/inbox/config-set.json' <<'JSON'
@@ -412,9 +452,9 @@ AI 会话，等待人工处理。恢复路径：
 | `peer_unpaired` | 尚未配对 | 执行 `agentcallctl pair` |
 | `peer_version_mismatch` | APK/拨号器升级后版本变了 | 重新 `pair` |
 | `peer_uid_mismatch` | APK 卸载重装换了 uid | 重新 `pair` |
-| `io_missing` / `module_dir_unresolved` | WebUI 只读降级 | 更新 KernelSU 管理器或检查模块目录 |
-| `inbox_write_failed` | 无法写入 root 私有 inbox | 检查 `/data/adb/agentcall` 权限 |
-| `secret_transport_unsupported` | 只读能力下尝试保存密钥 | 升级管理器或在 root CLI 写入 |
+| `env_unavailable` / `io_missing` / `module_dir_unresolved` | WebUI 只读降级（前两者是原因名，不是命令错误码） | 更新 KernelSU 管理器以获得 ksu.io；或检查模块目录 |
+| `inbox_write_failed` | 无法写入 root 私有 inbox（仅 ksu.io 首选通道） | 检查 `/data/adb/agentcall` 权限 |
+| `secret_transport_unsupported` | 两种安全保存通道都不可用（ksu.io 缺失且 exec env 探测失败） | 升级管理器；或在 root shell 用 `agentcallctl config-set < 负载文件` 从 stdin 提交 |
 | `service_not_running` | `service.sh` 已退出（本次开机没有重启循环） | 重启设备或重新启用模块；不要伪造重启成功 |
 | `module_disabled` | 模块带 `disable`/`remove` 标记 | 先启用/重装模块；不会重启已移除模块 |
 | `restart_unconfirmed` | 桥接未接受 `shutdown`（退出/不可达） | 刷新状态；仍不可达时重启设备 |
@@ -428,7 +468,7 @@ AI 会话，等待人工处理。恢复路径：
 | --- | --- |
 | 模块 ZIP 结构、DEX 入口、版本、SHA-256、密钥泄漏检查 | 本地已验证（`make package-check`） |
 | 最终矩阵（HEAD `438cbbd`） | 本地 PASS：225 个 Gradle task；JVM 845（core 126 / bridge 360 / app 359，0 failures / 0 errors / 0 skipped）、lint 0 errors / 15 warnings；APK/ZIP 已在该 HEAD 重新打包（哈希见第 1 节） |
-| JVM/JS/Python/脚本检查 | JVM 845；WebUI node 127/127；Python 59/59；`sh -n` 模块脚本通过；`make test` / `make build` / `make package-check` 全 PASS |
+| JVM/JS/Python/脚本检查 | JVM 845；WebUI node 141/141（含 exec+env 回退与探测/密钥卫生回归）；Python 59/59；`sh -n` 模块脚本通过；`make test` / `make build` / `make package-check` 全 PASS |
 | release 收缩（R8） | 本地已验证：`packageScope = setOf("**")`，mapping 99,205 行，release 未签名 APK 2.18 MB（debug 重签 2.27 MB）；**真机未验证** |
 | 配对（WebUI/root CLI）与 APK 校准/诊断界面 | 已实现；root CLI `calibrate` 经 `calibration.record` 写入五项人工证据；十个环境字段中六个（apiLevel、romFingerprint、kernelVersion、dialerPackageVersion、bridgeVersion、audioPolicyDigest）由桥接观测；四个可背书字段里 frameworkVersion/simCarrier 有真实观测源、只在观测不到时才由 root 背书，transport/route 则从不观测、始终为 UNKNOWN、只能在 calibrate 时由 root 背书；APP 就绪另需 `calibration.read` 的 supported/verified/environmentComplete/environmentMatchesEvidence（supportedApiLevel 是策略常量 `CalibrationPolicy.SUPPORTED_API_LEVEL`=37，不是设备 API 等级；API 36 因 `API_LEVEL_UNSUPPORTED` 保持阻断；真机探针与五项实测未验证，见第 7 节） |
 | 优雅关闭停止顺序（先取 stop.lock、shutdown、后停音频工作进程、再 TERM→KILL） | 本地宿主已验证（`shutdown-order.test.mjs`、`module-scripts.test.mjs` 进程/CLI 替身，含并发锁等待）；**真机未验证** |

@@ -10,6 +10,9 @@ const require = createRequire(import.meta.url);
 const B = require("../bridge.js");
 
 const SECRET = "sk-live-DO-NOT-LEAK-9f8e7d6c";
+// 固定命令契约：探测只回显 env；保存把 env 经管道送进 CLI 的 stdin。
+const ENV_PROBE_COMMAND = 'printf \'%s\' "$AGENTCALL_PROBE"';
+const ENV_CONFIG_COMMAND = 'printf \'%s\' "$AGENTCALL_CFG_PAYLOAD" | ' + CTL + " config-set";
 
 function redacted(overrides, secrets) {
   const config = Object.assign(
@@ -66,11 +69,12 @@ test("普通浏览器缺少真实桥：进入明确只读/演示态，任何保�
   assert.ok(String(B.DEMO.note).length > 0);
 });
 
-test("管理器缺少 io 受控文件接口：读取可用，写入被拒绝且不执行 config-set", async () => {
-  const fake = fakeManager({ io: false, handlers: statusHandler });
+test("管理器没有 io 且 exec 不支持 env：读取可用，保存被拒绝，探测一次后 fail closed", async () => {
+  const fake = fakeManager({ io: false, envSupport: false, handlers: statusHandler });
   const bridge = bridgeWith(fake);
-  assert.equal(bridge.mode, "readonly");
-  assert.equal(bridge.support.reason, "io_missing");
+  // 无 ksu.io 时先标记为 env 回退候选（待探测），而不是直接宣称只读。
+  assert.equal(bridge.support.ioMode, "env");
+  assert.equal(bridge.support.envProbe, "pending");
 
   const status = await bridge.call("status");
   assert.equal(status.ok, true);
@@ -79,7 +83,12 @@ test("管理器缺少 io 受控文件接口：读取可用，写入被拒绝且�
   const save = await bridge.call("config-set", { expectedRevision: 3, patch: { enabled: true, secrets: { ASR: { action: "keep" }, LLM: { action: "keep" }, TTS: { action: "keep" } } } });
   assert.equal(save.ok, false);
   assert.equal(save.code, "secret_transport_unsupported");
-  assert.equal(fake.commands.some((c) => c.includes("config-set")), false);
+  assert.equal(bridge.mode, "readonly");
+  assert.equal(bridge.support.reason, "env_unavailable");
+  assert.equal(bridge.support.ioMode, "none");
+  assert.equal(bridge.support.envProbe, "unsupported");
+  assert.deepEqual(fake.commands, [CTL + " status", ENV_PROBE_COMMAND], "只允许读取命令与一条无密钥探测命令");
+  assert.equal(fake.commands.some((c) => /\sconfig-set$/.test(c)), false);
 
   const log = await bridge.readLog();
   assert.equal(log.ok, false);
@@ -322,20 +331,22 @@ test("moduleInfo 抛错或返回非法 JSON 时也回退固定模块路径", asy
   }
 });
 
-test("io.support === false：视为没有受控文件接口（readonly io_missing），保存被拒绝", async () => {
-  const fake = fakeManager({ ioForm: "object", ioSupport: false, ioVersionStyle: "number", ioVersion: 0, handlers: statusHandler });
+test("io.support === false 且 exec env 不可用：视为两种受控写入都不可用（readonly env_unavailable），保存被拒绝", async () => {
+  const fake = fakeManager({ ioForm: "object", ioSupport: false, ioVersionStyle: "number", ioVersion: 0, envSupport: false, handlers: statusHandler });
   const bridge = bridgeWith(fake);
-  assert.equal(bridge.mode, "readonly");
-  assert.equal(bridge.support.reason, "io_missing");
   assert.equal(bridge.support.ioForm, "object");
   assert.equal(bridge.support.ioSupport, false);
   assert.equal(bridge.support.ioVersion, 0);
   assert.equal(bridge.support.hasIo, false);
+  assert.equal(bridge.support.ioMode, "env");
 
   const save = await bridge.call("config-set", { expectedRevision: 0, patch: { enabled: true } });
   assert.equal(save.ok, false);
   assert.equal(save.code, "secret_transport_unsupported");
-  assert.equal(fake.commands.some((command) => command.indexOf(" config-set ") !== -1), false);
+  assert.equal(bridge.mode, "readonly");
+  assert.equal(bridge.support.reason, "env_unavailable");
+  assert.equal(bridge.support.ioMode, "none");
+  assert.equal(fake.commands.some((command) => /\sconfig-set$/.test(command)), false);
 });
 
 test("对象形式 ksu.io（support: true、version: 1）识别为 kernelsu，保存可用", async () => {
@@ -393,18 +404,20 @@ test("旧式函数形式 ksu.io() 仍可用：version() 返回数字时识别为
   assert.equal(bridge.support.hasFileOutputStream, true);
 });
 
-test("io 存在但缺少 FileOutputStream：readonly io_missing，保存被拒绝（诊断指出缺类）", async () => {
-  const fake = fakeManager({ ioForm: "object", ioSupport: true, ioVersionStyle: "number", ioVersion: 1, fileOutputStream: false, handlers: statusHandler });
+test("io 存在但缺少 FileOutputStream 且 env 不可用：readonly env_unavailable，保存被拒绝（诊断指出缺类）", async () => {
+  const fake = fakeManager({ ioForm: "object", ioSupport: true, ioVersionStyle: "number", ioVersion: 1, fileOutputStream: false, envSupport: false, handlers: statusHandler });
   const bridge = bridgeWith(fake);
-  assert.equal(bridge.mode, "readonly");
-  assert.equal(bridge.support.reason, "io_missing");
   assert.equal(bridge.support.hasFile, true);
   assert.equal(bridge.support.hasFileOutputStream, false);
+  assert.equal(bridge.support.ioMode, "env");
 
   const save = await bridge.call("config-set", { expectedRevision: 0, patch: { enabled: true } });
   assert.equal(save.ok, false);
   assert.equal(save.code, "secret_transport_unsupported");
-  assert.equal(fake.commands.some((command) => command.indexOf(" config-set ") !== -1), false);
+  assert.equal(bridge.mode, "readonly");
+  assert.equal(bridge.support.reason, "env_unavailable");
+  assert.equal(bridge.support.ioMode, "none");
+  assert.equal(fake.commands.some((command) => /\sconfig-set$/.test(command)), false);
 });
 
 test("对象形式 io 可用但模块目录不可信：仍以 module_dir_unresolved 为准（不放宽）", async () => {
@@ -517,3 +530,156 @@ test("静态资源不含在线 CDN、内联事件处理器，也不使用 innerH
 });
 
 // 渲染路径（DOM 层）由 app-ui.test.mjs 用极简 DOM 垫片真实执行；此处只保留静态扫描。
+
+// ------------------------------------------------------------------ exec + env 回退
+
+test("exec+env 回退：固定命令 + env 传 JSON，密钥不进命令/日志，回读确认后才算成功", async () => {
+  const fake = fakeManager({
+    io: false,
+    handlers: {
+      "config-set": () => ({
+        errno: 0,
+        stdout: redacted({ revision: 4, enabled: true }, { ASR: "CONFIGURED", LLM: "MISSING", TTS: "MISSING" }),
+        stderr: "",
+      }),
+    },
+  });
+  const bridge = bridgeWith(fake);
+  assert.equal(bridge.support.ioMode, "env");
+  assert.equal(bridge.support.envProbe, "pending");
+  assert.equal(bridge.mode, "readonly", "探测成功前不得宣称可保存");
+  assert.equal(bridge.support.reason, "env_probe_pending");
+
+  const result = await bridge.call("config-set", {
+    expectedRevision: 3,
+    patch: {
+      enabled: true,
+      secrets: { ASR: { action: "replace", value: SECRET }, LLM: { action: "keep" }, TTS: { action: "keep" } },
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.data.config.revision, 4);
+  assert.equal(bridge.mode, "kernelsu");
+  assert.equal(bridge.support.reason, "ok");
+  assert.equal(bridge.support.ioMode, "env");
+  assert.equal(bridge.support.envProbe, "supported");
+
+  assert.deepEqual(fake.commands, [ENV_PROBE_COMMAND, ENV_CONFIG_COMMAND]);
+  assert.equal(typeof fake.envs[0].AGENTCALL_PROBE, "string");
+  assert.ok(fake.envs[0].AGENTCALL_PROBE.length > 0, "探测使用非空 canary");
+  // CLI 从 stdin 收到的就是完整 write JSON 的逐字节副本（没有信封、没有 argv 拼接）。
+  const expectedWrite = {
+    expectedRevision: 3,
+    patch: {
+      enabled: true,
+      secrets: { ASR: { action: "replace", value: SECRET }, LLM: { action: "keep" }, TTS: { action: "keep" } },
+    },
+  };
+  assert.equal(fake.envPayloads[0], JSON.stringify(expectedWrite));
+  const payload = JSON.parse(fake.envPayloads[0]);
+  assert.equal(payload.expectedRevision, 3);
+  assert.equal(payload.patch.secrets.ASR.value, SECRET);
+  assert.equal(payload.patch.enabled, true);
+
+  const secretBase64 = B.toBase64Utf8(SECRET);
+  for (const command of fake.commands) {
+    assert.equal(command.includes(SECRET), false, "命令字符串不得含密钥");
+    assert.equal(command.includes(secretBase64), false, "命令字符串不得含密钥编码");
+    assert.equal(command.includes("expectedRevision"), false, "命令字符串不得含负载");
+  }
+  assert.equal(JSON.stringify(bridge.logs()).includes(SECRET), false);
+  assert.equal(JSON.stringify(bridge.logs()).includes(secretBase64), false);
+  // env 路径不写 inbox：没有负载文件、没有目录、没有 io 写入记录。
+  assert.equal(fake.files.size, 0);
+  assert.equal(fake.dirs.size, 0);
+  assert.deepEqual(fake.writes.map((entry) => entry.path), ["(exec-env)"]);
+});
+
+test("env 探测每页会话只执行一次：并发/重复探测复用同一结果", async () => {
+  const fake = fakeManager({ io: false, handlers: statusHandler });
+  const bridge = bridgeWith(fake);
+
+  const [first, second] = await Promise.all([bridge.probeEnvTransport(), bridge.probeEnvTransport()]);
+  assert.equal(first, true);
+  assert.equal(second, true);
+  assert.deepEqual(fake.commands, [ENV_PROBE_COMMAND]);
+
+  assert.equal(await bridge.probeEnvTransport(), true);
+  assert.equal(fake.commands.length, 1, "探测结果必须缓存，不得每次保存都探测");
+  assert.equal(bridge.mode, "kernelsu");
+  assert.equal(bridge.support.ioMode, "env");
+  assert.equal(bridge.support.envProbe, "supported");
+});
+
+test("exec 忽略 env（探测 stdout 为空）：只读 env_unavailable，绝不执行 config-set", async () => {
+  const fake = fakeManager({ io: false, envSupport: false, handlers: statusHandler });
+  const bridge = bridgeWith(fake);
+
+  assert.equal(await bridge.probeEnvTransport(), false);
+  assert.equal(bridge.mode, "readonly");
+  assert.equal(bridge.support.reason, "env_unavailable");
+  assert.equal(bridge.support.ioMode, "none");
+  assert.equal(bridge.support.envProbe, "unsupported");
+  assert.deepEqual(fake.commands, [ENV_PROBE_COMMAND]);
+
+  const save = await bridge.call("config-set", { expectedRevision: 0, patch: { enabled: true } });
+  assert.equal(save.ok, false);
+  assert.equal(save.code, "secret_transport_unsupported");
+  assert.deepEqual(fake.commands, [ENV_PROBE_COMMAND], "探测失败后不得执行 config-set");
+  assert.equal(fake.envPayloads.length, 0);
+});
+
+test("exec 拒绝 options/抛错：同样 env_unavailable 只读，不执行 config-set", async () => {
+  const fake = fakeManager({ io: false, envSupport: "error", handlers: statusHandler });
+  const bridge = bridgeWith(fake);
+
+  assert.equal(await bridge.probeEnvTransport(), false);
+  assert.equal(bridge.mode, "readonly");
+  assert.equal(bridge.support.reason, "env_unavailable");
+  assert.equal(bridge.support.ioMode, "none");
+  assert.deepEqual(fake.commands, [ENV_PROBE_COMMAND]);
+
+  const save = await bridge.call("config-set", { expectedRevision: 0, patch: { enabled: true } });
+  assert.equal(save.ok, false);
+  assert.equal(save.code, "secret_transport_unsupported");
+  assert.equal(fake.commands.length, 1);
+  assert.equal(fake.envPayloads.length, 0);
+});
+
+test("存在受控文件接口时优先走 io：不探测 env、不执行 env 命令", async () => {
+  const fake = fakeManager({ handlers: { "config-set": () => ({ errno: 0, stdout: redacted({ revision: 1 }), stderr: "" }) } });
+  const bridge = bridgeWith(fake);
+  assert.equal(bridge.mode, "kernelsu");
+  assert.equal(bridge.support.ioMode, "file");
+  assert.equal(bridge.support.envProbe, "skipped");
+  assert.equal(bridge.support.reason, "ok");
+
+  const result = await bridge.call("config-set", { expectedRevision: 0, patch: { enabled: false } });
+  assert.equal(result.ok, true);
+  assert.equal(fake.commands.length, 1);
+  assert.equal(fake.commands[0], CTL + " config-set < " + fake.writes[0].path);
+  assert.notEqual(fake.commands[0], ENV_PROBE_COMMAND);
+  assert.equal(fake.commands.includes(ENV_CONFIG_COMMAND), false);
+  assert.equal(fake.envPayloads.length, 0);
+  assert.deepEqual(fake.envs[0], {}, "file 路径的 exec options 仍是空对象");
+});
+
+test("io.support === false 但 exec env 可用：走 env 回退保存，而不是只读", async () => {
+  const fake = fakeManager({
+    ioForm: "object",
+    ioSupport: false,
+    ioVersionStyle: "number",
+    ioVersion: 0,
+    handlers: { "config-set": () => ({ errno: 0, stdout: redacted({ revision: 5, enabled: true }), stderr: "" }) },
+  });
+  const bridge = bridgeWith(fake);
+  assert.equal(bridge.support.hasIo, false);
+  assert.equal(bridge.support.ioMode, "env");
+
+  const result = await bridge.call("config-set", { expectedRevision: 4, patch: { enabled: true } });
+  assert.equal(result.ok, true);
+  assert.equal(bridge.mode, "kernelsu");
+  assert.equal(bridge.support.ioMode, "env");
+  assert.deepEqual(fake.commands, [ENV_PROBE_COMMAND, ENV_CONFIG_COMMAND]);
+  assert.equal(JSON.parse(fake.envPayloads[0]).expectedRevision, 4);
+});

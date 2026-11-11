@@ -23,18 +23,18 @@
 | `/data/adb/agentcall/pairing.json` | 配对记录（包名/UID/签名摘要/版本） | 0600 |
 | `/data/adb/agentcall/config.schema-<n>.json.bak` | 迁移前旧 schema 备份 | 0600 |
 | `/data/adb/agentcall/supervisor-state.json` | 监督端持久状态（schema 3，见 §8） | 0600 |
-| `/data/adb/agentcall/inbox` | WebUI 写入的 `config-set` 一次性负载 | 0700（WebUI 创建时显式 ownerOnly rwx，不依赖 umask；`customize.sh` 预创建） |
-| `/data/adb/agentcall/inbox/config-set.<token>-<seq>.json` | 单次写入负载（每次保存唯一文件名）；正常路径读写后立即删除 | 写入后收紧为 0000 |
+| `/data/adb/agentcall/inbox` | ksu.io 首选通道的 `config-set` 一次性负载目录（exec+env 回退不写这里） | 0700（WebUI 创建时显式 ownerOnly rwx，不依赖 umask；`customize.sh` 预创建） |
+| `/data/adb/agentcall/inbox/config-set.<token>-<seq>.json` | 首选通道的单次写入负载（每次保存唯一文件名）；正常路径读写后立即删除 | 写入后收紧为 0000 |
 | `/data/adb/agentcall/logs/service.log` | 服务日志（有大小上限） | 0700 目录，服务自身轮转 |
 
 密钥以**明文**保存在 root 私有单文件里，依靠目录/文件权限与 root 隔离，不做加密。
 这符合 spec §6.4/§11：密钥不进入普通应用备份、导出或日志，但不能防御同设备其它
 已授权 root 进程。
 
-inbox 中的一次性明文负载只在一次保存期间存在：正常路径在 CLI 返回后立即删除；WebView
-崩溃或进程被杀时可能残留，由 `service.sh`/`customize.sh` 在启动时清理本模块拥有的
-`config-set*.json`（不触碰 inbox 中其它文件）。固定路径 `config-set.json` 是旧版兼容
-形态，启动清理同样覆盖。
+inbox 中的一次性明文负载只在一次保存期间存在（仅 ksu.io 首选通道；exec+env 回退不落盘）：
+正常路径在 CLI 返回后立即删除；WebView 崩溃或进程被杀时可能残留，由
+`service.sh`/`customize.sh` 在启动时清理本模块拥有的 `config-set*.json`（不触碰 inbox
+中其它文件）。固定路径 `config-set.json` 是旧版兼容形态，启动清理同样覆盖。
 
 写入使用“同目录临时文件 → fsync → rename”的原子替换；revision 与内容一起落盘，
 不会读到半份配置。
@@ -186,12 +186,23 @@ inbox 中的一次性明文负载只在一次保存期间存在：正常路径�
 - `enabledPhoneAccounts` 属于 APK 侧；WebUI 的补丁不包含它，避免清空 APK 写入的启用项。
 - stdin 上限 `MAX_CONTROL_FRAME_BYTES - 1024 = 64512` 字节（UTF-8）。
   WebUI 在写文件前按同一上限检查；超限返回 `payload_invalid`。
-- 配置内容只经 stdin 传输；命令行只有本次保存的**唯一**负载路径
-  `<moduleDir>/bin/agentcallctl config-set < /data/adb/agentcall/inbox/config-set.<token>-<seq>.json`。
-  路径由前端常量、每实例随机 token 与递增序号生成，不含用户输入；CLI 契约仍然是
-  “从 stdin 读 config-set”。每次保存使用唯一文件名，两个 WebUI 实例不会互相覆盖负载
-  （固定路径曾让 A 的 CLI 读到 B 的 payload，CAS 仍可能通过）。
-  密钥永远不进入进程 argv、URL、日志或错误消息。
+- 配置内容只经受控通道进入 CLI 的 stdin。WebUI 按管理器能力选择两种传输：
+  1. **首选 `ksu.io`**：命令行只有本次保存的**唯一**负载路径
+     `<moduleDir>/bin/agentcallctl config-set < /data/adb/agentcall/inbox/config-set.<token>-<seq>.json`。
+     路径由前端常量、每实例随机 token 与递增序号生成，不含用户输入；CLI 契约仍然是
+     “从 stdin 读 config-set”。每次保存使用唯一文件名，两个 WebUI 实例不会互相覆盖负载
+     （固定路径曾让 A 的 CLI 读到 B 的 payload，CAS 仍可能通过）。
+  2. **`ksu.exec` + env 回退**：`ksu.io` 不可用（缺少 `File`/`FileOutputStream`，或
+     `support: false`）但 exec 支持 `options.env` 时，执行**完全固定**的命令
+     `printf '%s' "$AGENTCALL_CFG_PAYLOAD" | <moduleDir>/bin/agentcallctl config-set`，
+     JSON 只经 exec options 的 env map
+     `{ "env": { "AGENTCALL_CFG_PAYLOAD": "<json>" } }` 传入。命令字符串里只有环境变量名，
+     没有负载；不 base64 进 argv，不写 URL/日志。管理器未透传 env 时探测失败，保存 fail closed。
+  3. **两种都不可用**：只读态，`config-set` 被拒绝并返回
+     `secret_transport_unsupported`；提示升级管理器，或在 root shell 用
+     `agentcallctl config-set < <负载文件>` 从 stdin 提交。
+  密钥永远不进入进程 argv、URL、日志或错误消息；保存成功始终以后端回读的 revision 与
+  密钥状态为准。
 - **页面作用域**：WebUI 的每个页面保存只提交本页字段，校验也只针对本页；绝不夹带其它页面
   正在编辑（未确认）的内容，尤其是 AI 密钥意图：
 
@@ -252,9 +263,11 @@ inbox 中的一次性明文负载只在一次保存期间存在：正常路径�
 | code | 含义 | WebUI 行为 |
 | --- | --- | --- |
 | `bridge_unavailable` | 没有 KernelSU 管理器注入（普通浏览器） | 演示/只读态，保存一律失败 |
-| `secret_transport_unsupported` | 管理器没有 `ksu.io` 受控写入接口 | 只读态，拒绝 `config-set`，不执行命令 |
+| `secret_transport_unsupported` | 两种安全保存通道都不可用：`ksu.io` 不可用且 exec env 探测失败/抛错 | 只读态，拒绝 `config-set`，不执行 `config-set` 命令；提示升级管理器或 root CLI stdin |
 | `module_dir_unresolved` | `moduleInfo()` **明确给出**的 `moduleDir` 不符合固定模式（不可信） | 禁用所有需要执行 CLI 的命令与保存（fail closed）；固定路径日志仍可读 |
-| `io_missing`（只读原因，不是命令错误码） | 管理器没有 `ksu.io()` 或 `version()<1` | 只读态：读取/诊断/配对/关闭可用，保存一律拒绝（`secret_transport_unsupported`） |
+| `env_unavailable`（只读原因，不是命令错误码） | `ksu.io` 不可用，且一条无密钥探测确认 `ksu.exec` 不透传 `options.env`（或被忽略/抛错） | 只读态：读取/诊断/配对/关闭可用，保存一律拒绝（`secret_transport_unsupported`） |
+| `env_probe_pending`（只读原因，不是命令错误码） | 无 `ksu.io`，env 探测尚未完成 | 保存保持禁用；探测成功提升为 `kernelsu/env`，失败变 `env_unavailable` |
+| `io_missing`（旧只读原因，兼容保留） | 管理器没有 `ksu.io()` 且未走 env 回退 | 只读态：保存一律拒绝（`secret_transport_unsupported`） |
 | `io_unavailable` | 文件接口不可用（读日志等） | 显示“无法读取”，不伪造数据 |
 | `unsupported_operation` | 不在固定命令表内 | 拒绝，不拼 shell |
 | `payload_not_allowed` | 无参数命令收到负载 | 拒绝，不执行 |
@@ -461,18 +474,19 @@ CLI 结果最多 25 s、等桥接退出最多 10 s；`uninstall.sh` 相同，最
 `module/webroot/bridge.js` 只使用管理器注入的接口（与 KernelSU 上游
 `js/index.js` 使用的原生桥一致）：
 
-- 执行：`ksu.exec(command, "{}", callbackName)`，回调 `(errno, stdout, stderr)`；
-  也兼容返回 Promise 的实现。
-- 文件：`ksu.io()` 的 `version()`、`File()`、`FileOutputStream()`、
-  `RandomAccessFile()`/`FileInputStream()`（日志尾部）。
+- 执行：`ksu.exec(command, optionsJson, callbackName)`，回调 `(errno, stdout, stderr)`；
+  首选通道 options 为 `"{}"`，env 回退为 `{"env":{...}}`。也兼容返回 Promise 的实现。
+- 文件：`ksu.io`（对象形式）或旧式 `ksu.io()` 的 `version`、`File()`、
+  `FileOutputStream()`、`RandomAccessFile()`/`FileInputStream()`（日志尾部）。
 - 模块目录：`ksu.moduleInfo()`。
 
-三种运行状态：
+运行状态与保存通道（`support.ioMode`）：
 
 | 状态 | 条件 | 能力 |
 | --- | --- | --- |
-| `kernelsu` | 有 `ksu.exec`、`ksu.io()` ≥ v1、模块目录可信（`moduleInfo` 缺少 `moduleDir` 时回退固定路径） | 全部固定操作（WebUI 使用其中七条：status/config-get/config-set/pair/diagnose/shutdown/restart；不含 root-only `calibrate`）；保存可用 |
-| `readonly`（`io_missing`） | 有 `ksu.exec`，但没有 `ksu.io()`（或 `version()<1`） | 读取/诊断/配对/关闭可用；**保存一律拒绝**（`secret_transport_unsupported`），绝不降级为 base64/echo 命令行参数 |
+| `kernelsu` / `ioMode=file`（首选） | 有 `ksu.exec`、`ksu.io` 的 `File`+`FileOutputStream`（`support !== false`）、模块目录可信（`moduleInfo` 缺少 `moduleDir` 时回退固定路径） | 全部固定操作（WebUI 使用其中七条：status/config-get/config-set/pair/diagnose/shutdown/restart；不含 root-only `calibrate`）；保存经受控文件 + stdin |
+| `kernelsu` / `ioMode=env`（兼容） | 有 `ksu.exec`、模块目录可信；`ksu.io` 不可用，但一条无密钥探测确认 exec 透传 `options.env` | 同一组固定操作；保存经固定命令 + `AGENTCALL_CFG_PAYLOAD` env（每页会话探测一次，结果缓存） |
+| `readonly`（`env_unavailable`） | 有 `ksu.exec`，但 `ksu.io` 不可用，且 env 探测失败/被忽略/exec 抛错 | 读取/诊断/配对/关闭可用；**保存一律拒绝**（`secret_transport_unsupported`），绝不降级为 base64/echo argv |
 | `readonly`（`module_dir_unresolved`） | `moduleInfo()` **明确给出**不可信的 `moduleDir` | 需要执行 CLI 的命令禁用；固定路径日志读取仍可用（日志不依赖模块目录）；保存拒绝 |
 | `demo` | 普通浏览器，没有管理器注入 | 明确标注“演示数据”，保存、配对、日志均不可用；不发起任何网络请求 |
 
@@ -484,10 +498,12 @@ CLI 结果最多 25 s、等桥接退出最多 10 s；`uninstall.sh` 相同，最
   返回 `module_dir_unresolved`，只禁用需要模块目录的命令。
 - 日志路径 `/data/adb/agentcall/logs/service.log` 是固定的，不因模块目录未解析而失效。
 
-写入路径：
+写入路径（按能力二选一，绝不降级到 argv/base64）：
+
+**A. 首选 ksu.io**
 
 1. 前端把 `{expectedRevision, patch}` 序列化为 UTF-8 JSON。
-2. 通过 `ksu.io().FileOutputStream()` 写入本次保存的唯一负载
+2. 通过 `ksu.io` 的 `FileOutputStream` 写入本次保存的唯一负载
    `/data/adb/agentcall/inbox/config-set.<token>-<seq>.json`。
    这里的 base64 只是 Java 文件桥的字节编码，不经过 shell、不进 argv。
 3. 文件权限收紧为 0000；目录 0700。
@@ -496,6 +512,21 @@ CLI 结果最多 25 s、等桥接退出最多 10 s；`uninstall.sh` 相同，最
    `service.sh`/`customize.sh` 启动清理兜底。
 6. 唯一负载名取代固定文件名后，两个 WebUI 实例的写入不再交错；不需要额外的跨实例锁文件，
    也不存在“持锁等待”的失败模式。
+
+**B. ksu.exec + env 回退**
+
+1. 页面初始化/首次保存时执行一条无密钥探测：
+   `printf '%s' "$AGENTCALL_PROBE"`，env 里放随机 canary；只有 stdout 逐字节等于 canary
+   才认为管理器透传 `options.env`。探测结果每页会话缓存一次，不会每次保存都重跑。
+2. 探测通过后执行固定命令：
+   `printf '%s' "$AGENTCALL_CFG_PAYLOAD" | <moduleDir>/bin/agentcallctl config-set`。
+   命令字符串不含负载；JSON 只放在 exec options 的
+   `{ "env": { "AGENTCALL_CFG_PAYLOAD": "<json>" } }`。模块路径来自已校验的
+   `moduleDir`（固定字符集），负载从不参与拼接。
+3. 不写 inbox、不写 URL/日志；保存成功与否仍以后端回读的 revision 与密钥状态为准。
+4. 探测失败、stdout 为空或 exec 抛错：切换到 `readonly`/`env_unavailable`（`ioMode=none`），
+   返回 `secret_transport_unsupported`，不执行 `config-set` 命令；提示升级管理器或 root CLI
+   stdin 提交。
 
 WebUI 不加载任何在线 CDN、不发起 fetch/XHR、不用 `innerHTML` 渲染不受信任文本；
 配置与日志一律 `textContent`。
@@ -605,15 +636,20 @@ WebUI 不加载任何在线 CDN、不发起 fetch/XHR、不用 `innerHTML` 渲�
 
 ## 11. 未验证与已知限制
 
-- **真实 KernelSU 管理器未验证**：本环境没有设备/浏览器。当前实现依赖管理器提供
-  `ksu.exec` 与 `ksu.io()`（含 `FileOutputStream`）；若实际安装的管理器版本更旧或
-  接口不同，WebUI 会进入 `readonly` 并拒绝保存——这是有意的 fail-closed 行为，
-  不是“已保存”。文档不声称该路径已在真机 WebView 中工作。
-- **stdin/密钥传输能力**：`agentcallctl` 从继承的 stdin 读取负载，因此需要调用方
-  能把 JSON 放进 root 私有文件并做重定向。管理器的文件写入接口不可用时，没有
-  不暴露密钥的替代通道；实现选择拒绝保存，而不是用 base64 命令行参数伪装保密。
-- **KernelSU IO 版本**：`ksu.io()` 的 `version()` 必须 ≥ 1；不同管理器/分支的
-  文件接口细节未逐一验证。版本为 0 时按“没有受控写入接口”处理（只读，不是保存成功）。
+- **真实 KernelSU 管理器未验证**：本环境没有设备/浏览器。首选路径依赖管理器提供
+  `ksu.exec` 与可用的 `ksu.io`（`File` + `FileOutputStream`）；若管理器没有可用的
+  `ksu.io` 但 `ksu.exec` 透传 `options.env`，实现会走固定命令 + env 回退。两者都不可用时
+  WebUI 进入 `readonly`（`env_unavailable`）并拒绝保存——这是有意的 fail-closed 行为，
+  不是“已保存”。文档不声称任一通道已在真机 WebView 中工作。**管理器更新仍是长期推荐方案**。
+- **stdin/密钥传输能力**：`agentcallctl` 始终从继承的 stdin 读取负载。首选通道由 WebUI
+  把 JSON 放进 root 私有文件并重定向；env 回退由固定命令中的
+  `printf '%s' "$AGENTCALL_CFG_PAYLOAD"` 把 env 内容写进 CLI 的 stdin。两条通道都不把
+  密钥放进 argv/URL/日志；管理器不透传 env 时实现选择拒绝保存，而不是用 base64
+  命令行参数伪装保密。
+- **KernelSU io/env 版本差异**：只有 `File` + `FileOutputStream` 可用且 `support !== false`
+  才走首选文件通道；否则视为 `ksu.io` 不可用并尝试 env 回退。不同管理器/分支的
+  `exec` options（尤其 `env`）细节未逐一验证；env 探测只验证 canary 是否到达子进程，
+  不代表所有管理器版本行为一致。
 - **模块目录版本偏差**：`moduleInfo()` 缺少 `moduleDir` 时回退固定路径；只有明确给出
   非法目录才 fail closed。该项由 `transport.test.mjs` 覆盖，未在真机管理器上验证。
 - **优雅关闭与卸载顺序未上机**：`service.sh`/`uninstall.sh` 的“先固定 CLI shutdown、

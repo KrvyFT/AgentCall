@@ -12,6 +12,8 @@ export const LOG_PATH = "/data/adb/agentcall/logs/service.log";
 export function fakeManager(options) {
   const opts = options || {};
   const commands = [];
+  const envs = [];
+  const envPayloads = [];
   const files = new Map();
   const writes = [];
   const dirs = new Set();
@@ -20,6 +22,19 @@ export function fakeManager(options) {
   const ioVersion = opts.ioVersion === undefined ? 1 : opts.ioVersion;
   const logText = opts.logText;
   const failFlush = opts.failFlush === true;
+  // undefined = 管理器透传 options.env（默认）；false = 静默忽略 env；"error" = exec 抛错。
+  const envSupport = opts.envSupport === undefined ? true : opts.envSupport;
+
+  function parseOptions(optionsJson) {
+    if (!optionsJson) return {};
+    if (typeof optionsJson === "object") return optionsJson;
+    try {
+      const parsed = JSON.parse(optionsJson);
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch (error) {
+      return {};
+    }
+  }
 
   if (logText !== undefined) files.set(LOG_PATH, logText);
 
@@ -149,10 +164,45 @@ export function fakeManager(options) {
   const ksu = {
     exec(command, optionsJson, callbackName) {
       commands.push(command);
-      const tokens = command.split(/\s+/);
-      const op = tokens[1];
-      const handler = handlers[op];
-      const result = typeof handler === "function" ? handler(command) : handler || { errno: 0, stdout: "{}", stderr: "" };
+      const options = parseOptions(optionsJson);
+      const env = options.env && typeof options.env === "object" ? options.env : {};
+      envs.push(env);
+
+      if (envSupport === "error") {
+        // 管理器拒绝 options 参数：与真实管理器抛错的行为一致。
+        throw new Error("manager rejected exec options");
+      }
+
+      let result;
+      if (command.indexOf("$AGENTCALL_PROBE") !== -1) {
+        // 能力探测：只回显环境变量；忽略 env 的管理器会得到空 stdout。
+        result =
+          envSupport === false
+            ? { errno: 0, stdout: "", stderr: "" }
+            : { errno: 0, stdout: String(env.AGENTCALL_PROBE || ""), stderr: "" };
+      } else if (command.indexOf("$AGENTCALL_CFG_PAYLOAD") !== -1 && /\sconfig-set$/.test(command)) {
+        if (envSupport === false) {
+          // 忽略 env：子进程读到空 stdin，CLI 报负载非法；这是“不该发生”的成功。
+          result = opts.envIgnoredResult || {
+            errno: 1,
+            stdout: JSON.stringify({ error: { code: "payload_invalid", message: "empty stdin" } }),
+            stderr: "",
+          };
+        } else {
+          const payload = String(env.AGENTCALL_CFG_PAYLOAD === undefined ? "" : env.AGENTCALL_CFG_PAYLOAD);
+          envPayloads.push(payload);
+          // 兼容既有 app 测试：env 负载也记录成一次“写入”。
+          writes.push({ path: "(exec-env)", text: payload });
+          const handler = handlers["config-set"];
+          result = typeof handler === "function" ? handler(command, env) : handler || { errno: 0, stdout: "{}", stderr: "" };
+        }
+      } else {
+        const tokens = command.split(/\s+/);
+        const op = tokens[1];
+        const handler = handlers[op];
+        result = typeof handler === "function" ? handler(command, env) : handler || { errno: 0, stdout: "{}", stderr: "" };
+      }
+
       setTimeout(() => {
         if (typeof globalThis[callbackName] === "function") {
           globalThis[callbackName](result.errno, result.stdout, result.stderr);
@@ -177,5 +227,5 @@ export function fakeManager(options) {
     else ksu.io = () => io;
   }
 
-  return { ksu, commands, files, writes, dirs, perms, io };
+  return { ksu, commands, envs, envPayloads, files, writes, dirs, perms, io };
 }
