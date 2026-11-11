@@ -106,4 +106,111 @@ class DialerDefaultRoleProbeTest {
         assertEquals(java.lang.Boolean.FALSE, DialerDefaultRole.GOOGLE_DIALER_IS_NOT_DEFAULT.definite)
         assertNull(DialerDefaultRole.UNKNOWN.definite)
     }
+
+    // ------------------------------- Task 11Q-b：binder/context 之后的 shell 兜底
+
+    @Test
+    fun shellFallbackOnlyRunsWhenTheRoleHoldersAreUnreadable() {
+        var shellCalls = 0
+        val shell: () -> DialerDefaultRole = {
+            shellCalls++
+            DialerDefaultRole.GOOGLE_DIALER_IS_DEFAULT
+        }
+
+        // 角色持有者可读：它是唯一权威事实，shell 不再运行。
+        assertEquals(
+            DialerDefaultRole.GOOGLE_DIALER_IS_NOT_DEFAULT,
+            DialerDefaultRoleProbe(
+                roleHolders = { listOf("com.other.dialer") },
+                dialHandlerPackage = { null },
+                shellDialerRole = shell,
+            ).inspect(),
+        )
+        assertEquals(0, shellCalls)
+
+        // 角色不可读：shell 是 binder/context 路径之后的下一层事实。
+        assertEquals(
+            DialerDefaultRole.GOOGLE_DIALER_IS_DEFAULT,
+            DialerDefaultRoleProbe(
+                roleHolders = { null },
+                dialHandlerPackage = { null },
+                shellDialerRole = shell,
+            ).inspect(),
+        )
+        assertEquals(1, shellCalls)
+    }
+
+    @Test
+    fun shellFallbackIsAuthoritativeOverTheDialHandler() {
+        assertEquals(
+            "角色/Telecom 的默认事实优先于 ACTION_DIAL 处理器",
+            DialerDefaultRole.GOOGLE_DIALER_IS_DEFAULT,
+            DialerDefaultRoleProbe(
+                roleHolders = { null },
+                dialHandlerPackage = { "com.other.dialer" },
+                shellDialerRole = { DialerDefaultRole.GOOGLE_DIALER_IS_DEFAULT },
+            ).inspect(),
+        )
+        assertEquals(
+            DialerDefaultRole.GOOGLE_DIALER_IS_NOT_DEFAULT,
+            DialerDefaultRoleProbe(
+                roleHolders = { null },
+                dialHandlerPackage = { "com.google.android.dialer" },
+                shellDialerRole = { DialerDefaultRole.GOOGLE_DIALER_IS_NOT_DEFAULT },
+            ).inspect(),
+        )
+    }
+
+    @Test
+    fun unknownShellResultPreservesTheExistingHandlerSemantics() {
+        for (handler in listOf(null, "android", "com.google.android.dialer")) {
+            assertEquals(
+                DialerDefaultRole.UNKNOWN,
+                DialerDefaultRoleProbe(
+                    roleHolders = { null },
+                    dialHandlerPackage = { handler },
+                    shellDialerRole = { DialerDefaultRole.UNKNOWN },
+                ).inspect(),
+            )
+        }
+        assertEquals(
+            DialerDefaultRole.GOOGLE_DIALER_IS_NOT_DEFAULT,
+            DialerDefaultRoleProbe(
+                roleHolders = { null },
+                dialHandlerPackage = { "com.other.dialer" },
+                shellDialerRole = { DialerDefaultRole.UNKNOWN },
+            ).inspect(),
+        )
+    }
+
+    @Test
+    fun shellFailuresDoNotEscape() {
+        assertEquals(
+            DialerDefaultRole.GOOGLE_DIALER_IS_NOT_DEFAULT,
+            DialerDefaultRoleProbe(
+                roleHolders = { null },
+                dialHandlerPackage = { "com.other.dialer" },
+                shellDialerRole = { throw IllegalStateException("process") },
+            ).inspect(),
+        )
+    }
+
+    @Test
+    fun unavailableRoleMechanismSkipsTheShellFallback() {
+        var shellCalls = 0
+
+        assertEquals(
+            DialerDefaultRole.UNKNOWN,
+            DialerDefaultRoleProbe(
+                roleHolders = { null },
+                dialHandlerPackage = { null },
+                roleMechanismAvailable = { false },
+                shellDialerRole = {
+                    shellCalls++
+                    DialerDefaultRole.GOOGLE_DIALER_IS_DEFAULT
+                },
+            ).inspect(),
+        )
+        assertEquals(0, shellCalls)
+    }
 }

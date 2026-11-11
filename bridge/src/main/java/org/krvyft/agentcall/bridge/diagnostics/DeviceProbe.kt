@@ -85,6 +85,8 @@ class AndroidPlatformFacts(
     private val telephonyCarrier: () -> String? = { systemSimCarrier() },
     /** 直接类检查（XposedBridge）作为框架版本的补充信号；测试可注入。 */
     private val xposedBridgeVersion: () -> String? = { reflectiveXposedBridgeVersion() },
+    /** module.prop 候选路径；生产默认是 [FRAMEWORK_METADATA_PATHS]，测试注入临时目录。 */
+    private val frameworkMetadataPaths: List<String> = FRAMEWORK_METADATA_PATHS,
 ) : PlatformFacts {
 
     override fun apiLevel(): Int = Build.VERSION.SDK_INT
@@ -111,18 +113,26 @@ class AndroidPlatformFacts(
      * SIM 运营商名（B2）：只读 TelephonyManager 的公开运营商名，读不到时退回
      * telephony 栈写入的系统属性（`gsm.sim.operator.alpha`）。不使用网络运营商
      * 冒充 SIM 运营商；全部来源都空时保持 UNKNOWN。
+     *
+     * Task 11Q-b：多 SIM 上这些来源会把同一运营商写成逗号分隔列表（设备实测
+     * `China Unicom,China Unicom`，线上曾出现纯标点 `","`）。现在每个来源都走
+     * [carrierFact] 归一化；纯标点/空片段不是事实，继续下一个来源。
      */
     override fun simCarrier(): String {
-        boundedObservedFact(telephonyCarrier())?.let { return it }
+        carrierFact(telephonyCarrier())?.let { return it }
         for (key in SIM_CARRIER_PROPERTIES) {
-            boundedObservedFact(properties.get(key))?.let { return it }
+            carrierFact(properties.get(key))?.let { return it }
         }
         return UNKNOWN
     }
 
-    /** manager metadata：`/data/adb/modules/<name>/module.prop` 的 `version=` 行（root 可读）。 */
+    /**
+     * manager metadata：`/data/adb/modules/<name>/module.prop` 的 `version=` 行（root 可读）。
+     * 路径由 [frameworkMetadataPaths] 提供（生产默认是 [FRAMEWORK_METADATA_PATHS]），
+     * 第一个有界有效值优先；目录/文件缺失、空白或超长值都继续下一个路径。
+     */
     private fun managerMetadataVersion(): String? {
-        for (path in FRAMEWORK_METADATA_PATHS) {
+        for (path in frameworkMetadataPaths) {
             val file = File(path)
             if (!file.isFile || file.length() > MAX_METADATA_BYTES) continue
             val text = runCatching { file.readText() }.getOrNull() ?: continue
@@ -153,7 +163,7 @@ class AndroidPlatformFacts(
         return UNKNOWN
     }
 
-    private companion object {
+    internal companion object {
         const val UNKNOWN = "UNKNOWN"
         const val HEX = "0123456789abcdef"
         const val MAX_METADATA_BYTES = 64L * 1024L
@@ -176,11 +186,19 @@ class AndroidPlatformFacts(
             "persist.sys.edxposed.version",
         )
 
-        /** manager/安装器只留下 module.prop 时的兜底来源（root 可读的固定路径）。 */
+        /**
+         * manager/安装器只留下 module.prop 时的兜底来源（root 可读的固定路径）。
+         *
+         * Task 11Q-b：设备 XQ-DQ72 的 Vector 模块目录是 `zygisk_vector`（module.prop
+         * `version=v2.2 (3080-88f8e1fa-JingMatrix-Vector)`），旧候选列表里没有它；
+         * 现在按“当前栈最可能的位置在前”列出全部已知目录，第一个有界有效值优先。
+         */
         val FRAMEWORK_METADATA_PATHS = listOf(
-            "/data/adb/modules/lsposed/module.prop",
+            "/data/adb/modules/zygisk_vector/module.prop",
             "/data/adb/modules/zygisk_lsposed/module.prop",
+            "/data/adb/modules/lsposed/module.prop",
             "/data/adb/modules/vector/module.prop",
+            "/data/adb/modules/edxposed/module.prop",
         )
 
         /** telephony 栈写入的 SIM 运营商属性；绝不是网络运营商。 */
@@ -197,6 +215,27 @@ private const val MAX_OBSERVED_FACT_CHARS: Int = 128
 
 /** LSPosed/EdXposed/Vector 的 XposedBridge 类名；测试用替身类名覆盖反射路径。 */
 private const val XPOSED_BRIDGE_CLASS: String = "de.robv.android.xposed.XposedBridge"
+
+/**
+ * SIM 运营商名的归一化（Task 11Q-b，JVM 可测）。
+ *
+ * telephony 栈在多 SIM 上把同一运营商写成逗号分隔列表（设备实测
+ * `gsm.sim.operator.alpha` = `China Unicom,China Unicom`）；整串校验会把列表或
+ * 纯标点当成运营商名。这里只取第一个非空片段、去掉首尾标点，再走
+ * [boundedObservedFact]。空值/全空片段/纯标点片段返回 null（这个来源没有事实），
+ * 调用方继续下一个来源。
+ */
+internal fun carrierFact(value: String?): String? {
+    val raw = value ?: return null
+    for (segment in raw.split(',')) {
+        val trimmed = segment.trim()
+        if (trimmed.isEmpty()) continue
+        val stripped = trimmed.trim { !it.isLetterOrDigit() }
+        if (stripped.isEmpty()) return null
+        return boundedObservedFact(stripped)
+    }
+    return null
+}
 
 /**
  * 观测事实的有界校验（Task 11H1）：trim 后必须非空、≤ [MAX_OBSERVED_FACT_CHARS]、
