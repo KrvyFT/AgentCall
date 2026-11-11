@@ -9,6 +9,7 @@ KernelSU 模块里的 `app_process` 特权桥负责 Telecom 控制、通话音�
 ![Android 17 / API 37](https://img.shields.io/badge/Android-17%20%2F%20API%2037-3DDC84?logo=android&logoColor=white)
 ![Kotlin](https://img.shields.io/badge/language-Kotlin-7F52FF?logo=kotlin&logoColor=white)
 ![Tests](https://img.shields.io/badge/tests-922%20JVM%20%C2%B7%20149%20node%20%C2%B7%2059%20Python-brightgreen)
+![License: GPL-2.0](https://img.shields.io/badge/license-GPL--2.0-blue)
 
 > [!IMPORTANT]
 > **自动接听目前有意关闭，不是“装上就能用”。** 它需要两道闸门同时成立：
@@ -295,5 +296,9 @@ cd dist && sha256sum -c SHA256SUMS
 
 ## 许可证
 
-仓库当前**没有 `LICENSE` 文件**，因此不声明任何开源许可证；在补充许可证之前，默认保留所有权利。
-如果你需要分发或复用，请先与仓库维护者确认。
+本项目以 **GNU General Public License v2.0（GPL-2.0-only）** 发布，完整文本见 [LICENSE](LICENSE)。
+
+- 你可以自由使用、修改与再分发，但分发衍生作品时必须同样以 GPL-2.0 开源并提供对应源码；
+  且不提供任何担保（详见许可证第 11、12 条）。
+- 仓库中的 `docs/superpowers/` 规格与计划文档、设备证据与商标名称分别归其权利人所有；
+  Google 电话、KernelSU、Vector/LSPosed 等第三方组件遵循各自许可证。
