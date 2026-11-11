@@ -3,6 +3,7 @@ package org.krvyft.agentcall.bridge.diagnostics
 import android.os.Build
 import java.io.File
 import java.security.MessageDigest
+import org.krvyft.agentcall.bridge.ipc.PackageFacts
 import org.krvyft.agentcall.bridge.ipc.PackageFactsSource
 import org.krvyft.agentcall.bridge.ipc.PeerVerifier
 import org.krvyft.agentcall.core.model.CapabilityReport
@@ -297,15 +298,29 @@ class DeviceProbe(
     private val dialerPackage: String = PeerVerifier.DIALER_PACKAGE,
     /** 设备日志/诊断里的包事实 provider 码（context|appglobals|binder|shell）；null = 未接线。 */
     private val packageProvider: String? = null,
+    /** 机器码日志；默认丢弃，生产装配显式接 stderr。绝不输出异常文本/路径。 */
+    private val log: (String) -> Unit = {},
 ) {
 
     fun inspect(): CapabilityReport {
-        val visibleMethods = audioApiProbe.visibleMethods()
+        // 隐藏 API 反射可能抛 Throwable（含 Error）：环境探测是诊断/校准的前置条件，
+        // 不能让一次反射失败打断 config-set/status。读不到就是显式 UNKNOWN/NONE。
+        val visibleMethods = try {
+            audioApiProbe.visibleMethods()
+        } catch (t: Throwable) {
+            log("device_probe_unavailable source=audio_api code=reflection_throwable")
+            emptySet()
+        }
         // 一次查询同时拿到拨号器版本/签名/uid；shell 回退的签名是显式 null（UNKNOWN）。
-        val dialerFacts = if (dialerPackage == PeerVerifier.DIALER_PACKAGE) {
-            packages.dialerPackageFacts()
-        } else {
-            packages.packageFacts(dialerPackage)
+        val dialerFacts = try {
+            if (dialerPackage == PeerVerifier.DIALER_PACKAGE) {
+                packages.dialerPackageFacts()
+            } else {
+                packages.packageFacts(dialerPackage)
+            }
+        } catch (t: Throwable) {
+            log("device_probe_unavailable source=dialer_facts code=reflection_throwable")
+            PackageFacts(dialerPackage)
         }
         val dialerVersion = dialerFacts.versionName ?: UNKNOWN
         val dialerSignature = dialerFacts.signatureSha256 ?: UNKNOWN

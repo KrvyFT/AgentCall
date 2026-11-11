@@ -11,8 +11,34 @@ const B = require("../bridge.js");
 
 const SECRET = "sk-live-DO-NOT-LEAK-9f8e7d6c";
 // 固定命令契约：探测只回显 env；保存把 env 经管道送进 CLI 的 stdin。
-const ENV_PROBE_COMMAND = 'printf \'%s\' "$AGENTCALL_PROBE"';
-const ENV_CONFIG_COMMAND = 'printf \'%s\' "$AGENTCALL_CFG_PAYLOAD" | ' + CTL + " config-set";
+const ENV_CHUNK_SIZE = 128;
+const ENV_PROBE_CHUNKS = 3;
+function envChunk(name, index) {
+  return '"$' + name + "_" + index + '"';
+}
+function envConfigCommand(chunks) {
+  const args = [];
+  for (let index = 0; index < chunks; index += 1) args.push(envChunk("AGENTCALL_CFG_PAYLOAD", index));
+  return "printf '%s' " + args.join(" ") + " | " + CTL + " config-set";
+}
+function envProbeCommand(chunks = ENV_PROBE_CHUNKS) {
+  const args = [];
+  for (let index = 0; index < chunks; index += 1) args.push(envChunk("AGENTCALL_PROBE", index));
+  return "printf '%s' " + args.join(" ");
+}
+function chunked(fake, index, name = "AGENTCALL_CFG_PAYLOAD") {
+  const env = fake.envs[index] || {};
+  const pattern = new RegExp("^" + name + "_(\\d+)$");
+  return Object.keys(env)
+    .map((key) => {
+      const match = pattern.exec(key);
+      return match ? { index: Number(match[1]), value: env[key] } : null;
+    })
+    .filter(Boolean)
+    .sort((left, right) => left.index - right.index);
+}
+const ENV_PROBE_COMMAND = envProbeCommand();
+const ENV_CONFIG_COMMAND = envConfigCommand(1);
 
 function redacted(overrides, secrets) {
   const config = Object.assign(
@@ -564,9 +590,12 @@ test("exec+env 回退：固定命令 + env 传 JSON，密钥不进命令/日志�
   assert.equal(bridge.support.ioMode, "env");
   assert.equal(bridge.support.envProbe, "supported");
 
-  assert.deepEqual(fake.commands, [ENV_PROBE_COMMAND, ENV_CONFIG_COMMAND]);
-  assert.equal(typeof fake.envs[0].AGENTCALL_PROBE, "string");
-  assert.ok(fake.envs[0].AGENTCALL_PROBE.length > 0, "探测使用非空 canary");
+  const writeChunks = chunked(fake, 1);
+  assert.deepEqual(fake.commands, [ENV_PROBE_COMMAND, envConfigCommand(writeChunks.length)]);
+  const probeChunks = chunked(fake, 0, "AGENTCALL_PROBE");
+  assert.equal(probeChunks.length, ENV_PROBE_CHUNKS, "探测 canary 必须拆成固定 3 块");
+  assert.deepEqual(probeChunks.map((entry) => entry.index), [0, 1, 2]);
+  assert.equal(probeChunks.map((entry) => entry.value).join("").length, ENV_CHUNK_SIZE * ENV_PROBE_CHUNKS);
   // CLI 从 stdin 收到的就是完整 write JSON 的逐字节副本（没有信封、没有 argv 拼接）。
   const expectedWrite = {
     expectedRevision: 3,

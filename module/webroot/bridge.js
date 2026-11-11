@@ -8,10 +8,13 @@
  *   命令行里只有该次保存的重定向路径（内部常量 + 随机 token/序号，不含用户输入），
  *   因此密钥不可能出现在 argv。
  * - 管理器没有可用的受控文件写入接口（ksu.io 的 File + FileOutputStream 不可用）时，
- *   若 ksu.exec 透传 options.env，则用完全固定的命令
- *   `printf '%s' "$AGENTCALL_CFG_PAYLOAD" | <moduleDir>/bin/agentcallctl config-set`：
- *   JSON 只经 env map 进入子进程 stdin，命令字符串里只有环境变量名；不写 URL/日志，
- *   不把负载 base64 进 argv，也不写 inbox 文件。能力由一条无密钥探测确认（每页会话一次）。
+ *   若 ksu.exec 透传 options.env，则把 JSON 拆成固定大小的分块
+ *   AGENTCALL_CFG_PAYLOAD_0..N（每块 128 UTF-16 码元，最多 64 块，绝不在代理对中间切分），
+ *   再用完全固定的命令
+ *   `printf '%s' "$AGENTCALL_CFG_PAYLOAD_0" ... "$AGENTCALL_CFG_PAYLOAD_N" | <moduleDir>/bin/agentcallctl config-set`：
+ *   printf 的多个参数按顺序拼接后写入 stdin，argv 里只有环境变量名与索引，命令字符串由
+ *   固定索引范围生成，绝不拼接任何负载内容。能力由一条同样分 3 块的无密钥探测确认
+ *   （每页会话一次）：任一分块缺失/被截断都会 fail closed 为 env_unavailable。
  * - 两种通道都不可用时进入 readonly（env_unavailable）：读取可用，保存一律拒绝并提示
  *   “升级管理器（推荐）或在 root CLI 用 config-set 从 stdin 提交”；绝不降级成
  *   argv/echo，也绝不显示保存成功。
@@ -39,11 +42,13 @@
   var INBOX_FILE_PREFIX = "config-set.";
   var LOG_PATH = DATA_ROOT + "/logs/service.log";
   var MODULE_DIR_PATTERN = /^\/data\/adb\/modules\/[A-Za-z][A-Za-z0-9._-]+$/;
-  // exec + env 回退（Task 11O）：负载只放在 exec options 的 env map，固定命令仅引用变量名。
-  // 变量名与探测命令都是常量；命令字符串永不拼接负载。
-  var ENV_PAYLOAD_KEY = "AGENTCALL_CFG_PAYLOAD";
-  var ENV_PROBE_KEY = "AGENTCALL_PROBE";
-  var ENV_PROBE_COMMAND = "printf '%s' \"$" + ENV_PROBE_KEY + "\"";
+  // exec + env 回退（Task 11O/11P）：负载拆成固定大小的 env 分块，固定命令仅引用变量名与
+  // 索引。分块边界绝不落在代理对中间；命令字符串由固定索引范围生成，永不拼接负载。
+  var ENV_PAYLOAD_VAR_PREFIX = "AGENTCALL_CFG_PAYLOAD_";
+  var ENV_PROBE_VAR_PREFIX = "AGENTCALL_PROBE_";
+  var ENV_CHUNK_SIZE = 128;
+  var ENV_CHUNK_CAP = 64;
+  var ENV_PROBE_CHUNKS = 3;
   var IO_MODE_FILE = "file";
   var IO_MODE_ENV = "env";
   var IO_MODE_NONE = "none";
@@ -103,6 +108,7 @@
     UNSUPPORTED_OPERATION: "unsupported_operation",
     PAYLOAD_NOT_ALLOWED: "payload_not_allowed",
     PAYLOAD_INVALID: "payload_invalid",
+    PAYLOAD_TOO_LARGE: "payload_too_large",
     TRANSPORT_FAILED: "transport_failed",
     RESPONSE_INVALID: "response_invalid",
     SAVE_UNCONFIRMED: "save_unconfirmed",
@@ -119,6 +125,7 @@
     unsupported_operation: "只允许 status/config-get/config-set/pair/diagnose/shutdown/restart 七条固定命令。",
     payload_not_allowed: "该命令不接受参数。",
     payload_invalid: "请求内容不符合后端固定字段表，已被拒绝。",
+    payload_too_large: "配置补丁超过 env 分块传输上限（64 块 × 128 UTF-16 码元），已拒绝保存。",
     transport_failed: "无法连接 AgentCall 桥接服务（未启动或已退出）。",
     response_invalid: "桥接服务返回的内容无法解析。",
     save_unconfirmed: "写入结果未被后端回读确认，因此不视为已保存。",
@@ -178,6 +185,70 @@
       return encodeURIComponent(source).replace(/%[0-9A-F]{2}/gi, "_").length;
     }
     return source.length;
+  }
+
+  /**
+   * 按 UTF-16 码元长度分块，但绝不把代理对拆到两个分块里。
+   * 空串返回单个空块（保持 printf 的 stdin 语义）；块数由调用方按 ENV_CHUNK_CAP 限制。
+   */
+  function chunkText(text, size) {
+    var source = toText(text);
+    if (source.length === 0) return [""];
+    var chunks = [];
+    var current = "";
+    var index = 0;
+    while (index < source.length) {
+      var code = source.charCodeAt(index);
+      var width = 1;
+      if (code >= 0xd800 && code <= 0xdbff && index + 1 < source.length) {
+        var low = source.charCodeAt(index + 1);
+        if (low >= 0xdc00 && low <= 0xdfff) width = 2;
+      }
+      if (current.length > 0 && current.length + width > size) {
+        chunks.push(current);
+        current = "";
+      }
+      current += source.substr(index, width);
+      index += width;
+    }
+    if (current.length > 0) chunks.push(current);
+    return chunks.length > 0 ? chunks : [""];
+  }
+
+  /** 固定索引范围生成 env 变量名；索引是数字，不是负载内容。 */
+  function envChunkNames(prefix, count) {
+    var names = [];
+    for (var index = 0; index < count; index += 1) names.push(prefix + index);
+    return names;
+  }
+
+  /** printf 的多个 %s 参数按顺序拼接；命令里只有常量壳词、变量名与模块路径。 */
+  function envPrintfCommand(prefix, count) {
+    var args = [];
+    var names = envChunkNames(prefix, count);
+    for (var index = 0; index < names.length; index += 1) args.push('"$' + names[index] + '"');
+    return "printf '%s' " + args.join(" ");
+  }
+
+  function envDiagnostic(bytes, chunks) {
+    return "transport=env bytes=" + bytes + " chunks=" + chunks;
+  }
+
+  function withEnvDiagnostic(message, bytes, chunks) {
+    return toText(message) + "（" + envDiagnostic(bytes, chunks) + "）";
+  }
+
+  /**
+   * 探测 canary：长度正好是 ENV_CHUNK_SIZE * ENV_PROBE_CHUNKS（384 码元），
+   * 拆成 3 个满长分块。这样既验证“多变量都传到了”，也验证“单个长值没有被截断”；
+   * 任一块缺失/变短都会让 stdout 与 canary 不相等。canary 本身不是密钥。
+   */
+  function buildProbeCanary() {
+    var seed = "agentcall-env-probe-" + Date.now().toString(36) + "-" + (Math.random().toString(36).slice(2, 10) || "0");
+    var target = ENV_CHUNK_SIZE * ENV_PROBE_CHUNKS;
+    var canary = "";
+    while (canary.length < target) canary += seed;
+    return canary.slice(0, target);
   }
 
   function toBase64Utf8(text) {
@@ -538,12 +609,26 @@
     }
 
     /**
-     * env 回退的固定命令：只有常量壳词、环境变量名与已校验的模块路径。
+     * env 回退的固定命令：只有常量壳词、环境变量名/索引与已校验的模块路径。
      * moduleDir 由 MODULE_DIR_PATTERN 限定为 [A-Za-z0-9._/-]，不含引号或 shell 元字符；
-     * 双引号保证 printf 只读取完整的环境变量值。负载永远不参与字符串拼接。
+     * 双引号保证 printf 只读取完整的环境变量值。分块数量只决定索引范围，负载内容
+     * 永远不参与字符串拼接（任务 11P：reassembly 保持 argv-free）。
      */
-    function envConfigCommand() {
-      return "printf '%s' \"$" + ENV_PAYLOAD_KEY + "\" | " + controlPath() + " config-set";
+    function envConfigCommand(chunkCount) {
+      return envPrintfCommand(ENV_PAYLOAD_VAR_PREFIX, chunkCount) + " | " + controlPath() + " config-set";
+    }
+
+    /** 回调/失败后立刻断开 env 引用；删除失败不改变结论。 */
+    function clearEnvMap(env) {
+      if (!env || typeof env !== "object") return;
+      var keys = Object.keys(env);
+      for (var index = 0; index < keys.length; index += 1) {
+        try {
+          delete env[keys[index]];
+        } catch (error) {
+          /* 清理失败不影响结果 */
+        }
+      }
     }
 
     function markEnvUnavailable() {
@@ -576,14 +661,22 @@
       }
       if (envProbePromise) return envProbePromise;
 
-      var canary = "agentcall-env-probe-" + Date.now().toString(36) + "-" + (Math.random().toString(36).slice(2, 10) || "0");
+      var canary = buildProbeCanary();
+      var canaryChunks = chunkText(canary, ENV_CHUNK_SIZE);
+      var probeNames = envChunkNames(ENV_PROBE_VAR_PREFIX, ENV_PROBE_CHUNKS);
       var probeEnv = {};
-      probeEnv[ENV_PROBE_KEY] = canary;
-      envProbePromise = runCommand(ENV_PROBE_COMMAND, probeEnv).then(
+      for (var probeIndex = 0; probeIndex < ENV_PROBE_CHUNKS; probeIndex += 1) {
+        probeEnv[probeNames[probeIndex]] = canaryChunks[probeIndex] || "";
+      }
+      canaryChunks = null;
+      envProbePromise = runCommand(envPrintfCommand(ENV_PROBE_VAR_PREFIX, ENV_PROBE_CHUNKS), probeEnv).then(
         function (raw) {
           // canary 不是密钥，但仍不保留环境对象与字符串引用。
+          clearEnvMap(probeEnv);
           probeEnv = null;
-          if (raw.errno === 0 && trimText(raw.stdout) === canary) {
+          var matched = raw.errno === 0 && trimText(raw.stdout) === canary;
+          canary = null;
+          if (matched) {
             markEnvAvailable();
             return true;
           }
@@ -591,7 +684,9 @@
           return false;
         },
         function () {
+          clearEnvMap(probeEnv);
           probeEnv = null;
+          canary = null;
           markEnvUnavailable();
           return false;
         },
@@ -781,35 +876,61 @@
       if (!validated.ok) return reject(CODE.PAYLOAD_INVALID, validated.message);
       var write = validated.write;
       var text = JSON.stringify(write);
-      if (utf8ByteLength(text) > CONFIG_WRITE_LIMIT_BYTES) {
-        return reject(CODE.PAYLOAD_INVALID, "配置补丁超过 stdin 上限（" + CONFIG_WRITE_LIMIT_BYTES + " 字节）");
+      var byteLength = utf8ByteLength(text);
+      if (byteLength > CONFIG_WRITE_LIMIT_BYTES) {
+        text = null;
+        return reject(CODE.PAYLOAD_INVALID, "配置补丁超过 stdin 上限（" + CONFIG_WRITE_LIMIT_BYTES + " 字节）；" + envDiagnostic(byteLength, 0));
+      }
+      var chunks = chunkText(text, ENV_CHUNK_SIZE);
+      var chunkCount = chunks.length;
+      if (chunkCount > ENV_CHUNK_CAP) {
+        text = null;
+        chunks = null;
+        return reject(
+          CODE.PAYLOAD_TOO_LARGE,
+          errorText(CODE.PAYLOAD_TOO_LARGE) + "（" + envDiagnostic(byteLength, chunkCount) + "）",
+        );
       }
       return probeEnvTransport().then(function (supported) {
         if (!supported || support.ioMode !== IO_MODE_ENV) {
           text = null;
-          return reject(CODE.SECRET_TRANSPORT_UNSUPPORTED);
+          chunks = null;
+          return reject(
+            CODE.SECRET_TRANSPORT_UNSUPPORTED,
+            errorText(CODE.SECRET_TRANSPORT_UNSUPPORTED) + "（" + envDiagnostic(byteLength, chunkCount) + "）",
+          );
         }
+        var names = envChunkNames(ENV_PAYLOAD_VAR_PREFIX, chunkCount);
         var env = {};
-        env[ENV_PAYLOAD_KEY] = text;
-        // env 已持有唯一副本：立即断开本地字符串引用。
+        for (var chunkIndex = 0; chunkIndex < chunkCount; chunkIndex += 1) {
+          env[names[chunkIndex]] = chunks[chunkIndex];
+        }
+        // env 已持有唯一副本：立即断开本地字符串/分块引用。
         text = null;
-        return runCommand(envConfigCommand(), env).then(function (raw) {
-          try {
-            delete env[ENV_PAYLOAD_KEY];
-          } catch (error) {
-            /* 清理失败不影响结果 */
-          }
+        chunks = null;
+        return runCommand(envConfigCommand(chunkCount), env).then(function (raw) {
+          clearEnvMap(env);
           env = null;
           var parsed = parseCliResult(raw);
           recordLog("config-set", raw.errno, parsed.ok ? "ok" : parsed.code);
           if (!parsed.ok) {
-            var failure = { ok: false, code: parsed.code, message: parsed.message, source: "bridge" };
+            var failure = {
+              ok: false,
+              code: parsed.code,
+              message: withEnvDiagnostic(parsed.message, byteLength, chunkCount),
+              source: "bridge",
+            };
             if (parsed.code === "config_conflict") failure.conflict = true;
             return failure;
           }
           var problem = verifyWrite(parsed.data, write.expectedRevision, write.patch && write.patch.secrets);
           if (problem) {
-            return { ok: false, code: problem, message: errorText(problem), source: "bridge" };
+            return {
+              ok: false,
+              code: problem,
+              message: withEnvDiagnostic(errorText(problem), byteLength, chunkCount),
+              source: "bridge",
+            };
           }
           state.revision = parsed.data.config.revision;
           return { ok: true, source: "bridge", data: parsed.data };
@@ -1469,6 +1590,11 @@
     ENDPOINT_FIELDS: ENDPOINT_FIELDS,
     MODES: MODES.slice(),
     CONFIG_WRITE_LIMIT_BYTES: CONFIG_WRITE_LIMIT_BYTES,
+    ENV_CHUNK_SIZE: ENV_CHUNK_SIZE,
+    ENV_CHUNK_CAP: ENV_CHUNK_CAP,
+    ENV_PROBE_CHUNKS: ENV_PROBE_CHUNKS,
+    ENV_PAYLOAD_VAR_PREFIX: ENV_PAYLOAD_VAR_PREFIX,
+    ENV_PROBE_VAR_PREFIX: ENV_PROBE_VAR_PREFIX,
     DEFAULT_OPENING_LINE: DEFAULT_OPENING_LINE,
     CODE: CODE,
     DEMO: DEMO,

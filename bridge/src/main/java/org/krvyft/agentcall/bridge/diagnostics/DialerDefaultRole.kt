@@ -98,6 +98,8 @@ class DialerDefaultRoleProbe(
 class AndroidDialerDefaultRoleProbe(
     private val dialHandler: () -> String?,
     private val roleManager: RoleManager?,
+    /** 机器码日志；默认丢弃，生产装配显式接 stderr。绝不输出异常文本/路径。 */
+    private val log: (String) -> Unit = {},
 ) : () -> DialerDefaultRole {
 
     private val probe = DialerDefaultRoleProbe(
@@ -117,6 +119,7 @@ class AndroidDialerDefaultRoleProbe(
         return try {
             manager.isRoleAvailable(RoleManager.ROLE_DIALER)
         } catch (t: Throwable) {
+            log("dialer_role_unavailable source=role_available code=reflection_throwable")
             null
         }
     }
@@ -133,6 +136,7 @@ class AndroidDialerDefaultRoleProbe(
             @Suppress("UNCHECKED_CAST")
             method.invoke(manager, RoleManager.ROLE_DIALER) as? List<String>
         } catch (t: Throwable) {
+            log("dialer_role_unavailable source=role_holders code=hidden_api_reflection_failed")
             null
         }
     }

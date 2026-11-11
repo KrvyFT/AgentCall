@@ -177,6 +177,7 @@ internal object BridgeRuntime {
         val dialerDefaultRole = AndroidDialerDefaultRoleProbe(
             dialHandler = { packages.dialHandlerPackage() },
             roleManager = RootFramework.roleManager(),
+            log = { System.err.println(it) },
         )
 
         val verifier = PeerVerifier(packages) { runCatching { store.readPairing() }.getOrNull() }
@@ -186,6 +187,7 @@ internal object BridgeRuntime {
             audioApiProbe = ReflectiveAudioApiProbe(),
             bridgeVersion = BridgeInfo.VERSION,
             packageProvider = packageProvider.kind.wireCode,
+            log = { System.err.println(it) },
         )
         // 环境在进程生命周期内固定（ROM/框架/桥接不变），只采集一次用于校准授权。
         val environment = probe.inspect().environment
@@ -637,9 +639,14 @@ internal class ControlDispatcher(
     } catch (error: CalibrationStoreException) {
         // 校准文件损坏/更新 schema/磁盘失败：机器码 + 固定短消息，不含路径。
         failure(request, error.code, error.message ?: error.code)
-    } catch (t: Exception) {
-        // 其它异常的文本可能含路径：只回类名。
-        failure(request, "internal_error", t.javaClass.simpleName)
+    } catch (t: Throwable) {
+        // 其它异常的文本可能含路径：只回类名。config-set 的反射/校验 Throwable 有
+        // 专用机器码，绝不回 internal_error。
+        if (request.method == RolePolicy.METHOD_CONFIG_WRITE) {
+            failure(request, ERROR_CONFIG_VALIDATION_UNAVAILABLE, "config validation could not be completed")
+        } else {
+            failure(request, "internal_error", t.javaClass.simpleName)
+        }
     }
 
     /**
@@ -1372,7 +1379,24 @@ internal class ControlDispatcher(
     private fun configWrite(request: RpcRequest): RpcResponse {
         val write = RpcCodec.decodeConfigWrite(request.payload)
             ?: return failure(request, "payload_invalid", "config patch payload is invalid")
-        return ok(request, RpcCodec.encodeRedacted(store.update(write.expectedRevision, write.patch)))
+        return try {
+            ok(request, RpcCodec.encodeRedacted(store.update(write.expectedRevision, write.patch)))
+        } catch (error: ConfigStoreException) {
+            // 保留既有机器码（冲突/字段非法/磁盘失败）。
+            throw error
+        } catch (t: Throwable) {
+            // 隐藏 API/反射/校验依赖抛出的 Throwable（含 Error）绝不能让保存变成
+            // internal_error：只回固定机器码，日志只含类名，不含负载/路径。
+            System.err.println(
+                "config_write_failed code=" + ERROR_CONFIG_VALIDATION_UNAVAILABLE +
+                    " cause=" + t.javaClass.simpleName,
+            )
+            failure(
+                request,
+                ERROR_CONFIG_VALIDATION_UNAVAILABLE,
+                "config validation could not be completed",
+            )
+        }
     }
 
     /**
@@ -1489,6 +1513,9 @@ internal class ControlDispatcher(
         const val MAX_SESSION_REQUEST_CHARS: Int = 1024
         const val MAX_ERROR_TEXT_CHARS: Int = 200
         const val MAX_APP_COMMAND_CHARS: Int = 128
+
+        /** config-set 的反射/校验依赖抛 Throwable 时的固定机器码（绝不回 internal_error）。 */
+        const val ERROR_CONFIG_VALIDATION_UNAVAILABLE: String = "config_validation_unavailable"
 
         /** APP session.command 的唯一线格式字段表：多一个键就是 payload_invalid。 */
         val APP_COMMAND_KEYS = setOf("command")

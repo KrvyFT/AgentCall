@@ -11,8 +11,9 @@ const require = createRequire(import.meta.url);
 const B = require("../bridge.js");
 
 const SECRET = "sk-live-DO-NOT-LEAK-9f8e7d6c";
-const ENV_PROBE_COMMAND = 'printf \'%s\' "$AGENTCALL_PROBE"';
-const ENV_CONFIG_COMMAND = 'printf \'%s\' "$AGENTCALL_CFG_PAYLOAD" | ' + CTL + " config-set";
+const ENV_PROBE_COMMAND =
+  'printf \'%s\' "$AGENTCALL_PROBE_0" "$AGENTCALL_PROBE_1" "$AGENTCALL_PROBE_2"';
+const ENV_CONFIG_COMMAND = 'printf \'%s\' "$AGENTCALL_CFG_PAYLOAD_0" | ' + CTL + " config-set";
 
 function redacted(overrides, secrets) {
   return JSON.stringify({

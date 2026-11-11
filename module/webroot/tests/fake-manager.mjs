@@ -24,6 +24,33 @@ export function fakeManager(options) {
   const failFlush = opts.failFlush === true;
   // undefined = 管理器透传 options.env（默认）；false = 静默忽略 env；"error" = exec 抛错。
   const envSupport = opts.envSupport === undefined ? true : opts.envSupport;
+  // 模拟真实管理器对 exec env 的两种已知限制：单个值被截断、某个变量根本没传进来。
+  const envValueMaxChars = typeof opts.envValueMaxChars === "number" ? opts.envValueMaxChars : null;
+  const envDropKeys = new Set(Array.isArray(opts.envDropKeys) ? opts.envDropKeys : []);
+
+  function deliveredEnv(env) {
+    const delivered = {};
+    for (const key of Object.keys(env)) {
+      if (envDropKeys.has(key)) continue;
+      const raw = String(env[key]);
+      delivered[key] = envValueMaxChars === null ? raw : raw.slice(0, envValueMaxChars);
+    }
+    return delivered;
+  }
+
+  /** 按前缀 + 数字后缀收集分块环境变量，并按索引顺序拼接。 */
+  function reassemble(env, prefix) {
+    const pattern = new RegExp("^" + prefix + "(\\d+)$");
+    return Object.keys(env)
+      .map((key) => {
+        const match = pattern.exec(key);
+        return match ? { index: Number(match[1]), value: String(env[key]) } : null;
+      })
+      .filter((entry) => entry !== null)
+      .sort((left, right) => left.index - right.index)
+      .map((entry) => entry.value)
+      .join("");
+  }
 
   function parseOptions(optionsJson) {
     if (!optionsJson) return {};
@@ -174,13 +201,11 @@ export function fakeManager(options) {
       }
 
       let result;
-      if (command.indexOf("$AGENTCALL_PROBE") !== -1) {
-        // 能力探测：只回显环境变量；忽略 env 的管理器会得到空 stdout。
-        result =
-          envSupport === false
-            ? { errno: 0, stdout: "", stderr: "" }
-            : { errno: 0, stdout: String(env.AGENTCALL_PROBE || ""), stderr: "" };
-      } else if (command.indexOf("$AGENTCALL_CFG_PAYLOAD") !== -1 && /\sconfig-set$/.test(command)) {
+      if (command.indexOf("$AGENTCALL_PROBE_") !== -1) {
+        // 能力探测：分块回显；忽略 env 或分块缺失时 stdout 与 canary 不等。
+        const delivered = envSupport === false ? {} : deliveredEnv(env);
+        result = { errno: 0, stdout: reassemble(delivered, "AGENTCALL_PROBE_"), stderr: "" };
+      } else if (command.indexOf("$AGENTCALL_CFG_PAYLOAD_") !== -1 && /\sconfig-set$/.test(command)) {
         if (envSupport === false) {
           // 忽略 env：子进程读到空 stdin，CLI 报负载非法；这是“不该发生”的成功。
           result = opts.envIgnoredResult || {
@@ -189,7 +214,8 @@ export function fakeManager(options) {
             stderr: "",
           };
         } else {
-          const payload = String(env.AGENTCALL_CFG_PAYLOAD === undefined ? "" : env.AGENTCALL_CFG_PAYLOAD);
+          // 只按命令实际引用的分块变量（前缀 + 索引）重组 stdin，顺序由索引决定。
+          const payload = reassemble(deliveredEnv(env), "AGENTCALL_CFG_PAYLOAD_");
           envPayloads.push(payload);
           // 兼容既有 app 测试：env 负载也记录成一次“写入”。
           writes.push({ path: "(exec-env)", text: payload });

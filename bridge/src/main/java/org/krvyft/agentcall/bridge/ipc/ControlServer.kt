@@ -252,9 +252,11 @@ class ControlServer(
 
     private fun dispatch(identity: PeerIdentity, request: RpcRequest): RpcResponse = try {
         handler.handle(identity, request)
-    } catch (t: Exception) {
-        // 不把异常文本回给对端：可能含路径或凭据。
-        RpcResponse(id = request.id, error = RpcError(ERROR_INTERNAL, t.javaClass.simpleName))
+    } catch (t: Throwable) {
+        // 不把异常文本回给对端：可能含路径或凭据。隐藏 API/反射可能抛 Error，
+        // 也必须在这里收口，不能让一条反射失败打断连接；config-set 使用专用机器码。
+        val code = if (request.method == RolePolicy.METHOD_CONFIG_WRITE) ERROR_CONFIG_VALIDATION_UNAVAILABLE else ERROR_INTERNAL
+        RpcResponse(id = request.id, error = RpcError(code, t.javaClass.simpleName))
     }
 
     // ------------------------------------------------------------------ PCM 通道
@@ -399,6 +401,9 @@ class ControlServer(
 
         const val ERROR_FORBIDDEN: String = "forbidden"
         const val ERROR_INTERNAL: String = "internal_error"
+
+        /** config-set 的反射/校验 Throwable 专用机器码；绝不回 internal_error。 */
+        const val ERROR_CONFIG_VALIDATION_UNAVAILABLE: String = "config_validation_unavailable"
 
         /** 命令 lane 饱和：有界失败（APP 可重试），绝不排队等 4 s 再超时。 */
         const val ERROR_COMMAND_LANE_BUSY: String = "command_lane_busy"
