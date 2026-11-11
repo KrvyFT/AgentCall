@@ -3,7 +3,7 @@ package org.krvyft.agentcall.bridge.diagnostics
 import android.os.Build
 import java.io.File
 import java.security.MessageDigest
-import org.krvyft.agentcall.bridge.ipc.PackageIdentitySource
+import org.krvyft.agentcall.bridge.ipc.PackageFactsSource
 import org.krvyft.agentcall.bridge.ipc.PeerVerifier
 import org.krvyft.agentcall.core.model.CapabilityReport
 import org.krvyft.agentcall.core.model.CapabilityStatus
@@ -289,18 +289,26 @@ class ReflectiveAudioApiProbe : AudioApiProbe {
  *   UNKNOWN，只能由 root 操作员背书，不猜默认值。
  */
 class DeviceProbe(
-    private val packages: PackageIdentitySource,
+    private val packages: PackageFactsSource,
     private val platform: PlatformFacts = AndroidPlatformFacts(),
     private val audioApiProbe: AudioApiProbe = ReflectiveAudioApiProbe(),
     private val clockMs: () -> Long = { System.currentTimeMillis() },
     private val bridgeVersion: String,
     private val dialerPackage: String = PeerVerifier.DIALER_PACKAGE,
+    /** 设备日志/诊断里的包事实 provider 码（context|appglobals|binder|shell）；null = 未接线。 */
+    private val packageProvider: String? = null,
 ) {
 
     fun inspect(): CapabilityReport {
         val visibleMethods = audioApiProbe.visibleMethods()
-        val dialerVersion = packages.versionName(dialerPackage) ?: UNKNOWN
-        val dialerSignature = packages.signatureSha256(dialerPackage) ?: UNKNOWN
+        // 一次查询同时拿到拨号器版本/签名/uid；shell 回退的签名是显式 null（UNKNOWN）。
+        val dialerFacts = if (dialerPackage == PeerVerifier.DIALER_PACKAGE) {
+            packages.dialerPackageFacts()
+        } else {
+            packages.packageFacts(dialerPackage)
+        }
+        val dialerVersion = dialerFacts.versionName ?: UNKNOWN
+        val dialerSignature = dialerFacts.signatureSha256 ?: UNKNOWN
         val environment = EnvironmentKey(
             apiLevel = platform.apiLevel(),
             romFingerprint = platform.romFingerprint(),
@@ -320,10 +328,11 @@ class DeviceProbe(
             visibleMethods.sorted().joinToString("|")
         }
         val notes = "audio:UNTESTED permissions:UNTESTED selinux:UNVERIFIED " +
-            "dialerPackage=" + dialerPackage +
+            "dialerPackage=" + dialerFacts.packageName +
             " dialerVersion=" + dialerVersion +
             " dialerSignatureSha256=" + dialerSignature +
-            " hiddenApi=" + hiddenApi
+            " hiddenApi=" + hiddenApi +
+            " packageProvider=" + (packageProvider ?: UNKNOWN)
         return CapabilityReport(
             environment = environment,
             downlinkExtraction = visibleStatus(visibleMethods, ReflectiveAudioApiProbe.DOWNLINK_METHOD),

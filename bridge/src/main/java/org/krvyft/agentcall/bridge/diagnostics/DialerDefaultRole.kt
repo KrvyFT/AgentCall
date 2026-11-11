@@ -1,9 +1,6 @@
 package org.krvyft.agentcall.bridge.diagnostics
 
 import android.app.role.RoleManager
-import android.content.Intent
-import android.content.pm.PackageManager
-import android.net.Uri
 import org.krvyft.agentcall.bridge.ipc.PeerVerifier
 
 /**
@@ -86,22 +83,26 @@ class DialerDefaultRoleProbe(
 }
 
 /**
- * 生产探测：系统 [RoleManager]（ROLE_DIALER 持有者）+ [PackageManager]
- * （`ACTION_DIAL` 默认处理器）。
+ * 生产探测：系统 [RoleManager]（ROLE_DIALER 持有者）+ 分层包事实 provider 的
+ * `ACTION_DIAL` 默认处理器。
  *
  * 两者都是本地调用。`RoleManager` 通过反射拿到的系统 Context 可能不可用（不同 ROM 的
  * 隐藏 API 策略不同）：此时角色事实不可读，由 [DialerDefaultRoleProbe] 回落为负证据/未知。
  * `isRoleAvailable(ROLE_DIALER) == false`（系统没有该角色机制）单独上报为“机制不可用”，
  * 由探测直接 fail closed 为 UNKNOWN，而不是当成“Google 电话不是默认拨号器”。
+ *
+ * Task 11N：处理器事实不再直接依赖 PackageManager——context provider 用公开
+ * `resolveActivity`，AppGlobals/binder provider 用反射 `resolveIntent`，shell provider 用
+ * `resolve-activity --brief`；任一路径拿不到事实时返回 null，判定保持 UNKNOWN。
  */
 class AndroidDialerDefaultRoleProbe(
-    private val packageManager: PackageManager,
+    private val dialHandler: () -> String?,
     private val roleManager: RoleManager?,
 ) : () -> DialerDefaultRole {
 
     private val probe = DialerDefaultRoleProbe(
         roleHolders = { roleHolders() },
-        dialHandlerPackage = { dialHandlerPackage() },
+        dialHandlerPackage = { dialHandler() },
         roleMechanismAvailable = { roleMechanismAvailable() },
     )
 
@@ -136,18 +137,4 @@ class AndroidDialerDefaultRoleProbe(
         }
     }
 
-    private fun dialHandlerPackage(): String? {
-        // MATCH_DEFAULT_ONLY：只返回默认处理器，不返回候选列表。
-        val withPhoneData = Intent(Intent.ACTION_DIAL, Uri.fromParts("tel", "", null))
-            .addCategory(Intent.CATEGORY_DEFAULT)
-        val withoutData = Intent(Intent.ACTION_DIAL).addCategory(Intent.CATEGORY_DEFAULT)
-        for (intent in listOf(withPhoneData, withoutData)) {
-            val packageName = packageManager
-                .resolveActivity(intent, PackageManager.MATCH_DEFAULT_ONLY)
-                ?.activityInfo
-                ?.packageName
-            if (packageName != null) return packageName
-        }
-        return null
-    }
 }

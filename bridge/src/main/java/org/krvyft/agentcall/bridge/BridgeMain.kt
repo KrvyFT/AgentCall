@@ -36,10 +36,10 @@ import org.krvyft.agentcall.bridge.diagnostics.DeviceProbe
 import org.krvyft.agentcall.bridge.diagnostics.DialerDefaultRole
 import org.krvyft.agentcall.bridge.diagnostics.PlatformFacts
 import org.krvyft.agentcall.bridge.diagnostics.ReflectiveAudioApiProbe
-import org.krvyft.agentcall.bridge.ipc.AndroidPackageIdentitySource
+import org.krvyft.agentcall.bridge.diagnostics.AndroidPackageFactsProvider
 import org.krvyft.agentcall.bridge.ipc.ControlServer
 import org.krvyft.agentcall.bridge.ipc.HookCommandRouter
-import org.krvyft.agentcall.bridge.ipc.PackageIdentitySource
+import org.krvyft.agentcall.bridge.ipc.PackageFactsSource
 import org.krvyft.agentcall.bridge.ipc.PeerVerifier
 import org.krvyft.agentcall.bridge.ipc.RootFramework
 import org.krvyft.agentcall.bridge.ipc.RpcHandler
@@ -104,7 +104,7 @@ internal object BridgeInfo {
 /**
  * 特权运行容器的进程入口（app_process 按类名加载）。
  *
- * 只做四件事：解析配置目录、取系统 PackageManager、启动 [ControlServer] 与监督角色、
+ * 只做四件事：解析配置目录、解析包事实 provider、启动 [ControlServer] 与监督角色、
  * 等待 shutdown。任何不可用条件都以机器可读错误码退出，绝不降级为“信任所有对端”。
  */
 object BridgeMain {
@@ -142,15 +142,20 @@ internal object BridgeRuntime {
             return 1
         }
 
-        // 没有系统 PackageManager 就无法核验包名/签名：必须失败退出，而不是信任消息自述。
-        val packageManager = RootFramework.packageManager()
-        if (packageManager == null) {
+        // 包事实来源分层获取（Task 11N）：context → appglobals → binder → shell 回退。
+        // 没有任何 provider 才失败退出；shell 路径签名不可验证，连接核验会 fail closed，
+        // 绝不降级为“信任消息自述”。选择结果由链输出 package_provider=<code>。
+        val packageProvider = AndroidPackageFactsProvider.resolve()
+        if (packageProvider == null) {
             System.err.println(
-                machineErrorJson("package_manager_unavailable", "system PackageManager is unavailable in this process"),
+                machineErrorJson(
+                    "package_manager_unavailable",
+                    "no package facts provider is available (context/appglobals/binder/shell)",
+                ),
             )
             return 1
         }
-        val packages: PackageIdentitySource = AndroidPackageIdentitySource(packageManager)
+        val packages: PackageFactsSource = packageProvider.source
 
         val store = try {
             ConfigStore(root)
@@ -167,7 +172,12 @@ internal object BridgeRuntime {
 
         // 默认拨号器事实：系统 RoleManager（权威）+ ACTION_DIAL 默认处理器（负证据）。
         // 两者都是本地查询；不可读时探测返回 UNKNOWN，status 线上值是字符串 "unknown"。
-        val dialerDefaultRole = AndroidDialerDefaultRoleProbe(packageManager, RootFramework.roleManager())
+        // 默认处理器事实也走分层 provider：context 路径用 PackageManager，binder/shell
+        // 路径用各自的反射/命令；读不到时探测保持 UNKNOWN（不猜默认拨号器）。
+        val dialerDefaultRole = AndroidDialerDefaultRoleProbe(
+            dialHandler = { packages.dialHandlerPackage() },
+            roleManager = RootFramework.roleManager(),
+        )
 
         val verifier = PeerVerifier(packages) { runCatching { store.readPairing() }.getOrNull() }
         val probe = DeviceProbe(
@@ -175,6 +185,7 @@ internal object BridgeRuntime {
             platform = AndroidPlatformFacts(),
             audioApiProbe = ReflectiveAudioApiProbe(),
             bridgeVersion = BridgeInfo.VERSION,
+            packageProvider = packageProvider.kind.wireCode,
         )
         // 环境在进程生命周期内固定（ROM/框架/桥接不变），只采集一次用于校准授权。
         val environment = probe.inspect().environment
@@ -529,7 +540,7 @@ internal fun resolveConfigRoot(args: Array<String>): File {
  */
 internal class ControlDispatcher(
     private val store: ConfigStore,
-    private val packages: PackageIdentitySource,
+    private val packages: PackageFactsSource,
     private val probe: DeviceProbe,
     /**
      * 判定/校准使用的当前环境。生产装配注入**进程启动时采集一次**的环境：自动接听授权、

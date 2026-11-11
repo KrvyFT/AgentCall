@@ -2,8 +2,10 @@ package org.krvyft.agentcall.bridge.ipc
 
 import android.app.role.RoleManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.LocalSocket
+import android.net.Uri
 import java.io.IOException
 import java.security.MessageDigest
 import org.krvyft.agentcall.bridge.config.PairingRecord
@@ -24,10 +26,40 @@ sealed interface PeerVerification {
 }
 
 /**
- * 包名/签名/版本查询。生产实现使用系统 PackageManager；仪器测试注入真实
- * PackageManager，JVM 测试不应伪造内核凭据。
+ * 包事实（Task 11N）：PeerVerifier 的连接核验与 DeviceProbe 的诊断报告共用的最小事实集。
+ * 任何字段解析不出来都保持 null，由调用方 fail closed（未知签名绝不当成匹配）。
  */
-interface PackageIdentitySource {
+data class PackageFacts(
+    val packageName: String,
+    val versionName: String? = null,
+    val signatureSha256: String? = null,
+    val uid: Int? = null,
+)
+
+/**
+ * 分层 PackageManager 获取路径；[wireCode] 是设备日志里的机器可读值
+ * （`package_provider=context|appglobals|binder|shell`）。
+ */
+enum class PackageProviderKind(val wireCode: String) {
+    /** ActivityThread.systemMain().getSystemContext().getPackageManager()。 */
+    CONTEXT("context"),
+
+    /** android.app.AppGlobals.getPackageManager()（隐藏 API 反射，返回 IPackageManager）。 */
+    APP_GLOBALS("appglobals"),
+
+    /** ServiceManager.getService("package") + IPackageManager$Stub.asInterface。 */
+    BINDER("binder"),
+
+    /** /system/bin/pm 或 cmd package 的 shell 回退（签名摘要不可验证）。 */
+    SHELL("shell"),
+}
+
+/**
+ * 包名/签名/版本查询。生产实现使用分层的系统 PackageManager 获取路径（context →
+ * appglobals → binder → shell 回退）；仪器测试注入真实 PackageManager，JVM 测试不应
+ * 伪造内核凭据。
+ */
+interface PackageFactsSource {
     /** 该 UID 拥有的已安装包；共享 UID 可能有多个。 */
     fun packagesForUid(uid: Int): List<String>
 
@@ -39,47 +71,81 @@ interface PackageIdentitySource {
 
     /** 包当前安装所属的 Linux uid；未安装或无法解析返回 null。配对时记录，连接时复核。 */
     fun uidForPackage(packageName: String): Int?
+
+    /** 一次性读取一个包的全部事实；默认实现逐项查询，实现可覆盖为单次查询。 */
+    fun packageFacts(packageName: String): PackageFacts = PackageFacts(
+        packageName = packageName,
+        versionName = versionName(packageName),
+        signatureSha256 = signatureSha256(packageName),
+        uid = uidForPackage(packageName),
+    )
+
+    /** 拨号器事实（DeviceProbe 诊断上报）。 */
+    fun dialerPackageFacts(): PackageFacts = packageFacts(PeerVerifier.DIALER_PACKAGE)
+
+    /**
+     * `ACTION_DIAL + CATEGORY_DEFAULT` 的默认处理器包名（默认拨号器探测的负证据）。
+     * 无法证明时返回 null，探测据此保持 UNKNOWN，绝不猜默认拨号器。
+     */
+    fun dialHandlerPackage(): String? = null
 }
 
-/** [PackageIdentitySource] 的 Android 实现（PackageManager）。 */
-class AndroidPackageIdentitySource(private val packageManager: PackageManager) : PackageIdentitySource {
+/** 兼容旧名字：连接核验与诊断只依赖这套事实集。 */
+typealias PackageIdentitySource = PackageFactsSource
+
+/** [PackageFactsSource] 的 Android Context/PackageManager 实现（分层路径的第一层）。 */
+class AndroidPackageIdentitySource(private val packageManager: PackageManager) : PackageFactsSource {
 
     override fun packagesForUid(uid: Int): List<String> =
         packageManager.getPackagesForUid(uid)?.toList().orEmpty()
 
-    override fun signatureSha256(packageName: String): String? {
+    override fun signatureSha256(packageName: String): String? =
+        packageFacts(packageName).signatureSha256
+
+    override fun versionName(packageName: String): String? =
+        packageFacts(packageName).versionName
+
+    override fun uidForPackage(packageName: String): Int? =
+        packageFacts(packageName).uid
+
+    override fun dialHandlerPackage(): String? {
+        // MATCH_DEFAULT_ONLY：只返回默认处理器，不返回候选列表。
+        for (intent in dialIntents()) {
+            val packageName = packageManager
+                .resolveActivity(intent, PackageManager.MATCH_DEFAULT_ONLY)
+                ?.activityInfo
+                ?.packageName
+            if (packageName != null) return packageName
+        }
+        return null
+    }
+
+    override fun packageFacts(packageName: String): PackageFacts {
         val info = try {
             packageManager.getPackageInfo(packageName, GET_SIGNING_CERTIFICATES)
         } catch (missing: PackageManager.NameNotFoundException) {
-            return null
+            return PackageFacts(packageName)
         }
-        val signingInfo = info.signingInfo ?: return null
-        val signer = signingInfo.apkContentsSigners?.firstOrNull() ?: return null
-        return PeerVerifier.sha256Hex(signer.toByteArray())
-    }
-
-    override fun versionName(packageName: String): String? {
-        val info = try {
-            packageManager.getPackageInfo(packageName, 0)
-        } catch (missing: PackageManager.NameNotFoundException) {
-            return null
-        }
-        return info.versionName
-    }
-
-    override fun uidForPackage(packageName: String): Int? {
-        val info = try {
-            packageManager.getPackageInfo(packageName, 0)
-        } catch (missing: PackageManager.NameNotFoundException) {
-            return null
-        }
-        val applicationInfo = info.applicationInfo ?: return null
-        return applicationInfo.uid
+        val signer = info.signingInfo?.apkContentsSigners?.firstOrNull()
+        return PackageFacts(
+            packageName = packageName,
+            versionName = info.versionName,
+            signatureSha256 = signer?.let { PeerVerifier.sha256Hex(it.toByteArray()) },
+            uid = info.applicationInfo?.uid,
+        )
     }
 
     private companion object {
         /** PackageManager.GET_SIGNING_CERTIFICATES 的字面值，避免 API 级别分支。 */
         const val GET_SIGNING_CERTIFICATES: Int = 0x08000000
+
+        fun dialIntents(): List<Intent> {
+            val withData = Intent(Intent.ACTION_DIAL, Uri.fromParts("tel", "", null))
+                .addCategory(Intent.CATEGORY_DEFAULT)
+            val withoutData = Intent(Intent.ACTION_DIAL)
+                .addCategory(Intent.CATEGORY_DEFAULT)
+            return listOf(withData, withoutData)
+        }
     }
 }
 
