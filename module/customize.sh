@@ -9,8 +9,11 @@
 #
 # 明确不做：不改 Google 电话默认角色，不改 vendor 音频策略，不改 webroot 权限
 # （KernelSU 安装时自动设置，用户不要覆盖），不写 system.prop，不动 SELinux。
-
-set -u
+#
+# 本脚本由 KernelSU 安装器 source 执行，绝不能在这里启用 nounset（set -u）：
+# 它会泄漏进安装器自身的 set_perm/set_perm_recursive，而这两个 util 函数直接
+# 展开可选的 SELinux context（$5/$6）；省略该参数时安装会以
+# “5: parameter not set” 中止（KernelSU 报 Failed to install module script）。
 
 ui_print "- AgentCall: 校验模块内容与权限"
 
@@ -27,10 +30,12 @@ if [ ! -f "$MODPATH/webroot/index.html" ]; then
     abort "AgentCall 模块缺少 webroot/index.html"
 fi
 
-set_perm "$MODPATH/bin/agentcallctl" 0 0 0755
+# 可选 context 显式传空串：安装器 shell 若已开着 nounset，省略参数会中止安装；
+# 空串在 KernelSU util 中表示使用默认/保留 context。
+set_perm "$MODPATH/bin/agentcallctl" 0 0 0755 ""
 
 if [ -d "$MODPATH/bridge" ]; then
-    set_perm_recursive "$MODPATH/bridge" 0 0 0755 0644
+    set_perm_recursive "$MODPATH/bridge" 0 0 0755 0644 ""
 fi
 
 # webroot 的权限与 SELinux context 由 KernelSU 安装时统一设置；这里刻意不碰。

@@ -8,6 +8,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
@@ -142,6 +143,103 @@ test("customize.sh 只补固定包装器可执行位，不改 webroot 官方权�
   assert.equal(/chmod[^\n]*webroot|set_perm[^\n]*webroot/.test(customize), false, "webroot 权限由 KernelSU 安装器统一管理");
   assert.match(customize, /abort/, "缺失桥接容器/命令包装器时必须中止安装而非半装");
   assert.equal(/sys\.prop|resetprop|setenforce|settings put/.test(customize), false, "安装脚本不得改系统属性、SELinux 或默认应用");
+});
+
+test("customize.sh：KernelSU 以 source 加载时 nounset 不得泄漏进安装器 util", () => {
+  const customize = read("customize.sh");
+  const harnessRoot = mkdtempSync(join(tmpdir(), "agentcall-customize-"));
+
+  try {
+    const modpath = join(harnessRoot, "modules_update", "agentcall");
+    const dataRoot = join(harnessRoot, "data", "adb", "agentcall");
+    const logFile = join(harnessRoot, "installer.log");
+    const harness = join(harnessRoot, "installer.sh");
+
+    mkdirSync(join(modpath, "bin"), { recursive: true });
+    mkdirSync(join(modpath, "bridge"), { recursive: true });
+    mkdirSync(join(modpath, "webroot"), { recursive: true });
+    writeFileSync(join(modpath, "bin", "agentcallctl"), "#!/system/bin/sh\nexit 0\n", { mode: 0o755 });
+    writeFileSync(join(modpath, "bridge", "agentcall-bridge.jar"), "test container\n");
+    writeFileSync(join(modpath, "webroot", "index.html"), "<!doctype html>\n");
+
+    // 数据目录是设备绝对路径；宿主上只把这一行改到临时目录，其余脚本内容保持原样。
+    const redirected = customize.replace(
+      /^DATA_ROOT=\/data\/adb\/agentcall$/m,
+      "DATA_ROOT=" + dataRoot,
+    );
+    assert.notEqual(redirected, customize, "customize.sh 必须仍以 DATA_ROOT=/data/adb/agentcall 创建私有目录");
+    writeFileSync(join(modpath, "customize.sh"), redirected);
+
+    // 复刻 KernelSU installer.sh 的最坏情况：安装器 shell 已开启 nounset，
+    // set_perm/set_perm_recursive 像 util 函数一样直接读取可选位置参数 $5/$6。
+    writeFileSync(harness, [
+      "set -u",
+      'MODPATH="$1"',
+      'LOG="$2"',
+      "ui_print() { printf 'ui_print %s\\n' \"$1\" >> \"$LOG\"; }",
+      "abort() { printf 'abort %s\\n' \"$1\" >> \"$LOG\"; exit 1; }",
+      "set_perm() {",
+      '  local context="$5"',
+      "  printf 'set_perm argc=%s target=%s context=[%s]\\n' \"$#\" \"$1\" \"$context\" >> \"$LOG\"",
+      "}",
+      "set_perm_recursive() {",
+      '  local file_mode="$5"',
+      '  local context="$6"',
+      "  printf 'set_perm_recursive argc=%s target=%s file_mode=%s context=[%s]\\n' \"$#\" \"$1\" \"$file_mode\" \"$context\" >> \"$LOG\"",
+      "}",
+      '. "$MODPATH/customize.sh"',
+      "printf 'HARNESS_OK\\n' >> \"$LOG\"",
+      "",
+    ].join("\n"));
+
+    const result = spawnSync("sh", [harness, modpath, logFile], { encoding: "utf8" });
+    assert.equal(
+      result.status,
+      0,
+      "source customize.sh 失败（nounset 泄漏或可选 context 未绑定）：\n" +
+        (result.stderr || result.stdout),
+    );
+
+    const log = readFileSync(logFile, "utf8");
+    assert.match(log, /HARNESS_OK/, "安装脚本必须在 source 后跑完");
+
+    for (const relative of ["", "inbox", "logs"]) {
+      const dir = join(dataRoot, relative);
+      assert.ok(existsSync(dir), "安装未创建数据目录 " + (relative || "."));
+      assert.equal(statSync(dir).mode & 0o777, 0o700, "数据目录必须是 0700：" + dir);
+    }
+
+    // 空串也是实参：argc 证明调用点显式传了可选 context，而不是让 util 展开未绑定变量。
+    assert.match(
+      log,
+      /^set_perm argc=5 target=.*\/bin\/agentcallctl context=\[\]$/m,
+      "set_perm 必须带显式空 context 调用",
+    );
+    assert.match(
+      log,
+      /^set_perm_recursive argc=6 target=.*\/bridge file_mode=0644 context=\[\]$/m,
+      "set_perm_recursive 必须带显式空 context 调用",
+    );
+
+    // 静态不变量：脚本本身不得再打开 nounset（会被 source 进安装器 shell）。
+    assert.equal(
+      /^[ \t]*set[ \t]+-[A-Za-z]*u/m.test(customize),
+      false,
+      "customize.sh 被 KernelSU source，不得启用 set -u",
+    );
+    assert.match(
+      customize,
+      /^set_perm "\$MODPATH\/bin\/agentcallctl" 0 0 0755 ""$/m,
+      "set_perm 的可选 context 必须显式传空串",
+    );
+    assert.match(
+      customize,
+      /^[ \t]*set_perm_recursive "\$MODPATH\/bridge" 0 0 0755 0644 ""$/m,
+      "set_perm_recursive 的可选 context 必须显式传空串",
+    );
+  } finally {
+    rmSync(harnessRoot, { recursive: true, force: true });
+  }
 });
 
 test("customize.sh：安装时清理 inbox 中 WebView 崩溃遗留的 config-set 负载", () => {
