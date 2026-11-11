@@ -197,11 +197,15 @@ inbox 中的一次性明文负载只在一次保存期间存在（仅 ksu.io 首
      “从 stdin 读 config-set”。每次保存使用唯一文件名，两个 WebUI 实例不会互相覆盖负载
      （固定路径曾让 A 的 CLI 读到 B 的 payload，CAS 仍可能通过）。
   2. **`ksu.exec` + env 回退**：`ksu.io` 不可用（缺少 `File`/`FileOutputStream`，或
-     `support: false`）但 exec 支持 `options.env` 时，执行**完全固定**的命令
-     `printf '%s' "$AGENTCALL_CFG_PAYLOAD" | <moduleDir>/bin/agentcallctl config-set`，
+     `support: false`）但 exec 支持 `options.env` 时，把 JSON 拆成
+     `AGENTCALL_CFG_PAYLOAD_0..N`（每块 128 UTF-16 码元、绝不拆代理对、最多 64 块），
+     再执行**完全固定**的命令
+     `printf '%s' "$AGENTCALL_CFG_PAYLOAD_0" ... "$AGENTCALL_CFG_PAYLOAD_N" | <moduleDir>/bin/agentcallctl config-set`。
+     变量名/索引范围由分块数量生成；`printf` 的多个 `%s` 参数按顺序拼接后写入 stdin。
      JSON 只经 exec options 的 env map
-     `{ "env": { "AGENTCALL_CFG_PAYLOAD": "<json>" } }` 传入。命令字符串里只有环境变量名，
-     没有负载；不 base64 进 argv，不写 URL/日志。管理器未透传 env 时探测失败，保存 fail closed。
+     `{ "env": { "AGENTCALL_CFG_PAYLOAD_0": "<chunk0>", ... } }` 传入。命令字符串里只有
+     环境变量名与固定索引，没有负载；不 base64 进 argv，不写 URL/日志。管理器未透传 env、
+     分块被截断或缺失时探测失败，保存 fail closed；超过 64 块返回 `payload_too_large`。
   3. **两种都不可用**：只读态，`config-set` 被拒绝并返回
      `secret_transport_unsupported`；提示升级管理器，或在 root shell 用
      `agentcallctl config-set < <负载文件>` 从 stdin 提交。
@@ -276,6 +280,7 @@ inbox 中的一次性明文负载只在一次保存期间存在（仅 ksu.io 首
 | `unsupported_operation` | 不在固定命令表内 | 拒绝，不拼 shell |
 | `payload_not_allowed` | 无参数命令收到负载 | 拒绝，不执行 |
 | `payload_invalid` | 负载不符合固定字段表/大小上限 | 拒绝，不执行 |
+| `payload_too_large` | 负载超过 env 分块上限（64 × 128 码元） | 拒绝，不执行；消息含 `transport=env bytes=<n> chunks=<k>` |
 | `transport_failed` | 命令超时、socket 不可达或 CLI 退出码非 0 | 报错；不宣称保存 |
 | `response_invalid` | CLI 输出不是合法 JSON | 报错；不宣称保存 |
 | `save_unconfirmed` | 写入响应未确认新 revision/密钥状态 | 不显示成功 |
@@ -299,6 +304,7 @@ inbox 中的一次性明文负载只在一次保存期间存在（仅 ksu.io 首
 | `calibration_unavailable` | 校准存储未接线或不可用；不得假装已验证 |
 | `calibration_environment_unknown` | 当前/预期环境事实不完整，拒绝把校准绑定到不可复现环境 |
 | `calibration_environment_mismatch` | 预期环境与当前设备环境不一致 |
+| `config_validation_unavailable` | config-set 的反射/校验依赖抛 Throwable（含隐藏 API Error）；只回固定机器码，不得回成 `internal_error` |
 | `internal_error` | 未预期异常（只回类名） |
 
 业务校验 issue code（`config_invalid` 消息内）：`ANSWER_DELAY_OUT_OF_RANGE`、
@@ -527,7 +533,7 @@ CLI 结果最多 25 s、等桥接退出最多 10 s；`uninstall.sh` 相同，最
 | 状态 | 条件 | 能力 |
 | --- | --- | --- |
 | `kernelsu` / `ioMode=file`（首选） | 有 `ksu.exec`、`ksu.io` 的 `File`+`FileOutputStream`（`support !== false`）、模块目录可信（`moduleInfo` 缺少 `moduleDir` 时回退固定路径） | 全部固定操作（WebUI 使用其中七条：status/config-get/config-set/pair/diagnose/shutdown/restart；不含 root-only `calibrate`）；保存经受控文件 + stdin |
-| `kernelsu` / `ioMode=env`（兼容） | 有 `ksu.exec`、模块目录可信；`ksu.io` 不可用，但一条无密钥探测确认 exec 透传 `options.env` | 同一组固定操作；保存经固定命令 + `AGENTCALL_CFG_PAYLOAD` env（每页会话探测一次，结果缓存） |
+| `kernelsu` / `ioMode=env`（兼容） | 有 `ksu.exec`、模块目录可信；`ksu.io` 不可用，但一条无密钥探测确认 exec 透传 `options.env` | 同一组固定操作；保存经固定命令 + `AGENTCALL_CFG_PAYLOAD_0..N` 分块 env（每块 128 码元、最多 64 块；每页会话探测一次，结果缓存） |
 | `readonly`（`env_unavailable`） | 有 `ksu.exec`，但 `ksu.io` 不可用，且 env 探测失败/被忽略/exec 抛错 | 读取/诊断/配对/关闭可用；**保存一律拒绝**（`secret_transport_unsupported`），绝不降级为 base64/echo argv |
 | `readonly`（`module_dir_unresolved`） | `moduleInfo()` **明确给出**不可信的 `moduleDir` | 需要执行 CLI 的命令禁用；固定路径日志读取仍可用（日志不依赖模块目录）；保存拒绝 |
 | `demo` | 普通浏览器，没有管理器注入 | 明确标注“演示数据”，保存、配对、日志均不可用；不发起任何网络请求 |
@@ -575,17 +581,22 @@ CLI 结果最多 25 s、等桥接退出最多 10 s；`uninstall.sh` 相同，最
 **B. ksu.exec + env 回退**
 
 1. 页面初始化/首次保存时执行一条无密钥探测：
-   `printf '%s' "$AGENTCALL_PROBE"`，env 里放随机 canary；只有 stdout 逐字节等于 canary
-   才认为管理器透传 `options.env`。探测结果每页会话缓存一次，不会每次保存都重跑。
-2. 探测通过后执行固定命令：
-   `printf '%s' "$AGENTCALL_CFG_PAYLOAD" | <moduleDir>/bin/agentcallctl config-set`。
+   `printf '%s' "$AGENTCALL_PROBE_0" "$AGENTCALL_PROBE_1" "$AGENTCALL_PROBE_2"`。
+   canary 固定 384 个 UTF-16 码元、拆成 3 个满长分块（每块 128），env 里放
+   `AGENTCALL_PROBE_0..2`；只有 stdout 逐字节等于完整 canary 才认为管理器**同时**
+   透传了多个 env 变量且没有截断长值。探测结果每页会话缓存一次，不会每次保存都重跑。
+2. 探测通过后按 JSON 的 UTF-16 码元长度拆成 `AGENTCALL_CFG_PAYLOAD_0..N`
+   （每块 128、代理对不跨块、最多 64 块），执行固定命令：
+   `printf '%s' "$AGENTCALL_CFG_PAYLOAD_0" ... "$AGENTCALL_CFG_PAYLOAD_N" | <moduleDir>/bin/agentcallctl config-set`。
    命令字符串不含负载；JSON 只放在 exec options 的
-   `{ "env": { "AGENTCALL_CFG_PAYLOAD": "<json>" } }`。模块路径来自已校验的
-   `moduleDir`（固定字符集），负载从不参与拼接。
+   `{ "env": { "AGENTCALL_CFG_PAYLOAD_0": "<chunk0>", ... } }`。模块路径来自已校验的
+   `moduleDir`（固定字符集），变量名/索引范围由分块数量生成，负载从不参与拼接。
+   超过 64 块在探测/执行前返回 `payload_too_large`。
 3. 不写 inbox、不写 URL/日志；保存成功与否仍以后端回读的 revision 与密钥状态为准。
-4. 探测失败、stdout 为空或 exec 抛错：切换到 `readonly`/`env_unavailable`（`ioMode=none`），
-   返回 `secret_transport_unsupported`，不执行 `config-set` 命令；提示升级管理器或 root CLI
-   stdin 提交。
+   保存失败消息附加 `transport=env bytes=<n> chunks=<k>`（只有长度与块数，绝不含负载）。
+4. 探测失败（stdout 为空/不匹配、任一分块缺失或被截断）、exec 抛错：切换到
+   `readonly`/`env_unavailable`（`ioMode=none`），返回 `secret_transport_unsupported`，
+   不执行 `config-set` 命令；提示升级管理器或 root CLI stdin 提交。
 
 WebUI 不加载任何在线 CDN、不发起 fetch/XHR、不用 `innerHTML` 渲染不受信任文本；
 配置与日志一律 `textContent`。
@@ -704,7 +715,7 @@ WebUI 不加载任何在线 CDN、不发起 fetch/XHR、不用 `innerHTML` 渲�
   不是“已保存”。文档不声称任一通道已在真机 WebView 中工作。**管理器更新仍是长期推荐方案**。
 - **stdin/密钥传输能力**：`agentcallctl` 始终从继承的 stdin 读取负载。首选通道由 WebUI
   把 JSON 放进 root 私有文件并重定向；env 回退由固定命令中的
-  `printf '%s' "$AGENTCALL_CFG_PAYLOAD"` 把 env 内容写进 CLI 的 stdin。两条通道都不把
+  `printf '%s' "$AGENTCALL_CFG_PAYLOAD_0" ... "$AGENTCALL_CFG_PAYLOAD_N"` 把分块 env 按顺序拼进 CLI 的 stdin。两条通道都不把
   密钥放进 argv/URL/日志；管理器不透传 env 时实现选择拒绝保存，而不是用 base64
   命令行参数伪装保密。
 - **KernelSU io/env 版本差异**：只有 `File` + `FileOutputStream` 可用且 `support !== false`

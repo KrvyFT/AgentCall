@@ -2,10 +2,10 @@
 
 本文描述 AgentCall 的安装范围、配对、配置、校准、升级与卸载。**所有真机步骤均为「未验证」**：
 交付时 `adb devices` 为空，本仓库没有真机 Google 电话、KernelSU WebView 或音频证据；
-用户也明确禁止设备侧验证。最终本地矩阵（代码 HEAD `ae8c70f`）通过：JVM 单测 **875**
-（core 126 / bridge 390 / app 359，0 failures / 0 errors / 0 skipped）、WebUI node 141/141、
-Python 59/59、`sh -n` 通过、lint 0 errors / 15 warnings；release APK、bridge 容器与模块 ZIP
-都在该 HEAD 上重新构建（大小与 SHA-256 见第 1 节）。产物哈希绑定 `ae8c70f` 的这次构建
+用户也明确禁止设备侧验证。最终本地矩阵（代码 HEAD `aaa36ae`）通过：JVM 单测 **877**
+（core 126 / bridge 392 / app 359，0 failures / 0 errors / 0 skipped）、WebUI node 149/149、
+Python 59/59、`sh -n` 通过；release APK、bridge 容器与模块 ZIP
+都在该 HEAD 上重新构建（大小与 SHA-256 见第 1 节）。产物哈希绑定 `aaa36ae` 的这次构建
 （APK 内嵌构建元数据、重建会改变字节），更晚提交重建必须重生成 `SHA256SUMS`。
 标注「未验证」的条目仍不能当作已可用。
 
@@ -19,12 +19,12 @@ Python 59/59、`sh -n` 通过、lint 0 errors / 15 warnings；release APK、brid
 | `dist/agentcall-<version>.apk` | AgentCall APK（Xposed 模块 + 远程语音回合） |
 | `dist/SHA256SUMS` | 两个产物的 SHA-256 |
 
-最终打包（在代码 HEAD `ae8c70f` 上重新构建：11N 改 `bridge/` 与 `module/service.sh`，
-11O 改 `module/webroot`；以 `dist/SHA256SUMS` 为准）：
-`agentcall-1.0.zip` 1,421,090 B（11 个条目），SHA-256
-`1bb871c255e6d1d6ea44fdf666d9d95bdfd764781faef8ccd2e4d3053dfccf8c`；
+最终打包（在代码 HEAD `aaa36ae` 上重新构建：11P 改 `module/webroot/bridge.js`、
+WebUI 测试与 bridge 反射硬化；以 `dist/SHA256SUMS` 为准）：
+`agentcall-1.0.zip` 1,423,090 B（11 个条目），SHA-256
+`593eb5f3e6f685bcf047fddaea891cb055440d814cd6c2a45d2c3cd69dc02018`；
 `agentcall-1.0.apk` 2,274,772 B，SHA-256
-`583b579529ce937f406d67510e0c844f074b6c927220f1054c44b5d3b9c46c11`。
+`1a7e2225763fd736124e7772ee0f5807ab6a6875074703be99f00596f3a869c1`。
 这些摘要只对应这次构建；APK 内嵌构建元数据、打包不是逐字节可复现，重建（即使源码不变）
 也会改变字节，必须重生成 `SHA256SUMS`。
 `python3 tools/check_package.py --dist dist` 输出 `Status: PASS`：appId
@@ -128,7 +128,7 @@ su -c /data/adb/modules/agentcall/bin/agentcallctl diagnose
 - WebUI 诊断页那一行给出 `ioForm`（object/function/none）、`ioSupport`
   （true/false/null）、`ioVersion`、`hasFile`、`hasFileOutputStream` 与
   `ioMode`（file/env/none）。`ioMode=env` 表示无密钥探测已通过、保存走固定命令 +
-  `AGENTCALL_CFG_PAYLOAD` env；`ioMode=none` + `env_unavailable` 表示只读，保存会被拒绝
+  `AGENTCALL_CFG_PAYLOAD_0..N` 分块 env；`ioMode=none` + `env_unavailable` 表示只读，保存会被拒绝
   （不要重试 argv/base64）。
 - stop.lock：桥接**已退出**后的清理只做一次非阻塞取锁，允许出现
   `stop_lock_acquired ... nonblocking=1` 或 `! stop_lock_busy ... nonblocking=1`，
@@ -198,7 +198,7 @@ root 操作员（不供 WebUI）：calibrate（JSON 从 stdin）
 | 状态 | 保存通道（`ioMode`） | 条件 | 能力 |
 | --- | --- | --- | --- |
 | `kernelsu` | `file`（受控文件接口，优先） | `ksu.exec` + `ksu.io`（对象或旧式函数形式；`support !== false` 且 `File`/`FileOutputStream` 存在）+ 模块目录可信 | WebUI 的七条固定操作，保存经 ksu.io 文件 + stdin |
-| `kernelsu` | `env`（exec+env 回退） | `ksu.exec` + 模块目录可信；`ksu.io` 不可用，但一条无密钥探测确认 exec 透传 `options.env` | WebUI 的七条固定操作，保存经固定命令 + `AGENTCALL_CFG_PAYLOAD` env |
+| `kernelsu` | `env`（exec+env 回退） | `ksu.exec` + 模块目录可信；`ksu.io` 不可用，但一条无密钥探测确认 exec 透传 `options.env` | WebUI 的七条固定操作，保存经固定命令 + `AGENTCALL_CFG_PAYLOAD_0..N` 分块 env（每块 128 码元、最多 64 块） |
 | `readonly` | `none`（`env_unavailable`） | `ksu.io` 不可用，且 env 探测被忽略/无回显/exec 抛错 | 读取/诊断/配对/关闭可用；**保存被拒绝**，提示升级管理器或 root CLI stdin |
 | `readonly` | `none`（`module_dir_unresolved`） | `moduleInfo()` 明确给出不可信 `moduleDir` | 依赖模块目录的命令禁用，固定路径日志仍可读 |
 | `demo` | `none` | 普通浏览器无管理器注入 | 明确标注模拟数据，不发起任何请求 |
@@ -223,17 +223,23 @@ env 回退必须先通过探测才会把状态从 `readonly/env_probe_pending` �
    正常路径写后立即删除。
 2. **exec+env 回退（`ioMode=env`）**：管理器的 `ksu.io` 存在但没有可用的
    `File`/`FileOutputStream`（或 `support: false`）时，WebUI 先执行一条**不含任何密钥**的
-   探测命令，确认管理器确实把 `ksu.exec` 的 `options.env` 透传给子进程。探测通过后执行
-   **完全固定**的命令：
+   分块探测命令，确认管理器确实把 `ksu.exec` 的 `options.env` 透传给子进程，且**多个变量、
+   每个长值都完整**。探测 canary 固定为 384 个 UTF-16 码元，拆成
+   `AGENTCALL_PROBE_0..2` 三块（每块 128 码元），任一块缺失/截断都会 fail closed。
+   探测通过后把 JSON 拆成 `AGENTCALL_CFG_PAYLOAD_0..N`（每块 128 码元，绝不拆代理对，
+   最多 64 块）并执行**完全固定**的命令：
 
    ```sh
-   printf '%s' "$AGENTCALL_CFG_PAYLOAD" | /data/adb/modules/agentcall/bin/agentcallctl config-set
+   printf '%s' "$AGENTCALL_CFG_PAYLOAD_0" "$AGENTCALL_CFG_PAYLOAD_1" ... | /data/adb/modules/agentcall/bin/agentcallctl config-set
    ```
 
-   JSON 只经 exec options 的 env map
-   `{ "env": { "AGENTCALL_CFG_PAYLOAD": "<json>" } }` 传入；命令字符串里只有环境变量名，
-   没有负载。不把负载 base64 进 argv，不写 URL/日志，也不写 inbox 文件（没有需要删除的
-   磁盘负载）。保存成功与否仍以后端回读的 `revision` 与密钥状态为准。
+   命令的变量名/索引范围由分块数量（数字）生成，`printf` 的多个 `%s` 参数按顺序拼接后
+   写入 CLI 的 stdin；JSON 只经 exec options 的 env map
+   `{ "env": { "AGENTCALL_CFG_PAYLOAD_0": "<chunk0>", ... } }` 传入。命令字符串里只有
+   环境变量名与固定索引，没有负载；不把负载 base64 进 argv，不写 URL/日志，也不写 inbox
+   文件（没有需要删除的磁盘负载）。保存成功与否仍以后端回读的 `revision` 与密钥状态为准。
+   失败消息只带 `transport=env bytes=<n> chunks=<k>` 诊断，绝不含负载内容；超过 64 块
+   上限返回 `payload_too_large`。
 3. **两者都不可用（`readonly`，原因 `env_unavailable`）**：保存按钮禁用，并明确给出两条
    出路——升级管理器以获得 `ksu.io`（**推荐**），或在 root shell 用
    `agentcallctl config-set < <负载文件>` 从 stdin 提交。绝不静默降级到 argv/base64。
@@ -260,7 +266,7 @@ env 回退必须先通过探测才会把状态从 `readonly/env_probe_pending` �
 （APK 传输层拒绝非 HTTPS，并拒绝重定向到非 HTTPS 或跨主机地址）。
 
 密钥（`ASR/LLM/TTS`）只经受控通道写入，**永远不进入 argv/URL/日志**：首选 ksu.io 文件 +
-stdin；没有 ksu.io 时走固定命令 + `AGENTCALL_CFG_PAYLOAD` env（见 §5.1）；两者都不可用时
+stdin；没有 ksu.io 时走固定命令 + `AGENTCALL_CFG_PAYLOAD_0..N` 分块 env（见 §5.1）；两者都不可用时
 保存被拒绝。手工写入示例使用同一 stdin 契约（引号 heredoc，不做 shell 展开；写完手工删除
 临时文件）：
 
@@ -530,8 +536,8 @@ AI 会话，等待人工处理。恢复路径：
 | 步骤 | 状态 |
 | --- | --- |
 | 模块 ZIP 结构、DEX 入口、版本、SHA-256、密钥泄漏检查 | 本地已验证（`make package-check`） |
-| 最终矩阵（代码 HEAD `ae8c70f`） | 本地 PASS：JVM 875（core 126 / bridge 390 / app 359，0 failures / 0 errors / 0 skipped）、lint 0 errors / 15 warnings；APK/ZIP 已在该 HEAD 重新构建（哈希见第 1 节） |
-| JVM/JS/Python/脚本检查 | JVM 875；WebUI node 141/141（含 exec+env 回退、env 探测、密钥卫生与 stop.lock 回归）；Python 59/59；`sh -n` 模块脚本通过；`make test` / `make build` / `make package-check` 全 PASS |
+| 最终矩阵（代码 HEAD `aaa36ae`） | 本地 PASS：JVM 877（core 126 / bridge 392 / app 359，0 failures / 0 errors / 0 skipped）；APK/ZIP 已在该 HEAD 重新构建（哈希见第 1 节） |
+| JVM/JS/Python/脚本检查 | JVM 877；WebUI node 149/149（含 exec+env 分块回退、截断/cap、env 探测、密钥卫生与 stop.lock 回归）；Python 59/59；`sh -n` 模块脚本通过；`make test` / `make build` / `make package-check` 全 PASS |
 | release 收缩（R8） | 本地已验证：`packageScope = setOf("**")`，mapping 99,205 行，release 未签名 APK 2.18 MB（debug 重签 2.27 MB）；**真机未验证** |
 | 配对（WebUI/root CLI）与 APK 校准/诊断界面 | 已实现；root CLI `calibrate` 经 `calibration.record` 写入五项人工证据；十个环境字段中六个（apiLevel、romFingerprint、kernelVersion、dialerPackageVersion、bridgeVersion、audioPolicyDigest）由桥接观测；四个可背书字段里 frameworkVersion/simCarrier 有真实观测源、只在观测不到时才由 root 背书，transport/route 则从不观测、始终为 UNKNOWN、只能在 calibrate 时由 root 背书；APP 就绪另需 `calibration.read` 的 supported/verified/environmentComplete/environmentMatchesEvidence（supportedApiLevel 是策略常量 `CalibrationPolicy.SUPPORTED_API_LEVEL`=37，不是设备 API 等级；API 36 因 `API_LEVEL_UNSUPPORTED` 保持阻断；真机探针与五项实测未验证，见第 7 节） |
 | 优雅关闭停止顺序（先取 stop.lock、shutdown、后停音频工作进程、再 TERM→KILL） | 本地宿主已验证（`shutdown-order.test.mjs`、`module-scripts.test.mjs` 进程/CLI 替身，含并发锁等待）；**真机未验证** |
