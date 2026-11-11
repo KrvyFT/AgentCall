@@ -3,31 +3,36 @@
 - 依据：`docs/superpowers/specs/2026-11-10-agentcall-design.md` §8（会话状态与故障恢复）、§9（音频与校准）。
 - 范围：受限通话音频提取/注入、PCM16 单声道与重采样、麦克风隔离、心跳故障终止、人工接管、特权 Telecom 终止、持久校准证据。
 - 记录时间：2026-11-11（Asia/Shanghai）。
-- 最终代码 HEAD：`ae8c70f`（`master`；docs 同步提交在它之后，产物哈希绑定这个代码 HEAD）。
-- **当前结论：本文件所有验证项均为「未验证」。没有任何一行被真机执行过，也没有任何一行被标记为「已验证」。**
-  交付时没有连接设备（`adb devices` 为空），用户也明确禁止设备侧验证。
+- 最终代码 HEAD：`647a52f`（`master`；docs 同步提交在它之后，产物哈希绑定这个代码 HEAD）。
+- **当前结论：D01–D12 每一行仍为「未验证」**，没有任何一行完成整行验收或翻绿。设备侧只有
+  控制器通过 adb 取得的部分观测（Vector 注入 4/4 Hook、一次真实 RINGING、
+  `package_provider=appglobals`、root shell 确认默认拨号器）；本轮新 ZIP/APK 未安装、未重启。
 - JVM 单元测试（`:core:testDebugUnitTest`、`:bridge:testDebugUnitTest`）只证明无设备可测的逻辑；它们不是、也不能代替任何一行真机结论。
 
-## 当前状态（代码 HEAD `ae8c70f`，2026-11-11）
+## 当前状态（代码 HEAD `647a52f`，2026-11-11）
 
-- JVM/构建矩阵（代码 HEAD `ae8c70f`）：BUILD SUCCESSFUL；JVM core 126 / bridge 390 /
-  app 359，合计 **875**，0 failures / 0 errors / 0 skipped；lint 0 errors / 15 warnings；
-  WebUI node 141/141（含 exec+env 回退、env 探测、密钥卫生与 stop.lock 回归）；Python 59/59。
-  APK 与模块 ZIP 都在该 HEAD 重新构建，大小与 SHA-256 见 `docs/verification.md` 4.5；
-  哈希只对应 `ae8c70f` 的这次构建，更晚提交重建会改变字节。
-- **交付时 `adb devices` 为空，没有设备连接。** 实现期间曾只读观察到 XQ-DQ72（API 37），
-  但 shell uid 2000 没有 `su`，所以没有安装模块、启动桥接、发起通话或执行任何音频测试。
-- **本轮（11N/11O）是设备驱动修复**，依据是两处设备侧失败证据，但都不是本仓库执行的验证：
-  1. 管理器把 `ksu.io` 暴露为**函数**，没有 `File`/`FileOutputStream`（WebUI 诊断：
-     `ioForm=function`、`ioSupport=null`、`ioVersion=0`、`hasFile=false`、
-     `hasFileOutputStream=false`），所以首选文件保存通道不可用；11O 增加 exec+env 回退
-     （探测通过才启用，否则 `env_unavailable` fail closed）。
-  2. 同一类设备（XQ-DQ72 / API 37）上 `app_process` 桥接曾以
-     `package_manager_unavailable` 退出，WebUI 只能显示 `transport_failed`；11N 改为
-     context → appglobals → binder → shell 的分层 provider，只有四层全失败才以同一机器码
-     退出。修复后的落点、env 探测与 stop.lock 行为**均未在设备上确认**。
-- 结论不变：**D01–D12 每一行仍为「未验证」**；最终 JVM/node 计数不构成任何一行真机结论，
-  也不能把任何一行改成「已验证通过/已验证不支持」。
+- JVM/构建矩阵（代码 HEAD `647a52f`，225 个 Gradle 任务）：BUILD SUCCESSFUL；JVM core 127 /
+  bridge 429 / app 366，合计 **922**，0 failures / 0 errors / 0 skipped；lint 0 errors /
+  15 warnings；WebUI node 149/149（含 chunked env 分块/截断/cap、env 探测、密钥卫生与
+  stop.lock 回归）；Python 59/59。APK 与模块 ZIP 都在该 HEAD 重新构建，大小与
+  SHA-256 见 `docs/verification.md` 4.5；哈希只对应 `647a52f` 的这次构建，更晚提交重建会
+  改变字节。
+- **设备部分证据（不是整行验收）**：控制器通过 adb 在 XQ-DQ72/API 37 上观测到
+  Vector v2.2（legacy Xposed API 82）注入 `com.google.android.dialer`，
+  `installed 4 of 4 hook(s)`，拨号器日志出现一次
+  `AgentCall: observed callId=... state=RINGING direction=INCOMING`；root shell 确认默认
+  拨号器是 `com.google.android.dialer`，桥接启动日志为 `package_provider=appglobals`。
+  当时 `status.hookConnected=false` 是旧实现只按会话心跳导致的（11Q 改为空闲 presence）。
+  本轮新 ZIP/APK **尚未安装、未重启**，空闲/校准/chunked env 均未复测。
+- **本轮（11P/11Q）修复**：11P 在 `ksu.io` 无文件接口时改走分块 exec+env 保存
+  （`AGENTCALL_CFG_PAYLOAD_0..N`、128 UTF-16 码元/块、代理对安全、最多 64 块；
+  探测 `AGENTCALL_PROBE_0..2`），并让反射/校验 Throwable 回
+  `config_validation_unavailable`；11Q 增加空闲 `hook.presence`（每 2 s、5000 ms 窗口）
+  与 `hook_transport` 限流机器码；11Q-b 增加 root `cmd role`/`cmd telecom` 兜底、
+  `zygisk_vector` 的 `module.prop` 版本与 SIM 运营商逗号首段。以上都只有宿主/JVM/node
+  证据，设备复测待做。
+- 结论不变：**D01–D12 每一行仍为「未验证」**；最终 JVM/node 计数与上述部分观测不构成任何
+  一行真机结论，也不能把任何一行改成「已验证通过/已验证不支持」。
 
 ## 1. 状态定义与翻绿规则
 
@@ -84,7 +89,10 @@ ls: /data/adb/modules/agentcall: Permission denied
 结论与限制：
 
 - 任务 5 期间曾观察到一台 API 37（Android 17）Xperia 设备；这只说明当时设备可见，**不构成任何验证结果**。当时没有在该设备上安装模块、启动桥接、发起真实通话或执行音频测试；交付时该设备也已不在线（`adb devices` 为空）。
-- `adb shell` 是 uid 2000 的 shell，没有 `su`；本会话无法通过 adb 读取 `/data/adb/modules/agentcall`。因此 **KernelSU 模块、`agentcallctl`、真实特权音频/终止路径都无法从当前 adb 会话执行**。需要设备侧 root 入口或人工在 KernelSU 管理器中完成安装后再验证。
+- 上面这段是 **uid 2000、无 `su`** 的早期只读会话，不能执行内核模块/特权音频/终止路径。
+  后续 11Q 修复轮控制器通过 adb（含 root shell）取得了注入、4/4 Hook、一次 RINGING、
+  `package_provider=appglobals` 与默认拨号器的部分观测；但它们仍不是 D01–D12 的整行验收，
+  本轮新构建也未安装/重启。
 - 设备/ROM 可能在后续任务中被替换；每行证据必须重新记录实际设备，不得沿用本节的只读信息。
 - 型号与指纹字段说明（2026-11-10 用上表命令重新只读复核）：`ro.product.model` = `XQ-DQ72`，而 `ro.build.fingerprint` 的 `Sony/XQ-GE74/XQ-GE` 是 ROM 构建的 product/device 段；两者是不同系统属性，不是互相矛盾的观察。设备序列号与两个值均为只读观察，**仍不是验证结果**。
 
@@ -238,7 +246,7 @@ adb shell grep @org.krvyft.agentcall.control /proc/net/unix \
 
 翻转所需证据：注入命令/进程号、`logcat`+`service.log` 时间线、`dumpsys audio`/`dumpsys telecom`、接管界面录屏、对端录音、`status.json`（phase/blockedReason）。
 
-当前阻塞：进程入口已接入——`service.sh` 以独立 app_process 启动 `AudioWorkerMain`，bridge 容器（`BridgeMain`）内构造监督角色并以 500 ms 周期调用 `Supervisor.poll`；但实现期间 adb 是 uid 2000 无 `su`，交付时无设备连接，无法安装模块、定点 kill 监督/音频进程或执行本行。仍未验证；JVM `AudioWorker`/`Supervisor` 测试不能替代本行。
+当前阻塞：进程入口已接入——`service.sh` 以独立 app_process 启动 `AudioWorkerMain`，bridge 容器（`BridgeMain`）内构造监督角色并以 500 ms 周期调用 `Supervisor.poll`；但实现期间的早期 adb 会话是 uid 2000 无 `su`，本轮新构建也未安装/重启；仍无法执行本行的定点 kill 与接管。仍未验证；JVM `AudioWorker`/`Supervisor` 测试不能替代本行。
 
 ### D07 人工接管
 
@@ -289,7 +297,7 @@ adb shell grep @org.krvyft.agentcall.control /proc/net/unix \
 
 翻转所需证据：高速录屏/系统时间、`logcat`+`service.log` 时间戳、`dumpsys telecom` 前后、进程号、对端录音、`status.json`（phase=TERMINATING/blockedReason）。
 
-当前阻塞：监督/音频进程入口已接入（`BridgeMain` 内监督角色 + 独立 `AudioWorkerMain`，`service.sh` 分别有限重启）；心跳按 SessionId 记录，外来会话心跳不能给旧通话续命，`poll` 在同一轮最多终止同一会话一次。但实现期间 adb 无 root、交付时无设备连接，APP/Hook 心跳与故障注入仍无法执行。仍未验证。
+当前阻塞：监督/音频进程入口已接入（`BridgeMain` 内监督角色 + 独立 `AudioWorkerMain`，`service.sh` 分别有限重启）；心跳按 SessionId 记录，外来会话心跳不能给旧通话续命，`poll` 在同一轮最多终止同一会话一次。但本轮没有安装新构建/重启，APP/Hook 心跳与故障注入仍未执行（且还受校准与身份闸门限制）。仍未验证。
 
 ### D10 Hook 死亡后的独立特权 Telecom 终止
 
@@ -325,7 +333,7 @@ adb shell grep @org.krvyft.agentcall.control /proc/net/unix \
 
 翻转所需证据：每次 kill 的进程号/时间、`service.log` 重启计数、`status.json`、`logcat`、`dumpsys telecom`、对端录音。
 
-当前阻塞：音频工作进程入口已接入（独立 app_process，`service.sh` 有限重启）；重启预算已移到监督端（`RestartBudget`，60 s 窗口最多 3 次），音频工作进程重启不会清零预算，预算耗尽触发 `terminateOwned`。实现期间 adb 无 root、交付时无设备连接，仍无法执行 kill/重启注入。仍未验证。
+当前阻塞：音频工作进程入口已接入（独立 app_process，`service.sh` 有限重启）；重启预算已移到监督端（`RestartBudget`，60 s 窗口最多 3 次），音频工作进程重启不会清零预算，预算耗尽触发 `terminateOwned`。本轮新构建未安装/重启，仍无法执行 kill/重启注入。仍未验证。
 
 ### D12 校准证据与环境绑定
 
@@ -360,10 +368,10 @@ adb shell grep @org.krvyft.agentcall.control /proc/net/unix \
 | romFingerprint | `adb shell getprop ro.build.fingerprint` | 只读观察到 XQ-GE74 指纹；未验证 |
 | kernelVersion | `adb shell uname -a` 或 `diagnose` | 未验证 |
 | dialerPackageVersion | `adb shell dumpsys package com.google.android.dialer \| grep versionName` | 只读观察到 245.0.1006864670；未验证 |
-| frameworkVersion | root SystemProperties（`ro.lsposed.version`/`persist.sys.lsposed.version`/`ro.vector.version`/`persist.sys.vector.version`/`ro.edxposed.version`/`persist.sys.edxposed.version`）→ `/data/adb/modules/{lsposed,zygisk_lsposed,vector}/module.prop` 的 `version=` → XposedBridge 类检查；仍 UNKNOWN 时可由 root 背书 | 未验证（只有宿主/JVM 证据） |
+| frameworkVersion | root SystemProperties（`ro.lsposed.version`/`persist.sys.lsposed.version`/`ro.vector.version`/`persist.sys.vector.version`/`ro.edxposed.version`/`persist.sys.edxposed.version`）→ `/data/adb/modules/{zygisk_vector,zygisk_lsposed,lsposed,vector,edxposed}/module.prop` 的 `version=` → XposedBridge 类检查；仍 UNKNOWN 时可由 root 背书 | 未验证；本设备 `zygisk_vector` 的期望值为 `v2.2 (3080-88f8e1fa-JingMatrix-Vector)`，尚未在新构建读回 |
 | bridgeVersion | `agentcallctl status`（当前 BridgeInfo.VERSION=1.0） | 未验证 |
 | audioPolicyDigest | `agentcallctl diagnose`（vendor/system audio policy SHA-256） | 未验证 |
-| simCarrier | TelephonyManager 的 SIM 运营商名 → `gsm.sim.operator.alpha` / `gsm.sim.operator.default-name` / `ro.cdma.home.operator.alpha`；仍 UNKNOWN 时可由 root 背书 | 未验证（只有宿主/JVM 证据） |
+| simCarrier | TelephonyManager 的 SIM 运营商名 → `gsm.sim.operator.alpha` / `gsm.sim.operator.default-name` / `ro.cdma.home.operator.alpha`（逗号列表取第一个非空片段、去掉首尾标点）；仍 UNKNOWN 时可由 root 背书 | 未验证；本设备 `China Unicom,China Unicom` 的期望值是 `China Unicom`，尚未在新构建读回 |
 | transport | **没有观测路径**：桥接从不观测（始终 UNKNOWN），只能由 root 操作员在 calibrate 时按固定词表背书 | 不可作为观测验证（背书未验证） |
 | route | **没有观测路径**：桥接从不观测（始终 UNKNOWN），只能由 root 操作员在 calibrate 时按固定词表背书 | 不可作为观测验证（背书未验证） |
 
@@ -379,8 +387,8 @@ adb shell grep @org.krvyft.agentcall.control /proc/net/unix \
 
 ## 7. 任务 5 的 JVM 证据（不是真机证据）
 
-> 本节的 108 / 161 是任务 5 当时的历史计数；当前（代码 HEAD `ae8c70f`）的计数是
-> core 126 / bridge 390 / app 359，合计 875，另加 WebUI node 141/141 与 Python 59/59，
+> 本节的 108 / 161 是任务 5 当时的历史计数；当前（代码 HEAD `647a52f`）的计数是
+> core 127 / bridge 429 / app 366，合计 922，另加 WebUI node 149/149 与 Python 59/59，
 > 见 `docs/verification.md`。本节保留历史记录，不用它冒充最终数字。
 
 已执行（可复现）：
@@ -398,8 +406,13 @@ BUILD SUCCESSFUL
 ## 8. 当前未验证/阻塞清单
 
 - 全部 D01–D12：未验证。
-- 设备侧 root/模块：实现期间 adb 会话无 `su`，交付时无设备连接；无法安装/启动模块或执行 `agentcallctl`；需人工准备 root 环境。
-- 监督/音频工作进程：入口已接入。`service.sh` 启动 `BridgeMain`（控制面 + 监督角色 + 500 ms 轮询 + 状态持久化）与独立 `AudioWorkerMain`（PCM/隔离，root 私有 abstract socket），各自有限重启；但实现期间 adb 无 root、交付时无设备连接，D06/D09/D11 的进程级注入**仍未执行**，SELinux 域、app_process 类加载、真实 AudioManager 反射均未验证。
+- 设备侧 root/模块：本轮新 ZIP/APK 未安装、未重启；只在既有设备上通过 adb 取得注入/
+  4/4 Hook/一次 RINGING/`package_provider=appglobals` 与默认拨号器的部分观测。完整
+  `agentcallctl`、监督与音频链路仍待安装后验证。
+- 监督/音频工作进程：入口已接入。`service.sh` 启动 `BridgeMain`（控制面 + 监督角色 +
+  500 ms 轮询 + 状态持久化）与独立 `AudioWorkerMain`（PCM/隔离，root 私有 abstract
+  socket），各自有限重启；但本轮没有执行 D06/D09/D11 的进程级注入（还受安装、校准与
+  身份闸门限制），SELinux 域、app_process 类加载、真实 AudioManager 反射均未验证。
 - 自动接听仍被两道 fail-closed 闸门关闭：**校准记录** + `UnverifiedCallIdentityVerifier`
   不可用（`blocksAutoAnswer=true`）。因此真机上监督端当前不会拥有任何 AI 通话；D06/D09 需要
   先完成 D10 的身份核验与 D12 校准。校准写入通道已经存在：root CLI `calibrate` →
@@ -422,14 +435,19 @@ BUILD SUCCESSFUL
   阻止自动接听，`ReflectiveTelecomTermination` 未在目标 ROM 验证。
 - 音频 HAL/受限方法：未在任何真机上确认三个 AOSP 受限方法可见、可调用、可创建对象，更未确认对端能听到注入。
 - 锁屏、重启、双 SIM、VoWiFi、蓝牙、通知权限、人工接管界面、麦克风隔离与 TTS 共存：均未在真机执行。
-- 分层 PackageManager provider（11N）：`appglobals`/`binder` 的 `AppGlobals.getPackageManager`、
-  `ServiceManager` + `IPackageManager$Stub` 反射在真实 `app_process` 中是否可用、最终落在
-  `package_provider=context|appglobals|binder|shell` 哪一层，均未验证；只有宿主 JVM 的
-  顺序/缓存/失败回落/日志码证据。
-- WebUI exec+env 保存通道（11O）：真实 KernelSU WebView 是否透传 `ksu.exec` 的
-  `options.env`、诊断页 `ioMode` 是否按预期从 `none` 提升为 `env`，未验证；只有 node
-  管理器替身证据。设备上已知 `ksu.io` 为函数且无 `File`/`FileOutputStream`，但回退本身
-  未在真机执行。
+- 分层 PackageManager provider（11N）：设备上已观测 `package_provider=appglobals` 落点；
+  其余 `binder`/`shell` 分支的 `AppGlobals.getPackageManager`、`ServiceManager` +
+  `IPackageManager$Stub` 反射、失败回落顺序与权限均未验证，只有宿主 JVM 的顺序/缓存/
+  日志码证据。
+- WebUI chunked exec+env 保存通道（11O/11P）：真实 KernelSU WebView 是否透传 `ksu.exec`
+  的 `options.env`、`AGENTCALL_CFG_PAYLOAD_0..N`/`AGENTCALL_PROBE_0..2` 是否完整、诊断页
+  `ioMode` 是否从 `none` 提升为 `env`，均未验证；只有 node 管理器替身证据。设备上已知
+  `ksu.io` 为函数且无 `File`/`FileOutputStream`，但回退本身未在本轮新构建执行。
+- 空闲 Hook 存在性与设备探针（11Q/11Q-b）：`hook.presence` 每 2 s 驱动
+  `status.hookConnected`（5000 ms 窗口）、`hook_transport` 限流机器码、root `cmd role`/
+  `cmd telecom` 兜底、`zygisk_vector/module.prop` 版本与 SIM 运营商逗号首段均只有
+  JVM/node 证据。修复前 RINGING 时 `hookConnected=false`；重启后空闲 true、
+  `dialerDefaultRole=true`、frameworkVersion/simCarrier 的读回尚未执行。
 - stop.lock 行为（11N）：`app_process` 子进程不继承锁 fd、桥接退出后的清理只做非阻塞取锁
   （`stop_lock_busy`/`stop_lock_unavailable`）与桥接存活时的串行化，只有宿主真实 `flock`
   + 替身证据；真机 KernelSU 停止/卸载时序未验证。

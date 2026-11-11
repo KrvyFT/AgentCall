@@ -4,29 +4,28 @@ AgentCall 在不替换 Google 电话（`com.google.android.dialer`）的前提�
 Xposed Hook 观察来电与通话状态，AgentCall APK 完成远程 ASR / LLM / TTS 语音回合，KernelSU 模块里的
 `app_process` 特权桥执行 Telecom 控制、音频注入、root 侧配置与中文 WebUI。
 
-> **状态：本地构建与验收矩阵通过，不等于可用。** 最终矩阵（代码 HEAD `ae8c70f`）JVM 单测
-> core 126 / bridge 390 / app 359（合计 **875**，0 failures / 0 errors / 0 skipped），
-> WebUI node 141/141、Python 打包 59/59、`sh -n` 通过，lint 0 errors / 15 warnings；
-> release APK、bridge 容器与模块 ZIP 都在该 HEAD 上重新构建（大小与 SHA-256 见下）。
-> 本轮是设备驱动修复（11N/11O）：桥接改为**分层 PackageManager 获取**
-> （context → AppGlobals → ServiceManager/binder → shell 事实），
-> `service.sh` 不再把 `stop.lock` 的 fd 继承给 `app_process` 子进程、桥接退出后的清理只做
-> 非阻塞取锁，WebUI 增加 **exec+env 保存通道**。但**没有真机证据**：交付时
-> `adb devices` 为空，设备侧一行都没跑；
-> 配对（WebUI/root CLI）、root CLI `calibrate` 与 APK 校准/诊断界面已实现。校准环境的十个
-> 字段中，`apiLevel`、`romFingerprint`、`kernelVersion`、`dialerPackageVersion`、
-> `bridgeVersion`、`audioPolicyDigest` 由桥接真实观测；四个可背书字段里 `frameworkVersion`
-> （root SystemProperties、模块 `module.prop` 的 `version=`、XposedBridge 类检查的
-> int/long/String）与 `simCarrier`（TelephonyManager 的 SIM 运营商名与 telephony 属性）
-> 有真实观测源，只在观测不到时才由 root 背书；`transport`/`route` 则**从不观测**（始终
-> UNKNOWN），只能在 `calibrate` 时由 root 操作员背书。
+> **状态：本地构建与验收矩阵通过，不等于可用。** 最终矩阵（代码 HEAD `647a52f`，
+> 225 个 Gradle 任务，`BUILD SUCCESSFUL`）JVM 单测 core 127 / bridge 429 / app 366
+> （合计 **922**，0 failures / 0 errors / 0 skipped），WebUI node 149/149、Python 打包 59/59、
+> `sh -n` 通过，lint 0 errors / 15 warnings；release APK、bridge 容器与模块 ZIP 都在该 HEAD
+> 上重新构建（大小与 SHA-256 见下），R8 mapping 仍约 99k 行。
+> 本轮是设备驱动修复（11P/11Q）：WebUI 在 `ksu.io` 没有文件接口时走**分块 exec+env 保存**
+> （`AGENTCALL_CFG_PAYLOAD_0..N`，每块 128 UTF-16 码元、代理对不切分、最多 64 块；探测用
+> `AGENTCALL_PROBE_0..2` 重组校验），HOOK 以固定方法 `hook.presence` 每 2 s 报告空闲存在性
+> （桥接按角色记录 5000 ms 窗口，`status.hookConnected` 不再依赖活动通话），默认拨号器探测
+> 增加 root shell `cmd role`/`cmd telecom` 兜底，框架版本与 SIM 运营商按设备实测修正
+> （`zygisk_vector` 的 `module.prop`、逗号列表取首段）。
+> 设备侧已由控制器通过 adb 在 XQ-DQ72/API 37 上取得**部分观测**：Vector v2.2 把 AgentCall
+> 注入 `com.google.android.dialer`（`installed 4 of 4 hook(s)`），拨号器日志出现真实
+> `state=RINGING`；当时 `status.hookConnected=false` 的原因是旧实现只按会话心跳，已由 11Q
+> 修复。**这不是完整设备验收**：新 ZIP/APK 尚未安装、未重启，空闲
+> `hookConnected=true`、`dialerDefaultRole=true`、校准环境字段与 chunked env 保存都待设备
+> 复测；音频、Telecom 与自动接听仍无证据。
 > **产品阻塞项不变（不是单纯的设备缺口）**：自动接听需要校准记录**且**需要设备
 > 验证过的、按通话身份定位的特权 Telecom 终止路径（`UnverifiedCallIdentityVerifier`
 > 保持 `blocksAutoAnswer=true`）；APK 只有 debug 签名、不可分发。生产就绪仍为
-> `NOT_READY`（`calibration_not_verified`），设备验收（spec §12）全部待做，见「状态与边界」与
-> `docs/verification.md`。本轮修复来自设备侧失败证据（管理器只有函数形式的 `ksu.io`、
-> 没有 `File`/`FileOutputStream`；`app_process` 桥接曾以 `package_manager_unavailable`
-> 退出），这些证据在 `docs/verification.md` 5.4，**不构成任何验证结果**。
+> `NOT_READY`（`calibration_not_verified`），设备验收（spec §12）仍未完成，见「状态与边界」与
+> `docs/verification.md`。
 >
 > 公开仓库：<https://github.com/KrvyFT/AgentCall>（分支 `master`）；仓库与文档中不含任何令牌或凭据。
 
@@ -103,16 +102,16 @@ python3 tools/check_package.py    # 失败即非零退出
   apksigner 的 v4 `.idsig` 旁文件不生成（不属于发布物）。
 - `dist/SHA256SUMS`：`sha256sum` 兼容格式。
 
-最终打包产物（在代码 HEAD `ae8c70f` 上重新构建；`dist/` 不提交）：
+最终打包产物（在代码 HEAD `647a52f` 上重新构建；`dist/` 不提交）：
 
 | 文件 | 大小 | SHA-256 |
 | --- | --- | --- |
-| `dist/agentcall-1.0.zip` | 1,421,090 B（11 个条目） | `1bb871c255e6d1d6ea44fdf666d9d95bdfd764781faef8ccd2e4d3053dfccf8c` |
-| `dist/agentcall-1.0.apk` | 2,274,772 B | `583b579529ce937f406d67510e0c844f074b6c927220f1054c44b5d3b9c46c11` |
+| `dist/agentcall-1.0.zip` | 1,426,689 B（11 个条目） | `65902224bf5a65e8d0c7f2a045c8081e17c31832be0c634504f0254329577577` |
+| `dist/agentcall-1.0.apk` | 2,274,772 B | `58f0a83c2247ed23ccea54264fbd0bc90aac3b2075d757d5c5f8cb5cc46876ca` |
 | `dist/SHA256SUMS` | 168 B | 与上面两行一致 |
 
 **哈希绑定这次构建**：APK 内嵌构建元数据，打包过程也不是逐字节可复现的，所以上表只对应
-`ae8c70f` 的这次构建。在任何更晚的提交（包括本次 docs 提交之后）重建都会改变 APK/ZIP
+`647a52f` 的这次构建。在任何更晚的提交（包括本次 docs 提交之后）重建都会改变 APK/ZIP
 字节，必须重新生成 `SHA256SUMS` 并以新文件为准；`dist/` 不进仓库，`sha256sum -c` 通过。
 
 APK 由本机 debug keystore 签名（`CN=Android Debug`，证书 SHA-256
@@ -170,20 +169,23 @@ manifest，打包与 `check_package.py` 都拿容器与 manifest 比对（名称
 
 | 范围 | 状态 |
 | --- | --- |
-| JVM 单测（core/bridge/app） | 最终本地矩阵（代码 HEAD `ae8c70f`）：126 / 390 / 359，合计 **875**，0 failures / 0 errors / 0 skipped |
-| WebUI node 测试、Python 打包测试、模块脚本语法 | 本地已验证：node 141/141（含 exec+env 回退、env 探测、密钥卫生与 KernelSU source 安装回归）、Python 59/59、`sh -n` 通过 4 个模块脚本 |
+| JVM 单测（core/bridge/app） | 最终本地矩阵（代码 HEAD `647a52f`，225 个 Gradle 任务，`BUILD SUCCESSFUL`）：127 / 429 / 366，合计 **922**，0 failures / 0 errors / 0 skipped |
+| WebUI node 测试、Python 打包测试、模块脚本语法 | 本地已验证：node 149/149（含 chunked env 分块/截断/cap、env 探测、密钥卫生与 KernelSU source 安装回归）、Python 59/59、`sh -n` 通过 4 个模块脚本 |
 | `:app:lintDebug` | 本地已验证：SUCCESSFUL，0 errors、15 warnings（13 条既有告警 + 2 条 `UseKtx`） |
-| R8（release） | 启用：`packageScope = setOf("**")`，release mapping 约 99,205 行；release 未签名 APK 2.18 MB（debug 重签交付 2.27 MB） |
+| R8（release） | 启用：`packageScope = setOf("**")`，release mapping 仍约 99k 行；release 未签名 APK 约 2.18 MB（debug 重签交付 2,274,772 B） |
 | release APK、模块 ZIP、SHA256SUMS、打包检查 | 本地已验证：`make build` / `make package-check` PASS（appId `org.krvyft.agentcall`，版本 1.0 (1)，dex `classes.dex`，结构 module=1/scripts=3/bridge=2/bin=1/webroot=4）；产物与哈希见上表 |
-| 桥接分层 PackageManager 获取（11N） | 本地 JVM 已验证：provider 顺序/缓存/日志码、shell 解析、shell 签名显式 unsupported 的 fail closed；**真机未验证**（设备上旧的 context-only 路径曾以 `package_manager_unavailable` 退出） |
-| WebUI 保存通道（11O） | 本地 node 已验证：file / exec+env / readonly 三态、env 探测每页会话一次、密钥不进命令/日志；**真机 KernelSU WebView 未验证**（设备管理器只有函数形式 `ksu.io`、没有 `File`/`FileOutputStream`） |
+| 桥接分层 PackageManager 获取（11N） | 本地 JVM 已验证 provider 顺序/缓存/日志码、shell 解析与 fail closed；设备上桥接已启动并记录 `package_provider=appglobals`（控制器 adb 只读观测）。其余 provider 分支、失败回落与真实权限仍未验证 |
+| WebUI 保存通道（11O/11P） | 本地 node 已验证 file / exec+env / readonly 三态、chunked env（128 码元/块、最多 64 块、代理对安全、`payload_too_large`）、env 探测与密钥卫生；**真机 KernelSU WebView 未验证**（设备管理器只有函数形式 `ksu.io`、没有 `File`/`FileOutputStream`），chunked 保存待复测 |
+| HOOK 空闲存在性与传输诊断（11Q） | 本地 JVM 已验证 `hook.presence` 驱动 `status.hookConnected`（5000 ms 窗口、空闲也发）与 `hook_transport` 限流机器码；**设备上待重启复测**（修复前 RINGING 时 `hookConnected=false`） |
+| 默认拨号器/框架版本/SIM 运营商探针（11Q-b） | 本地 JVM 已验证 RoleManager → root `cmd role`/`cmd telecom` → `ACTION_DIAL` 顺序、2 s/8 KiB/30 s 缓存、精确单一包名解析与逗号首段；**设备上待复测**预期 `dialerDefaultRole=true`、frameworkVersion `v2.2 (...)`、simCarrier `China Unicom` |
 | `service.sh` 停止锁（11N） | 本地宿主已验证（真实 flock + 替身）：`app_process` 子进程不继承 fd 9、桥接退出后非阻塞清理、桥接存活时仍串行化；**真机未验证** |
 | `app_process` 容器入口（BridgeMain/AgentCallCli/AudioWorkerMain）与 Kotlin/coroutines/Gson/core 运行库 | 结构级已验证（自研 DEX 解析：只校验类描述符与方法名存在，不校验方法原型/字节码语义） |
-| 真机 Google 电话原功能、真实来电、≥3 轮双向对话 | **未验证**（交付时无设备连接） |
-| 音频 downlink/uplink、麦克风隔离、真实 Google 电话 | **未验证**（无设备证据，不宣称可用） |
+| Vector/Xposed 注入与 Hook 安装 | **设备部分验证**：Vector v2.2（legacy API 82）日志 `Loading legacy module org.krvyft.agentcall`、`installed 4 of 4 hook(s)`，并观测到一次真实 `RINGING`；完整接听/音频链路未验证 |
+| 真机 Google 电话原功能、≥3 轮双向对话 | **未验证**：仅有一次 RINGING 观测，未归档完整通话 |
+| 音频 downlink/uplink、麦克风隔离 | **未验证**（无设备证据，不宣称可用） |
 | 人工接管、故障终止、锁屏/重启握手 | **未验证** |
-| KernelSU 真机安装、WebView WebUI、`ksu.io` 路径 | **未验证**（无真机） |
-| 配对（WebUI/root CLI）与 APK 校准/诊断界面 | 已实现；root CLI `calibrate` 经 `calibration.record` 写入五项人工证据。十个环境字段中六个（apiLevel、romFingerprint、kernelVersion、dialerPackageVersion、bridgeVersion、audioPolicyDigest）由桥接观测；四个可背书字段里 frameworkVersion/simCarrier 有真实观测源、只在观测不到时才由 root 背书，transport/route 则从不观测、始终为 UNKNOWN、只能在 calibrate 时由 root 背书。APP 就绪要求 `calibration.read` 的 available && supportedApiLevel==37 && verified && environmentComplete && environmentMatchesEvidence，再叠加本机 `CalibrationPolicy`；`supportedApiLevel` 是策略常量 `CalibrationPolicy.SUPPORTED_API_LEVEL`（37），不是设备 API 等级——API 36 会因 `verified=false` 且 blockers 含 `API_LEVEL_UNSUPPORTED` 保持阻断。读取失败/未知一律 false（`calibration_unavailable`），不缓存旧 true。真机证据仍缺失，自动接听保持关闭（`calibration_not_verified`） |
+| KernelSU 真机安装、WebView WebUI、`ksu.io` 路径 | **未验证**（本轮新 ZIP/APK 尚未安装；WebView 未打开） |
+| 配对（WebUI/root CLI）与 APK 校准/诊断界面 | 已实现；root CLI `calibrate` 经 `calibration.record` 写入五项人工证据。十个环境字段中六个（apiLevel、romFingerprint、kernelVersion、dialerPackageVersion、bridgeVersion、audioPolicyDigest）由桥接观测；四个可背书字段里 frameworkVersion/simCarrier 有真实观测源、只在观测不到时才由 root 背书，transport/route 则从不观测、始终为 UNKNOWN、只能在 calibrate 时由 root 背书。APP 就绪要求 `calibration.read` 的 available && supportedApiLevel==37 && verified && environmentComplete && environmentMatchesEvidence，再叠加本机 `CalibrationPolicy`；`supportedApiLevel` 是策略常量 `CalibrationPolicy.SUPPORTED_API_LEVEL`（37），不是设备 API 等级——API 36 会因 `verified=false` 且 blockers 含 `API_LEVEL_UNSUPPORTED` 保持阻断。读取失败/未知一律 false（`calibration_unavailable`），不缓存旧 true。校准证据的设备复测（frameworkVersion=`v2.2 (...)`、simCarrier=`China Unicom`）尚未完成，自动接听保持关闭（`calibration_not_verified`） |
 | 双卡、VoWiFi、蓝牙 | **未验证**，未测组合不启用 |
 | **产品阻塞项**：按通话身份定位的特权 Telecom 终止 | **不存在**：`UnverifiedCallIdentityVerifier` 保持 `blocksAutoAnswer=true`；即使校准记录齐全，自动接听也不会开启 |
 | **产品阻塞项**：APK 签名 | 仅 debug 签名（`CN=Android Debug`），不可分发；必须用发布密钥重签并重生成 `SHA256SUMS` |
@@ -199,8 +201,18 @@ manifest，打包与 `check_package.py` 都拿容器与 manifest 比对（名称
   `package_provider_unavailable`（四层都失败）或 `package_manager_unavailable`
   （桥接退出码 1）说明包事实拿不到，属于 fail closed，不是可忽略的告警。
 - **保存通道**：WebUI 诊断页给出 `ioForm`/`ioSupport`/`ioVersion`/`hasFile`/
-  `hasFileOutputStream`/`ioMode`。`ioMode=env` 表示走固定命令 + `AGENTCALL_CFG_PAYLOAD`
-  env；`ioMode=none` + `env_unavailable` 表示只读，保存被拒绝。
+  `hasFileOutputStream`/`ioMode`。`ioMode=env` 表示走固定命令 + `AGENTCALL_CFG_PAYLOAD_0..N`
+  分块 env（每块 128 码元、最多 64 块）；失败消息带 `transport=env bytes=<n> chunks=<k>`，
+  超过 64 块是 `payload_too_large`。`ioMode=none` + `env_unavailable` 表示只读，保存被拒绝。
+- **Hook 连通性**：`status.hookConnected` 由**空闲 presence** 驱动——HOOK 每 2 s 发一条无会话的
+  固定方法 `hook.presence`，桥接按角色记录 5000 ms 窗口，不再要求有活动通话。logcat 侧失败
+  只出现限流机器码
+  `hook_transport connect_failed|server_untrusted|protocol_violation failures=<n>`
+  （约 5 s 一条，不含负载/会话号/号码）。
+- **默认拨号器**：`dialerDefaultRole` 依次看 RoleManager 持有者 → 读不到时用 root 固定命令
+  `cmd role get-role-holders android.app.role.DIALER` / `cmd telecom get-default-dialer`
+  （2 s 超时、8 KiB 上限）→ `ACTION_DIAL` 负证据；解析只接受恰好一个合法包名，任何歧义
+  都是 `"unknown"`，结果缓存 30 s。
 - **停止锁**：桥接已退出后的清理只允许 `stop_lock_acquired ... nonblocking=1` 或
   `! stop_lock_busy ... nonblocking=1`；不应再出现 `! stop_lock_timeout waited=40s`。
   桥接仍存活时才是有界等待的 `stop_lock_wait` → `stop_lock_acquired`。
@@ -218,6 +230,6 @@ manifest，打包与 `check_package.py` 都拿容器与 manifest 比对（名称
 
 - 总开关默认关闭；未配对、未校准或无法保持 READY 时不自动接听。
 - 语音/文本会发送给用户配置的远程供应商；默认不保存原始录音或完整转写。
-- 密钥只经 stdin 写入 root 私有目录（0700），不进入 argv、URL、日志或导出；WebUI 不读取密钥。
+- 密钥最终只进入 CLI 的 stdin（ksu.io 文件重定向，或固定命令的分块 env 拼接到 stdin），不进入 argv、URL、日志或导出；WebUI 不读取密钥。
 - 模块与 APK 都依赖用户自行安装的 Xposed 框架与 KernelSU；不重签 Google 电话、不注入
   `system_server`、不改 SELinux、不自动刷框架或重启。

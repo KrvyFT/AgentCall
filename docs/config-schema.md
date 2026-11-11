@@ -1,6 +1,6 @@
 # AgentCall 配置 schema、CAS 与固定 CLI
 
-本文是 AgentCall 配置主副本与 WebUI/CLI 之间的接口约定。适用的代码 HEAD：`ae8c70f`；
+本文是 AgentCall 配置主副本与 WebUI/CLI 之间的接口约定。适用的代码 HEAD：`647a52f`；
 主要实现文件：
 
 - `bridge/src/main/java/org/krvyft/agentcall/bridge/config/ConfigStore.kt`（主副本、CAS、密钥）
@@ -138,13 +138,20 @@ inbox 中的一次性明文负载只在一次保存期间存在（仅 ksu.io 首
   缺失、非字符串、含空白/控制字符或超长时，调用方必须按“代次未知”处理，不得当成同一进程；
   `uptimeMs` 只作展示，不能替代它。
 - `hookConnected`：boolean，或字符串 `"unknown"`。表示 HOOK 角色是否在 **5000 ms**
-  心跳窗口内报告过心跳，数据源是监督端按会话记录的内存状态（`Supervisor.peerAlive`），
-  不发远程请求、不读密钥。未接入监督状态时返回 `"unknown"`。
-- `dialerDefaultRole`：boolean，或字符串 `"unknown"`。只有系统 `ROLE_DIALER` 持有者
-  是 Google 电话时才返回 `true`；角色查询不可读（无 `RoleManager`/隐藏 API 策略/权限）
-  时，只有 `ACTION_DIAL + CATEGORY_DEFAULT` 的 `MATCH_DEFAULT_ONLY` 默认处理器明确是
-  **其它**应用才返回 `false`；解析到 Google 电话本身、系统 Resolver、无候选或任何异常
-  都返回 `"unknown"`。这是特权进程内的本地查询，不调用 Telecom、不修改角色。
+  窗口内出现过，数据源是监督端按角色记录的内存最近出现时刻；**任何已鉴权 HOOK 请求**都会
+  刷新它，包括无会话、空负载的固定方法 `hook.presence`（HOOK 每 2 s 发一次，零存活会话
+  也发）。因此它不再依赖活动通话或按会话心跳。未接入监督状态时返回 `"unknown"`。
+- `dialerDefaultRole`：boolean，或字符串 `"unknown"`。判定顺序（第一个确定结论胜出）：
+  1. 系统 `RoleManager` 的 `ROLE_DIALER` 持有者可读时，是唯一权威事实；
+  2. 角色不可读（无 `RoleManager`/隐藏 API 策略/权限）时，用 root 固定命令
+     `cmd role get-role-holders android.app.role.DIALER`，再
+     `cmd telecom get-default-dialer`（每条 2 s 超时、8 KiB 输出上限，结果含 UNKNOWN
+     缓存 30 s）；输出只接受**恰好一个**合法包名，多持有者/空/纯标点/错误文本/超长都
+     是 unknown；
+  3. 命令也给不出事实时，只有 `ACTION_DIAL + CATEGORY_DEFAULT` 的
+     `MATCH_DEFAULT_ONLY` 默认处理器明确是**其它**应用才返回 `false`。
+  解析到 Google 电话本身、系统 Resolver、无候选或任何异常都返回 `"unknown"`。这是
+  特权进程内的本地查询，不调用 Telecom 修改接口、不修改角色。
 - 阶段 B 之前这两个字段不存在于 status；现在 WebUI 只按真实布尔渲染，`"unknown"` 显示
   “未知”，缺失时同样显示未知，前端不伪造结论。
 - `diagnose` 负载：`environment`（apiLevel/romFingerprint/kernelVersion/
@@ -155,6 +162,20 @@ inbox 中的一次性明文负载只在一次保存期间存在（仅 ksu.io 首
   `dialerPackage=`、`dialerVersion=`、`dialerSignatureSha256=`、`hiddenApi=` 与
   `packageProvider=<context|appglobals|binder|shell|UNKNOWN>`；后者是 11N 分层包事实
   来源的实际落点，shell 路径的签名显式为 `UNKNOWN`（不可验证，fail closed）。
+
+**固定方法表（与本文 status/校准字段相关，协议版本 1；未知方法一律拒绝）**：
+
+| 方法 | 角色 | sessionId | 负载 | 说明 |
+| --- | --- | --- | --- | --- |
+| `status` | APP、CLI_ROOT | 无 | 空 | 本文 §3 的 status 视图 |
+| `hook.snapshot` | HOOK | 必需 | 固定 JSON | 真实通话状态快照 |
+| `hook.heartbeat` | HOOK | 必需 | 空 | 会话存在性，不改变监督阶段 |
+| `hook.presence` | HOOK | **无** | **空** | 空闲存在性；每 2 s 一次，驱动 `status.hookConnected`（5000 ms 窗口），不改变所有权/阶段 |
+| `calibration.read` | APP、CLI_ROOT | 无 | 空 | 只读校准视图 |
+| `calibration.record` | CLI_ROOT | 无 | 固定 JSON | 仅 root 操作员写五项证据/背书 |
+
+HOOK 的固定方法只有 `hook.snapshot`、`hook.heartbeat`、`hook.presence`、
+`call.command.result`；HOOK 永远没有 `config.*`/密钥方法。
 
 ---
 
@@ -197,7 +218,10 @@ inbox 中的一次性明文负载只在一次保存期间存在（仅 ksu.io 首
      “从 stdin 读 config-set”。每次保存使用唯一文件名，两个 WebUI 实例不会互相覆盖负载
      （固定路径曾让 A 的 CLI 读到 B 的 payload，CAS 仍可能通过）。
   2. **`ksu.exec` + env 回退**：`ksu.io` 不可用（缺少 `File`/`FileOutputStream`，或
-     `support: false`）但 exec 支持 `options.env` 时，把 JSON 拆成
+     `support: false`）但 exec 支持 `options.env` 时，先用一条**无密钥**探测确认管理器
+     同时透传多个变量且不截断长值：canary 拆成 `AGENTCALL_PROBE_0..2`（每块 128 码元，
+     命令为 `printf '%s' "$AGENTCALL_PROBE_0" "$AGENTCALL_PROBE_1" "$AGENTCALL_PROBE_2"`，
+     stdout 必须逐字节等于完整 canary）。探测通过后才把 JSON 拆成
      `AGENTCALL_CFG_PAYLOAD_0..N`（每块 128 UTF-16 码元、绝不拆代理对、最多 64 块），
      再执行**完全固定**的命令
      `printf '%s' "$AGENTCALL_CFG_PAYLOAD_0" ... "$AGENTCALL_CFG_PAYLOAD_N" | <moduleDir>/bin/agentcallctl config-set`。
@@ -206,11 +230,13 @@ inbox 中的一次性明文负载只在一次保存期间存在（仅 ksu.io 首
      `{ "env": { "AGENTCALL_CFG_PAYLOAD_0": "<chunk0>", ... } }` 传入。命令字符串里只有
      环境变量名与固定索引，没有负载；不 base64 进 argv，不写 URL/日志。管理器未透传 env、
      分块被截断或缺失时探测失败，保存 fail closed；超过 64 块返回 `payload_too_large`。
+     保存失败消息只追加 `transport=env bytes=<n> chunks=<k>`（长度与块数，绝不含负载）。
   3. **两种都不可用**：只读态，`config-set` 被拒绝并返回
      `secret_transport_unsupported`；提示升级管理器，或在 root shell 用
      `agentcallctl config-set < <负载文件>` 从 stdin 提交。
   密钥永远不进入进程 argv、URL、日志或错误消息；保存成功始终以后端回读的 revision 与
-  密钥状态为准。
+  密钥状态为准。桥接在 `config-set` 的反射/校验依赖抛 `Throwable`（含隐藏 API `Error`）时
+  固定返回 `config_validation_unavailable`，不会冒成 `internal_error`。
 - **页面作用域**：WebUI 的每个页面保存只提交本页字段，校验也只针对本页；绝不夹带其它页面
   正在编辑（未确认）的内容，尤其是 AI 密钥意图：
 
@@ -341,6 +367,7 @@ inbox 中的一次性明文负载只在一次保存期间存在（仅 ksu.io 首
 | `package_provider_attempt=<code> result=unavailable` | 该层构造失败，链继续下一层（每层各一行） |
 | `package_provider_unavailable candidates=...` | 四层全失败；桥接随后以 `package_manager_unavailable` 退出（fail closed） |
 | `package_manager_unavailable` | 没有任何包事实 provider：stderr 机器错误 JSON，桥接退出码 1 |
+| `hook_transport connect_failed\|server_untrusted\|protocol_violation failures=<n>` | Hook 传输失败（XposedBridge/logcat）：固定机器码 + 累计失败数；每个机器码约 5 s 限流一条，**不含负载、会话号或号码** |
 | `stop_lock_wait path=... timeout=<n>s` | 桥接仍存活时进入有界等待（与 `uninstall.sh` 串行化） |
 | `stop_lock_acquired path=...` | 取得停止锁；桥接退出后的清理会带 `nonblocking=1` |
 | `stop_lock_reentrant path=... held=<n>` | 本进程已持锁，清理路径不重复申请（避免自锁） |
@@ -388,13 +415,16 @@ root 背书只能填补桥接观测不到的 `frameworkVersion`/`simCarrier`，�
 `frameworkVersion` 依次读 root SystemProperties（`ro.lsposed.version`/
 `persist.sys.lsposed.version`/`ro.vector.version`/`persist.sys.vector.version`/
 `ro.edxposed.version`/`persist.sys.edxposed.version`）、
-`/data/adb/modules/{lsposed,zygisk_lsposed,vector}/module.prop` 的 `version=`、XposedBridge
-类检查（只接受 `getXposedVersion()` 的 int/long/String 返回值：整数且为正、long 不超过
+`/data/adb/modules/{zygisk_vector,zygisk_lsposed,lsposed,vector,edxposed}/module.prop`
+的 `version=`（本设备是 `zygisk_vector`，值
+`v2.2 (3080-88f8e1fa-JingMatrix-Vector)`）、XposedBridge 类检查（只接受
+`getXposedVersion()` 的 int/long/String 返回值：整数且为正、long 不超过
 `Int.MAX_VALUE`；Double/Float/NaN/负数/零/溢出、String 超长/含控制字符/为 `UNKNOWN` 一律
-视为未知）；`simCarrier` 读 TelephonyManager
-SIM 运营商名并回退
-`gsm.sim.operator.alpha`/`gsm.sim.operator.default-name`/`ro.cdma.home.operator.alpha`。未知或
-不一致环境整体拒绝。校准存储未接线时返回 `calibration_unavailable`，绝不假装已验证。
+视为未知）；`simCarrier` 读 TelephonyManager SIM 运营商名并回退
+`gsm.sim.operator.alpha`/`gsm.sim.operator.default-name`/`ro.cdma.home.operator.alpha`；
+逗号分隔列表只取第一个非空片段并去掉首尾标点（本设备
+`China Unicom,China Unicom` -> `China Unicom`）。未知或不一致环境整体拒绝。校准存储未接线
+时返回 `calibration_unavailable`，绝不假装已验证。
 
 WebUI 的实际命令行（完整字符串，无用户数据）：
 
@@ -708,11 +738,12 @@ WebUI 不加载任何在线 CDN、不发起 fetch/XHR、不用 `innerHTML` 渲�
 
 ## 11. 未验证与已知限制
 
-- **真实 KernelSU 管理器未验证**：本环境没有设备/浏览器。首选路径依赖管理器提供
-  `ksu.exec` 与可用的 `ksu.io`（`File` + `FileOutputStream`）；若管理器没有可用的
-  `ksu.io` 但 `ksu.exec` 透传 `options.env`，实现会走固定命令 + env 回退。两者都不可用时
-  WebUI 进入 `readonly`（`env_unavailable`）并拒绝保存——这是有意的 fail-closed 行为，
-  不是“已保存”。文档不声称任一通道已在真机 WebView 中工作。**管理器更新仍是长期推荐方案**。
+- **真实 KernelSU WebView 未验证**：本轮新构建尚未在设备上安装，也未打开管理器 WebView。
+  首选路径依赖管理器提供 `ksu.exec` 与可用的 `ksu.io`（`File` + `FileOutputStream`）；若
+  管理器没有可用的 `ksu.io` 但 `ksu.exec` 透传 `options.env`，实现会走固定命令 + env
+  回退。两者都不可用时 WebUI 进入 `readonly`（`env_unavailable`）并拒绝保存——这是有意的
+  fail-closed 行为，不是“已保存”。文档不声称任一通道已在真机 WebView 中工作。**管理器更新
+  仍是长期推荐方案**。
 - **stdin/密钥传输能力**：`agentcallctl` 始终从继承的 stdin 读取负载。首选通道由 WebUI
   把 JSON 放进 root 私有文件并重定向；env 回退由固定命令中的
   `printf '%s' "$AGENTCALL_CFG_PAYLOAD_0" ... "$AGENTCALL_CFG_PAYLOAD_N"` 把分块 env 按顺序拼进 CLI 的 stdin。两条通道都不把
@@ -734,19 +765,25 @@ WebUI 不加载任何在线 CDN、不发起 fetch/XHR、不用 `innerHTML` 渲�
   环境探针**未验证**。`frameworkVersion`/`simCarrier` 观测为 UNKNOWN 时，以及从不观测的
   `transport`/`route`，只有 root 操作员背书才能补齐；`UNKNOWN` 背书不完整时仍按
   `calibration_environment_unknown` 拒绝，不会伪造环境事实。APP/HOOK 不能背书。
-- **分层 PackageManager provider 未上机**：11N 的 context → appglobals → binder → shell
-  链只有 JVM 证据（顺序/缓存/失败回落/日志码/签名不可验证时的 fail closed）。真实
-  `app_process` 中 `AppGlobals`/`ServiceManager`/`IPackageManager` 的反射签名、隐藏
-  API 策略、binder 权限，以及最终落在哪一层（`package_provider=`），都**未验证**；
-  shell 路径还会让 `pair` 报 `pairing_package_unknown`、非 root 对端被
+- **分层 PackageManager provider 只确认了一个落点**：设备上桥接启动日志为
+  `package_provider=appglobals`（控制器 adb 观测）；11N 的 context → appglobals → binder →
+  shell 链其余分支只有 JVM 证据（顺序/缓存/失败回落/日志码/签名不可验证时的 fail closed）。
+  真实 `app_process` 中 binder/shell 路径的反射签名、隐藏 API 策略与权限，以及失败回落
+  顺序仍未验证；shell 路径还会让 `pair` 报 `pairing_package_unknown`、非 root 对端被
   `peer_untrusted` 拒绝（预期 fail closed）。
 - **产品阻塞项**：校准记录只是自动接听的一道闸门；默认 `UnverifiedCallIdentityVerifier`
   仍 `blocksAutoAnswer=true`，没有设备验证过的、按通话身份定位的特权 Telecom 终止路径，
   所以即使记录齐全自动接听也不会开启。APK 只有 debug 签名、不可分发。
-- **概览实时字段**：`hookConnected`/`dialerDefaultRole` 已由桥接 status 提供，但只有
-  JVM 假替身证据（`BridgeStatusLiveValuesTest`、`DialerDefaultRoleProbeTest`）。真机上
-  `RoleManager` 隐藏方法（`getRoleHolders`）的反射可用性、root 的权限判定与真实取值
-  均**未验证**；不可读时后端返回 `"unknown"`，页面显示未知，不猜测。
+- **概览实时字段**：`hookConnected`/`dialerDefaultRole` 已由桥接 status 提供。11Q 起
+  `hookConnected` 由空闲 `hook.presence`（每 2 s、5000 ms 窗口）驱动；11Q-b 起
+  `dialerDefaultRole` 在 RoleManager 不可读时用固定 root 命令兜底（2 s/8 KiB/30 s 缓存）。
+  两者仍只有 JVM 假替身证据（`HookPresenceStatusTest`、`BridgeStatusLiveValuesTest`、
+  `DialerDefaultRoleProbeTest`、`ShellDialerDefaultRoleProbeTest`）；设备上尚未在重启后确认
+  空闲 true、boolean true 与校准字段，不可读时仍返回 `"unknown"`，页面显示未知，不猜测。
+- **11P/11Q 的设备复测待做**：chunked exec+env 保存、`config_validation_unavailable` 的
+  设备反射路径、空闲 presence、root 命令兜底、frameworkVersion/simCarrier 设备值都只有
+  宿主/JVM 测试。修复前的设备证据仅有一次 RINGING（当时 `hookConnected=false`）与
+  `package_provider=appglobals`；新 ZIP/APK 安装、重启与保存复测尚未执行。
 - **连接测试**：WebUI 不执行连接测试，也不代发任何远程请求；真实测试只能在 AgentCall APK
   诊断页进行（会计费），当前无设备证据。
 - **WebView 存储**：`localStorage` 保存“最近错误”在 file:// 或受限 WebView 中可能
