@@ -136,6 +136,20 @@ class BridgeDispatcherSupervisionTest {
     }
 
     @Test
+    fun hookPresenceIsRecordedWithoutASession() {
+        // Task 11Q：空闲存在性没有 sessionId，不能走 session.heartbeat 路径。
+        val response = dispatcher.handle(
+            hookPeer,
+            RpcRequest(id = "req-presence", method = RolePolicy.METHOD_HOOK_PRESENCE),
+        )
+
+        assertNull(response.error)
+        assertEquals("", response.payload)
+        assertEquals(listOf(PeerRole.HOOK), port.presences)
+        assertTrue("presence 不是会话心跳", port.heartbeats.isEmpty())
+    }
+
+    @Test
     fun authenticatedRequestsFeedSessionHeartbeats() {
         assertNull(dispatcher.handle(hookPeer, request(hookPeer, RolePolicy.METHOD_HOOK_HEARTBEAT)).error)
 
@@ -170,6 +184,12 @@ class BridgeDispatcherSupervisionTest {
 
     private class RecordingPort : SupervisionRpcPort() {
         val heartbeats = mutableListOf<Pair<SessionId, PeerRole>>()
+        val presences = mutableListOf<PeerRole>()
+
+        override fun notePresence(role: PeerRole) {
+            presences += role
+        }
+
         var prepared = 0
         var lastPrepared: SessionId? = null
         var active = 0

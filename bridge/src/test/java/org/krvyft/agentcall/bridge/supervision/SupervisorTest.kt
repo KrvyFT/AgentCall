@@ -586,14 +586,16 @@ class SupervisorTest {
     @Test
     fun rpcStatusReportsHookPresenceOnlyWithinTheHeartbeatWindow() {
         val f = Fixture()
-        val port = SupervisorRpcPort(f.supervisor, HookCallInbox())
+        val port = SupervisorRpcPort(f.supervisor, HookCallInbox(), clockMs = { f.clock.nowMs() })
 
-        assertFalse("没有任何心跳时必须报未连接", port.status().hookConnected)
+        assertFalse("没有任何出现时必须报未连接", port.status().hookConnected)
 
         f.supervisor.heartbeat(session, PeerRole.APP, f.clock.nowMs())
         assertFalse("只有 APP 心跳不能把 Hook 标成已连接", port.status().hookConnected)
 
-        f.supervisor.heartbeat(session, PeerRole.HOOK, f.clock.nowMs())
+        // Task 11Q：HOOK 存在性来自任何已鉴权 HOOK 请求（含无会话的 hook.presence），
+        // 不再要求“有存活会话才发心跳”。
+        port.notePresence(PeerRole.HOOK)
         assertTrue(port.status().hookConnected)
 
         f.clock.advance(SessionLimits.HEARTBEAT_TIMEOUT_MS + 1)

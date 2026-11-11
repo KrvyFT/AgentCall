@@ -15,7 +15,7 @@ import org.krvyft.agentcall.core.model.RpcRequest
  * | 角色 | 允许的方法 |
  * | --- | --- |
  * | APP | session.request、session.heartbeat、session.command、session.events、status、diagnose、config.read、config.secret.read、audio.channel、handover、calibration.read（只读） |
- * | HOOK | hook.snapshot、hook.heartbeat、call.command.result |
+ * | HOOK | hook.snapshot、hook.heartbeat、hook.presence、call.command.result |
  * | CLI_ROOT | status、config.read、config.write、pair、diagnose、shutdown、calibration.read、calibration.record |
  *
  * `session.heartbeat` 只表达“APP 仍在看着这通电话”，是存在性信号，不会触发接听或改变
@@ -48,6 +48,16 @@ object RolePolicy {
 
     const val METHOD_HOOK_SNAPSHOT: String = "hook.snapshot"
     const val METHOD_HOOK_HEARTBEAT: String = "hook.heartbeat"
+
+    /**
+     * HOOK 的空闲存在性（Task 11Q）：**没有会话、没有负载**，只证明 Hook 进程在。
+     *
+     * 旧实现只在有存活会话时发心跳，空闲 Hook 对桥接完全静默，readiness 永远看不到
+     * hookConnected=true。它不在 [SESSION_METHODS] 里（正是因为没有会话），也不是
+     * 会话/监督信号：bridge 只记录角色最近一次出现的时刻，不改变所有权/阶段。
+     */
+    const val METHOD_HOOK_PRESENCE: String = "hook.presence"
+
     const val METHOD_CALL_COMMAND_RESULT: String = "call.command.result"
 
     /**
@@ -103,6 +113,8 @@ object RolePolicy {
         PeerRole.HOOK to setOf(
             METHOD_HOOK_SNAPSHOT,
             METHOD_HOOK_HEARTBEAT,
+            // Task 11Q：空闲存在性，无会话、无负载；协议版本仍为 1。
+            METHOD_HOOK_PRESENCE,
             METHOD_CALL_COMMAND_RESULT,
         ),
         PeerRole.CLI_ROOT to setOf(

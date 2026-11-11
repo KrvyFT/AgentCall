@@ -169,6 +169,8 @@ class RolePolicyTest {
                 RolePolicy.METHOD_HOOK_SNAPSHOT,
                 RolePolicy.METHOD_HOOK_HEARTBEAT,
                 RolePolicy.METHOD_CALL_COMMAND_RESULT,
+                // Task 11Q：空闲存在性（无会话），协议版本仍为 1。
+                RolePolicy.METHOD_HOOK_PRESENCE,
             ),
             RolePolicy.methodsFor(PeerRole.HOOK),
         )
@@ -313,6 +315,30 @@ class RolePolicyTest {
     fun protocolVersionMismatchRejected() {
         assertFalse(RolePolicy.authorize(rootPeer(), request(RolePolicy.METHOD_STATUS, version = 2)))
         assertTrue(RolePolicy.authorize(rootPeer(), request(RolePolicy.METHOD_STATUS, version = PROTOCOL_VERSION)))
+    }
+
+    /**
+     * Task 11Q：HOOK 空闲存在性。它证明 Hook 进程活着，但**不**携带会话、不触发监督
+     * 迁移，也不改变协议版本；APP/CLI 都不能把这条通道当成自己的呼吸信号。
+     */
+    @Test
+    fun hookPresenceIsHookOnlyAndNeedsNoSession() {
+        // HOOK 不需要 sessionId：空闲时没有任何存活会话，正是它要证明的窗口。
+        assertTrue(RolePolicy.authorize(hookPeer(), request(RolePolicy.METHOD_HOOK_PRESENCE)))
+        // 不进入 SESSION_METHODS：无会话也不能被拒绝（这正是空闲路径）。
+        assertFalse(RolePolicy.methodsFor(PeerRole.APP).contains(RolePolicy.METHOD_HOOK_PRESENCE))
+        assertFalse(RolePolicy.methodsFor(PeerRole.CLI_ROOT).contains(RolePolicy.METHOD_HOOK_PRESENCE))
+        assertFalse(RolePolicy.authorize(appPeer(), request(RolePolicy.METHOD_HOOK_PRESENCE)))
+        assertFalse(RolePolicy.authorize(rootPeer(), request(RolePolicy.METHOD_HOOK_PRESENCE)))
+        // 伪造 uid 0 + APP 角色同样拿不到。
+        assertFalse(
+            RolePolicy.authorize(
+                PeerIdentity(0, PeerRole.APP, "org.krvyft.agentcall", appSignature),
+                request(RolePolicy.METHOD_HOOK_PRESENCE),
+            ),
+        )
+        // 协议版本保持 1。
+        assertEquals(1, PROTOCOL_VERSION)
     }
 
     @Test

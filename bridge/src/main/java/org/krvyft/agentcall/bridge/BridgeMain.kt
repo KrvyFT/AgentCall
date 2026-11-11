@@ -534,7 +534,8 @@ internal fun resolveConfigRoot(args: Array<String>): File {
  * 任何错误消息都不拼接请求负载或密钥。
  *
  * 监督接入（C1）：
- * - 任何已鉴权的 APP/HOOK 请求都按其 sessionId 记心跳（按会话归属，I1）；
+ * - 任何已鉴权的 APP/HOOK 请求都记“角色最近出现”（Task 11Q，无会话的空闲
+ *   hook.presence 也走这条）；带 sessionId 的请求同时按会话记心跳（按会话归属，I1）；
  * - session.request → 监督端准备接听；session.heartbeat → 只记录 APP 存在性；
  *   session.command → 受限命令排入 HOOK 路由并在 4000 ms 内等真实结果；handover → 人工交还；
  * - hook.snapshot → 更新真实通话状态并推动 ACTIVE/断开/交还；
@@ -609,7 +610,10 @@ internal class ControlDispatcher(
         hookCommands.enqueueCommand(session, command)
 
     override fun handle(peer: PeerIdentity, request: RpcRequest): RpcResponse = try {
-        // 任何已鉴权请求都证明该角色此刻活着；存活按会话归属记录（I1）。
+        // Task 11Q：任何已鉴权请求都刷新该角色最近出现时刻（含无会话的 hook.presence），
+        // status.hookConnected 由此派生；它不改变监督所有权/阶段。
+        supervision.notePresence(peer.role)
+        // 存活按会话归属记录（I1）。
         request.sessionId?.let { supervision.heartbeat(it, peer.role) }
         when (request.method) {
             RolePolicy.METHOD_STATUS -> ok(request, statusPayload())
@@ -627,6 +631,8 @@ internal class ControlDispatcher(
             RolePolicy.METHOD_HOOK_SNAPSHOT,
             RolePolicy.METHOD_HOOK_HEARTBEAT,
             -> hookCommandLines(request)
+            // Task 11Q：空闲存在性没有会话、没有负载，只回空确认；不下发命令。
+            RolePolicy.METHOD_HOOK_PRESENCE -> ok(request, "")
             RolePolicy.METHOD_CALL_COMMAND_RESULT -> hookCommandResult(request)
             RolePolicy.METHOD_AUDIO_CHANNEL -> audioChannel(request, peer)
             RolePolicy.METHOD_CALIBRATION_READ -> calibrationRead(request)
