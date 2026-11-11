@@ -31,7 +31,12 @@
 #   的 shutdownCode/microphoneIsolated；不干净时打印 `! microphone_still_isolated` /
 #   `! shutdown_unresolved` 与 `bridge_stop_unclean`，绝不记录 `bridge_exit_clean`。
 # - 跨脚本停止锁（I4）：停止序列先取 /data/adb/agentcall/stop.lock（flock，最多等 40 s），
-#   与 uninstall.sh 串行化；拿不到锁只记录 stop_lock_timeout 并跳过重复的优雅关闭请求。
+#   与 uninstall.sh 串行化；桥接仍存活时拿不到锁记录 stop_lock_timeout，桥接已退出后的
+#   清理记录 stop_lock_busy；两种情况都只跳过重复的优雅关闭请求。
+# - 锁 fd 不得被 app_process 子进程继承（任务 11N）：每个 app_process 启动都显式 `9>&-`，
+#   否则子进程持有同一个打开文件描述，父脚本退出后锁仍被它占着（下一次停止白等 40 s）。
+# - 桥接已经退出后的清理（错误路径/干净退出）只做一次非阻塞取锁：没有优雅关闭需要串行化，
+#   拿不到锁立即记录 stop_lock_busy 并继续有界回收，绝不再等满 STOP_LOCK_WAIT_SECONDS。
 # - 顺序不能颠倒：先杀音频工作进程会让桥接的恢复请求不可达，麦克风会保持全局静音。
 # - 启动时先回收上一次实例留下的音频工作进程（幂等），并按 cmdline 核验 PID 身份，
 #   避免 PID 复用误杀无关进程。
@@ -378,7 +383,11 @@ report_persisted_shutdown_verdict() {
 # 超时只记录机器可读原因（绝不无限阻塞停止路径）。优先 flock；没有 flock 时退回
 # mkdir 原子目录锁，语义相同（同一路径只允许一个持有者）。
 acquire_stop_lock() {
-    [ "$stop_lock_held" -eq 0 ] || return 0
+    if [ "$stop_lock_held" -ne 0 ]; then
+        # 本脚本已经持有锁：清理路径不能再次申请（同一进程重复 flock 会自锁 40 s）。
+        log_line "stop_lock_reentrant path=$STOP_LOCK_FILE held=$stop_lock_held"
+        return 0
+    fi
     log_line "stop_lock_wait path=$STOP_LOCK_FILE timeout=${STOP_LOCK_WAIT_SECONDS}s"
     if command -v flock >/dev/null 2>&1; then
         exec 9>"$STOP_LOCK_FILE" 2>/dev/null || {
@@ -409,6 +418,38 @@ acquire_stop_lock() {
     return 1
 }
 
+# 桥接已退出时的清理取锁：只做一次非阻塞尝试。
+# 此时没有任何优雅关闭请求可能需要与 uninstall.sh 串行化，阻塞 40 s 只会延长失败恢复；
+# 桥接仍存活时调用方必须继续用 acquire_stop_lock（有界等待）保持并发停止语义。
+acquire_stop_lock_cleanup() {
+    if [ "$stop_lock_held" -ne 0 ]; then
+        log_line "stop_lock_reentrant path=$STOP_LOCK_FILE held=$stop_lock_held"
+        return 0
+    fi
+    if command -v flock >/dev/null 2>&1; then
+        exec 9>"$STOP_LOCK_FILE" 2>/dev/null || {
+            log_line "stop_lock_unavailable path=$STOP_LOCK_FILE reason=open_failed"
+            return 1
+        }
+        if flock -n 9 2>/dev/null; then
+            stop_lock_held=1
+            log_line "stop_lock_acquired path=$STOP_LOCK_FILE nonblocking=1"
+            return 0
+        fi
+        exec 9>&- 2>/dev/null
+        log_line "! stop_lock_busy path=$STOP_LOCK_FILE nonblocking=1"
+        return 1
+    fi
+    lock_dir="$STOP_LOCK_FILE.d"
+    if mkdir "$lock_dir" 2>/dev/null; then
+        stop_lock_held=2
+        log_line "stop_lock_acquired path=$lock_dir fallback=mkdir nonblocking=1"
+        return 0
+    fi
+    log_line "! stop_lock_busy path=$lock_dir fallback=mkdir nonblocking=1"
+    return 1
+}
+
 release_stop_lock() {
     if [ "$stop_lock_held" -eq 1 ]; then
         flock -u 9 2>/dev/null
@@ -434,7 +475,7 @@ probe_bridge_status() {
         return 1
     fi
     rm -f "$STATUS_RESULT_FILE" 2>/dev/null
-    "$APP_PROCESS" -Djava.class.path="$BRIDGE_JAR" /system/bin --nice-name=agentcall-cli "$CLI_MAIN_CLASS" status > "$STATUS_RESULT_FILE" 2>/dev/null &
+    "$APP_PROCESS" -Djava.class.path="$BRIDGE_JAR" /system/bin --nice-name=agentcall-cli "$CLI_MAIN_CLASS" status > "$STATUS_RESULT_FILE" 2>/dev/null 9>&- &
     probe_pid=$!
     waited=0
     while pid_alive "$probe_pid" && [ "$waited" -lt "$STATUS_PROBE_WAIT_SECONDS" ]; do
@@ -492,7 +533,7 @@ request_bridge_graceful_shutdown() {
     cli_timed_out=0
     log_line "bridge_shutdown_request pid=$bridge_pid"
     rm -f "$SHUTDOWN_RESULT_FILE" 2>/dev/null
-    "$APP_PROCESS" -Djava.class.path="$BRIDGE_JAR" /system/bin --nice-name=agentcall-cli "$CLI_MAIN_CLASS" shutdown > "$SHUTDOWN_RESULT_FILE" 2>/dev/null &
+    "$APP_PROCESS" -Djava.class.path="$BRIDGE_JAR" /system/bin --nice-name=agentcall-cli "$CLI_MAIN_CLASS" shutdown > "$SHUTDOWN_RESULT_FILE" 2>/dev/null 9>&- &
     cli_pid=$!
     waited=0
     while pid_alive "$cli_pid" && [ "$waited" -lt "$GRACEFUL_SHUTDOWN_WAIT_SECONDS" ]; do
@@ -594,10 +635,22 @@ shutdown_children() {
     # 硬顺序：取跨脚本停止锁 → 桥接优雅关闭（恢复麦克风需要音频工作进程存活）→
     # 停音频工作进程 → 对仍未退出的进程做有界 TERM→KILL。任何一步失败都不能颠倒
     # 后面的顺序；锁确保 uninstall.sh 与本次停止只跑一次优雅关闭序列。
-    if acquire_stop_lock; then
+    # 桥接仍存活：保持有界等待（并发 uninstall/service 停止必须串行化）。
+    # 桥接已退出：非阻塞尝试即可，失败也只是记录原因后有界回收。
+    bridge_running=0
+    if [ -n "$bridge_pid" ] && pid_alive "$bridge_pid"; then
+        bridge_running=1
+    fi
+    cleanup_lock_acquired=0
+    if [ "$bridge_running" -eq 1 ]; then
+        acquire_stop_lock && cleanup_lock_acquired=1
+    else
+        acquire_stop_lock_cleanup && cleanup_lock_acquired=1
+    fi
+    if [ "$cleanup_lock_acquired" -eq 1 ]; then
         request_bridge_graceful_shutdown
     else
-        log_line "bridge_shutdown_skipped reason=stop_lock_timeout"
+        log_line "bridge_shutdown_skipped reason=stop_lock_unavailable"
         # 拿不到锁时仍读回持久裁决：桥接可能已经退出，警告不能因此丢失。
         report_persisted_shutdown_verdict || true
     fi
@@ -766,7 +819,7 @@ audio_worker_supervisor() {
         attempt=$((restarts + 1))
         rotate_log
         log_line "audio_worker_start attempt=$attempt"
-        "$APP_PROCESS" -Djava.class.path="$BRIDGE_JAR" /system/bin --nice-name=agentcall-audio-worker "$AUDIO_MAIN_CLASS" >> "$LOG_FILE" 2>&1 &
+        "$APP_PROCESS" -Djava.class.path="$BRIDGE_JAR" /system/bin --nice-name=agentcall-audio-worker "$AUDIO_MAIN_CLASS" >> "$LOG_FILE" 2>&1 9>&- &
         worker_pid=$!
         printf '%s\n' "$worker_pid" > "$AUDIO_PID_FILE" 2>/dev/null
         if wait_ready "$worker_pid" "$AUDIO_SOCKET"; then
@@ -810,7 +863,7 @@ bridge_container_supervisor() {
         # 上一次尝试已退出，轮转是安全的；单次运行期间桥接只输出少量脱敏行。
         rotate_log
         log_line "bridge_start attempt=$attempt"
-        "$APP_PROCESS" -Djava.class.path="$BRIDGE_JAR" /system/bin --nice-name=agentcall-bridge "$MAIN_CLASS" >> "$LOG_FILE" 2>&1 &
+        "$APP_PROCESS" -Djava.class.path="$BRIDGE_JAR" /system/bin --nice-name=agentcall-bridge "$MAIN_CLASS" >> "$LOG_FILE" 2>&1 9>&- &
         bridge_pid=$!
         printf '%s\n' "$bridge_pid" > "$PID_FILE" 2>/dev/null
         if wait_ready "$bridge_pid" "$CONTROL_SOCKET"; then

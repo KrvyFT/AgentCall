@@ -357,6 +357,7 @@ function serviceHarness() {
       "#!/bin/sh",
       'case "$*" in',
       "  *AgentCallCli*)",
+      '    if [ -n "${AGENTCALL_FAKE_FD_LOG:-}" ] && [ -e /proc/self/fd/9 ]; then echo "LOCKFD_INHERITED $*" >> "$AGENTCALL_FAKE_FD_LOG"; fi',
       '    if [ -n "${AGENTCALL_FAKE_SHUTDOWN_TRIGGER:-}" ]; then : > "$AGENTCALL_FAKE_SHUTDOWN_TRIGGER"; fi',
       '    if [ -n "${AGENTCALL_FAKE_SHUTDOWN_JSON:-}" ]; then printf "%s\\n" "$AGENTCALL_FAKE_SHUTDOWN_JSON"; fi',
       '    exit "${AGENTCALL_FAKE_CLI_EXIT:-0}"',
@@ -1429,6 +1430,125 @@ test("agentcallctl restart：固定 shutdown 失败时收回请求并报 restart
     killQuietly(service);
     rmSync(harness.root, { recursive: true, force: true });
   }
+});
+
+
+// ---------------------------------------------------------------------------------------------
+// Task 11N：stop.lock 的 fd 继承与失败清理超时
+//
+// 真机错误清理路径记录 stop_lock_wait timeout=40s → ! stop_lock_timeout → 跳过优雅关闭。
+// 两个成因：app_process 子进程继承了 flock fd（父脚本退出后锁仍被同一打开文件描述持有），
+// 以及桥接已经退出后清理仍按 40 s 上限等一个不可能释放的锁。下面用真实 shell + flock
+// 验证：子进程不继承锁 fd；失败清理不等满超时；桥接存活时仍串行化。
+// ---------------------------------------------------------------------------------------------
+
+test("service.sh：每个 app_process 子进程都显式关闭 stop.lock 的 fd 9", () => {
+  const service = read("service.sh");
+  const launches = service.split("\n").filter((line) => line.trimStart().startsWith('"$APP_PROCESS"'));
+  assert.ok(launches.length >= 4, "桥接/音频/CLI/status 四个 app_process 启动点都必须覆盖：" + launches.length);
+  for (const line of launches) {
+    assert.match(line, /9>&-/, "app_process 子进程不得继承 flock fd：" + line.trim());
+  }
+});
+
+test(
+  "service.sh：干净退出后清理不再等待 stop.lock（桥接已退出时非阻塞）",
+  { timeout: 90000 },
+  async () => {
+    const harness = serviceHarness();
+    const lockFile = join(harness.dataRoot, "stop.lock");
+    const ready = join(harness.root, "holder-ready");
+    const fdLog = join(harness.root, "fd.log");
+    let holder = null;
+    let child = null;
+    try {
+      // 另一个停止序列长时间持锁：桥接失败后的清理不得因此多等 40 s。
+      holder = spawn("flock", [lockFile, "sh", "-c", 'echo ready > "$1"; sleep 120', "sh", ready], {
+        stdio: "ignore",
+      });
+      await waitFor(() => existsSync(ready), 5000, "lock holder ready");
+
+      const startedAt = Date.now();
+      child = spawn("sh", [harness.script], {
+        env: serviceEnv(harness, { AGENTCALL_FAKE_BRIDGE_EXIT: "1", AGENTCALL_FAKE_FD_LOG: fdLog }),
+        stdio: "ignore",
+      });
+      const { code } = await waitForExit(child, 80000);
+      const elapsed = Date.now() - startedAt;
+
+      assert.notEqual(code, 0, "桥接失败必须保留非零退出码");
+      assert.ok(
+        elapsed < 35000,
+        "桥接已退出后的清理不得等满 40 s stop.lock 超时（实际 " + elapsed + " ms）",
+      );
+
+      const log = readFileSync(harness.logFile, "utf8");
+      assert.match(log, /stop_lock_busy/, "非阻塞取锁失败必须留下机器可读原因：" + log);
+      assert.match(log, /bridge_shutdown_skipped reason=stop_lock_unavailable/, "必须记录跳过优雅关闭");
+      assert.equal(/! stop_lock_timeout/.test(log), false, "桥接已退出时不得再进入 40 s 等待：" + log);
+      assert.equal(existsSync(fdLog), false, "CLI app_process 不得继承 stop.lock 的 fd 9");
+    } finally {
+      killQuietly(child);
+      if (holder) holder.kill("SIGKILL");
+      rmSync(harness.root, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "service.sh：桥接存活时的停止仍在 stop.lock 上串行化（等持有者释放后才 shutdown）",
+  { timeout: 90000 },
+  async () => {
+    const harness = serviceHarness();
+    const lockFile = join(harness.dataRoot, "stop.lock");
+    const ready = join(harness.root, "holder-ready");
+    const trigger = join(harness.root, "shutdown-trigger");
+    let holder = null;
+    let child = null;
+    try {
+      child = spawn("sh", [harness.script], {
+        env: serviceEnv(harness, {
+          AGENTCALL_FAKE_BRIDGE_STAY: "1",
+          AGENTCALL_FAKE_SHUTDOWN_TRIGGER: trigger,
+          AGENTCALL_STOP_LOCK_WAIT_SECONDS: "10",
+        }),
+        stdio: "ignore",
+      });
+      await waitFor(
+        () => existsSync(harness.bridgePidFile) && existsSync(harness.audioPidFile),
+        20000,
+        "bridge/audio pid files",
+      );
+
+      holder = spawn("flock", [lockFile, "sh", "-c", 'echo ready > "$1"; sleep 3', "sh", ready], {
+        stdio: "ignore",
+      });
+      await waitFor(() => existsSync(ready), 5000, "lock holder ready");
+
+      const startedAt = Date.now();
+      child.kill("SIGTERM");
+      await waitForExit(child, 40000);
+      const elapsed = Date.now() - startedAt;
+
+      assert.ok(elapsed >= 2500, "必须等锁持有者释放后才继续（实际 " + elapsed + " ms）");
+      assert.equal(existsSync(trigger), true, "取得锁后必须执行一次固定 CLI shutdown");
+      const log = readFileSync(harness.logFile, "utf8");
+      assert.match(log, /stop_lock_wait path=/);
+      assert.match(log, /stop_lock_acquired path=/);
+      assert.equal(/! stop_lock_timeout/.test(log), false, "10 s 上限内必须等得到锁：" + log);
+    } finally {
+      killQuietly(child);
+      if (holder) holder.kill("SIGKILL");
+      rmSync(harness.root, { recursive: true, force: true });
+    }
+  },
+);
+
+test("service.sh：桥接存活的停止路径仍显式关闭 CLI 的锁 fd", () => {
+  // 真实回归由下面这条用例覆盖（CLI 在持锁期间启动）；这里固定源码契约，防止未来
+  // 新增 app_process 启动点时忘记关闭 fd 9。
+  const service = read("service.sh");
+  assert.match(service, /shutdown > "\$SHUTDOWN_RESULT_FILE" 2>\/dev\/null 9>&- &/);
 });
 
 test("uninstall.sh：先收回待处理的重启请求，避免卸载过程中桥接被重新拉起", () => {
