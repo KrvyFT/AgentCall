@@ -105,7 +105,7 @@ flock /tmp/agentcall-gradle.lock ./gradlew \
 交付时重跑 `make test` 通过（退出码 0）：
 
 - JVM 单测：同上 845 项（HEAD `438cbbd`，完整重跑）。
-- WebUI node 测试：`node --test module/webroot/tests/*.test.mjs`，115 tests / 115 pass / 0 fail / 0 skipped。
+- WebUI node 测试：`node --test module/webroot/tests/*.test.mjs`，116 tests / 116 pass / 0 fail / 0 skipped（含 KernelSU source 安装回归）。
 - Python 打包测试：`python3 -m unittest discover -s tools/tests -v`，59 tests，OK。
 - 模块脚本语法：`sh -n` 检查 `customize.sh`、`service.sh`、`uninstall.sh`、`bin/agentcallctl`。
 - `make package-check` 重跑：`Status: PASS`（结构、版本、签名、SHA-256 见 4.5）。
@@ -116,13 +116,15 @@ flock /tmp/agentcall-gradle.lock ./gradlew \
 
 | 文件 | 大小 | SHA-256 |
 | --- | --- | --- |
-| `dist/agentcall-1.0.zip` | 1,405,746 B | `31eedd1fd4ca99571b7267e181624f00eafdf53022e1d2415ed11a20828c19a4` |
+| `dist/agentcall-1.0.zip` | 1,406,017 B | `7ba5cd26c19445b955e132ff79aaa120503dcb2ec44a46f72605961170bde274` |
 | `dist/agentcall-1.0.apk` | 2,274,772 B | `8fd9332de246baf31154f83ca5fc7bfe48e41e28d676023aeadd108e135e0dc6` |
 | `dist/SHA256SUMS` | 168 B | 两行，分别匹配上面两个摘要 |
 
-这些哈希对应**最终代码 HEAD `438cbbd` 上重新完成的打包**（在最后的 bridge 收紧之后），
-与 `dist/SHA256SUMS` 一致；`sha256sum -c` 通过。重签 APK 后哈希必然变化，必须重生成
-`SHA256SUMS` 并以新文件为准。
+APK 与 bridge 容器仍对应 **HEAD `438cbbd` 的 app/bridge 源码**：Task 11K 只改
+`module/customize.sh` 与回归测试，`git diff 438cbbd..fc351b4 -- app bridge core` 为空，
+因此 APK 哈希与上一版逐字节一致（`8fd9332d…`），无需重装 APK。模块 ZIP 在 `fc351b4`
+重新打包（安装脚本修复），与 `dist/SHA256SUMS` 一致；`sha256sum -c` 通过。重签 APK
+或改动 app/bridge 后哈希必然变化，必须重生成 `SHA256SUMS` 并以新文件为准。
 
 模块 ZIP 共 **11 个条目**（`bin/agentcallctl`、`bridge/agentcall-bridge.jar`、
 `bridge/agentcall-bridge.dex-manifest.json`、`customize.sh`、`module.prop`、`service.sh`、
@@ -166,7 +168,7 @@ flock /tmp/agentcall-gradle.lock ./gradlew \
 - R8：release 收缩启用（`packageScope = setOf("**")`），mapping 99,205 行；release 未签名
   APK 2.18 MB，debug 重签交付 APK 2.27 MB（见 4.7）。
 - Release APK 与 bridge 运行时容器均构建成功。
-- `make test` PASS：JVM（845）+ WebUI node（115）+ Python（59）+ 模块脚本 `sh -n`。
+- `make test` PASS：JVM（845）+ WebUI node（116）+ Python（59）+ 模块脚本 `sh -n`。
 - `make build` PASS；`make package-check` PASS（appId `org.krvyft.agentcall`，版本 1.0 (1)，
   `module.prop` 1.0 (1)，dex `classes.dex`，结构 module=1/scripts=3/bridge=2/bin=1/webroot=4）。
 - 产物结构、版本一致性、DEX manifest 覆盖、debug 签名类型、密钥泄漏检查与 SHA-256 均已核对。

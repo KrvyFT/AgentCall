@@ -10,10 +10,10 @@
 
 ## 当前状态（HEAD `438cbbd`，2026-11-11）
 
-- 最终本地矩阵（HEAD `438cbbd`）：225 个 Gradle task，BUILD SUCCESSFUL；JVM core 126 /
+- JVM/构建矩阵（HEAD `438cbbd`）：225 个 Gradle task，BUILD SUCCESSFUL；JVM core 126 /
   bridge 360 / app 359，合计 **845**，0 failures / 0 errors / 0 skipped；lint 0 errors /
-  15 warnings；WebUI node 115/115；Python 59/59。release APK 与模块 ZIP 已在该 HEAD
-  重新打包（大小与 SHA-256 见 `docs/verification.md` 4.5）。
+  15 warnings；WebUI node 116/116（Task 11K 安装回归）；Python 59/59。APK 与模块 ZIP 的
+  大小与 SHA-256 见 `docs/verification.md` 4.5（Task 11K 只重打模块 ZIP，APK 字节未变）。
 - **交付时 `adb devices` 为空，没有设备连接。** 实现期间曾只读观察到 XQ-DQ72（API 37），
   但 shell uid 2000 没有 `su`，所以没有安装模块、启动桥接、发起通话或执行任何音频测试。
 - 结论不变：**D01–D12 每一行仍为「未验证」**；最终 JVM 计数不构成任何一行真机结论，

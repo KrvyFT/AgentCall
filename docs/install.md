@@ -17,9 +17,9 @@
 | `dist/agentcall-<version>.apk` | AgentCall APK（Xposed 模块 + 远程语音回合） |
 | `dist/SHA256SUMS` | 两个产物的 SHA-256 |
 
-最终打包（代码 HEAD `438cbbd`，在最后的 bridge/module 修复之后重新构建；以
-`dist/SHA256SUMS` 为准）：`agentcall-1.0.zip` 1,405,746 B（11 个条目），SHA-256
-`31eedd1fd4ca99571b7267e181624f00eafdf53022e1d2415ed11a20828c19a4`；
+最终打包（Task 11K 只改安装脚本：模块 ZIP 在 `fc351b4` 重新打包；APK 仍是 `438cbbd`
+的字节未变产物，以 `dist/SHA256SUMS` 为准）：`agentcall-1.0.zip` 1,406,017 B（11 个条目），
+SHA-256 `7ba5cd26c19445b955e132ff79aaa120503dcb2ec44a46f72605961170bde274`；
 `agentcall-1.0.apk` 2,274,772 B，SHA-256
 `8fd9332de246baf31154f83ca5fc7bfe48e41e28d676023aeadd108e135e0dc6`。
 `python3 tools/check_package.py --dist dist` 输出 `Status: PASS`：appId
@@ -314,6 +314,9 @@ SystemProperties、模块 `module.prop`、XposedBridge 类检查、TelephonyMana
 4. Google 电话升级后同样要重新 `pair`（拨号器 `versionName` 变了）。
 5. 重新校验 `status` 与 `diagnose`，再按需开启总开关。
 
+> Task 11K 的安装修复只改模块 ZIP 中的 `customize.sh`，APK 与 bridge 容器字节未变：
+> 已安装用户只需重装模块 ZIP 并重启，不必重装 APK，也不必重新 `pair`。
+
 ### 桥接 BLOCKED / 服务恢复（重试服务）
 
 桥接在麦克风恢复失败、持久状态损坏或“重启时仍持有旧通话”等情况下会进入
@@ -423,7 +426,7 @@ AI 会话，等待人工处理。恢复路径：
 | --- | --- |
 | 模块 ZIP 结构、DEX 入口、版本、SHA-256、密钥泄漏检查 | 本地已验证（`make package-check`） |
 | 最终矩阵（HEAD `438cbbd`） | 本地 PASS：225 个 Gradle task；JVM 845（core 126 / bridge 360 / app 359，0 failures / 0 errors / 0 skipped）、lint 0 errors / 15 warnings；APK/ZIP 已在该 HEAD 重新打包（哈希见第 1 节） |
-| JVM/JS/Python/脚本检查 | JVM 845；WebUI node 115/115；Python 59/59；`sh -n` 模块脚本通过；`make test` / `make build` / `make package-check` 全 PASS |
+| JVM/JS/Python/脚本检查 | JVM 845；WebUI node 116/116；Python 59/59；`sh -n` 模块脚本通过；`make test` / `make build` / `make package-check` 全 PASS |
 | release 收缩（R8） | 本地已验证：`packageScope = setOf("**")`，mapping 99,205 行，release 未签名 APK 2.18 MB（debug 重签 2.27 MB）；**真机未验证** |
 | 配对（WebUI/root CLI）与 APK 校准/诊断界面 | 已实现；root CLI `calibrate` 经 `calibration.record` 写入五项人工证据；十个环境字段中六个（apiLevel、romFingerprint、kernelVersion、dialerPackageVersion、bridgeVersion、audioPolicyDigest）由桥接观测；四个可背书字段里 frameworkVersion/simCarrier 有真实观测源、只在观测不到时才由 root 背书，transport/route 则从不观测、始终为 UNKNOWN、只能在 calibrate 时由 root 背书；APP 就绪另需 `calibration.read` 的 supported/verified/environmentComplete/environmentMatchesEvidence（supportedApiLevel 是策略常量 `CalibrationPolicy.SUPPORTED_API_LEVEL`=37，不是设备 API 等级；API 36 因 `API_LEVEL_UNSUPPORTED` 保持阻断；真机探针与五项实测未验证，见第 7 节） |
 | 优雅关闭停止顺序（先取 stop.lock、shutdown、后停音频工作进程、再 TERM→KILL） | 本地宿主已验证（`shutdown-order.test.mjs`、`module-scripts.test.mjs` 进程/CLI 替身，含并发锁等待）；**真机未验证** |
