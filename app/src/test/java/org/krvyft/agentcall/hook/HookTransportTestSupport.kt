@@ -72,8 +72,15 @@ internal fun awaitHookRequests(
 ): FakeHookSocketLink {
     val deadline = System.nanoTime() + timeoutMs * 1_000_000L
     while (System.nanoTime() < deadline) {
-        if (links.size >= expected) return links[expected - 1]
+        // 连接先建立、请求后写入：必须等目标连接已记录请求帧，否则测试会在
+        // “socket 已出现但 requests 仍为空”的窗口里读到空列表（真实竞态）。
+        if (links.size >= expected && links[expected - 1].requests.isNotEmpty()) {
+            return links[expected - 1]
+        }
         Thread.sleep(10L)
     }
-    throw AssertionError("expected " + expected + " hook request(s), saw " + links.size)
+    throw AssertionError(
+        "expected " + expected + " hook request(s), saw links=" + links.size +
+            " requests=" + links.sumOf { it.requests.size },
+    )
 }

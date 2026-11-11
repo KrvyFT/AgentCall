@@ -56,6 +56,8 @@ class RolePolicyTest {
             setOf(
                 RolePolicy.METHOD_HOOK_SNAPSHOT,
                 RolePolicy.METHOD_HOOK_HEARTBEAT,
+                // Task 11Q：空闲存在性（无会话、无负载），不是配置/密钥方法。
+                RolePolicy.METHOD_HOOK_PRESENCE,
                 RolePolicy.METHOD_CALL_COMMAND_RESULT,
             ),
             RolePolicy.methodsFor(PeerRole.HOOK),
