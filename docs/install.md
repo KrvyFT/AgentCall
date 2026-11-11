@@ -4,7 +4,8 @@
 交付时 `adb devices` 为空，本仓库没有真机 Google 电话、KernelSU WebView 或音频证据；
 用户也明确禁止设备侧验证。最终本地矩阵（HEAD `438cbbd`）通过：JVM 单测 **845**
 （core 126 / bridge 360 / app 359，0 failures / 0 errors / 0 skipped）、lint 0 errors /
-15 warnings；release APK 与模块 ZIP 已在该 HEAD 上重新打包（大小与 SHA-256 见第 1 节）。
+15 warnings；release APK 仍是该 HEAD 的字节未变产物，模块 ZIP 在 Task 11M（WebUI
+`ksu.io` 对象形式修复）重新打包（大小与 SHA-256 见第 1 节）。
 标注「未验证」的条目仍不能当作已可用。
 
 ## 1. 产物与前提
@@ -17,9 +18,10 @@
 | `dist/agentcall-<version>.apk` | AgentCall APK（Xposed 模块 + 远程语音回合） |
 | `dist/SHA256SUMS` | 两个产物的 SHA-256 |
 
-最终打包（Task 11K 只改安装脚本：模块 ZIP 在 `fc351b4` 重新打包；APK 仍是 `438cbbd`
-的字节未变产物，以 `dist/SHA256SUMS` 为准）：`agentcall-1.0.zip` 1,406,017 B（11 个条目），
-SHA-256 `7ba5cd26c19445b955e132ff79aaa120503dcb2ec44a46f72605961170bde274`；
+最终打包（Task 11M 只改 WebUI 的 `ksu.io` 能力探测以同时接受对象形式与旧式函数形式：
+模块 ZIP 重新打包；APK 仍是 `438cbbd` 的字节未变产物，以 `dist/SHA256SUMS` 为准）：
+`agentcall-1.0.zip` 1,407,288 B（11 个条目），SHA-256
+`9f1612331e515ad79abfe853810b36c3d3c257840a459679913d10afd05cf566`；
 `agentcall-1.0.apk` 2,274,772 B，SHA-256
 `8fd9332de246baf31154f83ca5fc7bfe48e41e28d676023aeadd108e135e0dc6`。
 `python3 tools/check_package.py --dist dist` 输出 `Status: PASS`：appId
@@ -144,8 +146,8 @@ root 操作员（不供 WebUI）：calibrate（JSON 从 stdin）
 
 | 状态 | 条件 | 能力 |
 | --- | --- | --- |
-| `kernelsu` | `ksu.exec` + `ksu.io()` v1 + 模块目录可信 | WebUI 的七条固定操作，保存可用 |
-| `readonly` | 缺少 `ksu.io()` | 读取/诊断/配对/关闭可用，**保存被拒绝** |
+| `kernelsu` | `ksu.exec` + `ksu.io`（对象形式或旧式函数形式；`support !== false` 且 `File`/`FileOutputStream` 存在）+ 模块目录可信 | WebUI 的七条固定操作，保存可用 |
+| `readonly` | io 明确 `support: false`、缺少 `File`/`FileOutputStream`，或旧版不提供 `ksu.io` | 读取/诊断/配对/关闭可用，**保存被拒绝** |
 | `readonly` | `moduleInfo()` 明确给出不可信 `moduleDir` | 依赖模块目录的命令禁用，固定路径日志仍可读 |
 | `demo` | 普通浏览器无管理器注入 | 明确标注模拟数据，不发起任何请求 |
 
@@ -426,7 +428,7 @@ AI 会话，等待人工处理。恢复路径：
 | --- | --- |
 | 模块 ZIP 结构、DEX 入口、版本、SHA-256、密钥泄漏检查 | 本地已验证（`make package-check`） |
 | 最终矩阵（HEAD `438cbbd`） | 本地 PASS：225 个 Gradle task；JVM 845（core 126 / bridge 360 / app 359，0 failures / 0 errors / 0 skipped）、lint 0 errors / 15 warnings；APK/ZIP 已在该 HEAD 重新打包（哈希见第 1 节） |
-| JVM/JS/Python/脚本检查 | JVM 845；WebUI node 116/116；Python 59/59；`sh -n` 模块脚本通过；`make test` / `make build` / `make package-check` 全 PASS |
+| JVM/JS/Python/脚本检查 | JVM 845；WebUI node 127/127；Python 59/59；`sh -n` 模块脚本通过；`make test` / `make build` / `make package-check` 全 PASS |
 | release 收缩（R8） | 本地已验证：`packageScope = setOf("**")`，mapping 99,205 行，release 未签名 APK 2.18 MB（debug 重签 2.27 MB）；**真机未验证** |
 | 配对（WebUI/root CLI）与 APK 校准/诊断界面 | 已实现；root CLI `calibrate` 经 `calibration.record` 写入五项人工证据；十个环境字段中六个（apiLevel、romFingerprint、kernelVersion、dialerPackageVersion、bridgeVersion、audioPolicyDigest）由桥接观测；四个可背书字段里 frameworkVersion/simCarrier 有真实观测源、只在观测不到时才由 root 背书，transport/route 则从不观测、始终为 UNKNOWN、只能在 calibrate 时由 root 背书；APP 就绪另需 `calibration.read` 的 supported/verified/environmentComplete/environmentMatchesEvidence（supportedApiLevel 是策略常量 `CalibrationPolicy.SUPPORTED_API_LEVEL`=37，不是设备 API 等级；API 36 因 `API_LEVEL_UNSUPPORTED` 保持阻断；真机探针与五项实测未验证，见第 7 节） |
 | 优雅关闭停止顺序（先取 stop.lock、shutdown、后停音频工作进程、再 TERM→KILL） | 本地宿主已验证（`shutdown-order.test.mjs`、`module-scripts.test.mjs` 进程/CLI 替身，含并发锁等待）；**真机未验证** |

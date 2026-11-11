@@ -6,8 +6,8 @@ Xposed Hook 观察来电与通话状态，AgentCall APK 完成远程 ASR / LLM /
 
 > **状态：本地构建与验收矩阵通过，不等于可用。** 最终矩阵（HEAD `438cbbd`）JVM 单测
 > core 126 / bridge 360 / app 359（合计 **845**，0 failures / 0 errors / 0 skipped），
-> lint 0 errors / 15 warnings；Task 11K 只改模块安装脚本，模块 ZIP 已在 `fc351b4` 重新打包，
-> release APK 与 bridge 容器保持原字节（APK SHA-256 未变，见下）。但**没有真机证据**：交付时 `adb devices` 为空，设备侧一行都没跑；
+> lint 0 errors / 15 warnings；Task 11M 只改 WebUI 的 `ksu.io` 能力探测与文档，
+> 模块 ZIP 已重新打包，release APK 与 bridge 容器保持原字节（APK SHA-256 未变，见下）。但**没有真机证据**：交付时 `adb devices` 为空，设备侧一行都没跑；
 > 配对（WebUI/root CLI）、root CLI `calibrate` 与 APK 校准/诊断界面已实现。校准环境的十个
 > 字段中，`apiLevel`、`romFingerprint`、`kernelVersion`、`dialerPackageVersion`、
 > `bridgeVersion`、`audioPolicyDigest` 由桥接真实观测；四个可背书字段里 `frameworkVersion`
@@ -96,12 +96,12 @@ python3 tools/check_package.py    # 失败即非零退出
   apksigner 的 v4 `.idsig` 旁文件不生成（不属于发布物）。
 - `dist/SHA256SUMS`：`sha256sum` 兼容格式。
 
-最终打包产物（模块 ZIP 在 `fc351b4` 的安装修复之后重新打包；APK 仍是 `438cbbd` 的
-字节未变产物；`dist/` 不提交）：
+最终打包产物（模块 ZIP 在 Task 11M 的 WebUI `ksu.io` 对象形式修复之后重新打包；APK 仍是
+`438cbbd` 的字节未变产物；`dist/` 不提交）：
 
 | 文件 | 大小 | SHA-256 |
 | --- | --- | --- |
-| `dist/agentcall-1.0.zip` | 1,406,017 B（11 个条目） | `7ba5cd26c19445b955e132ff79aaa120503dcb2ec44a46f72605961170bde274` |
+| `dist/agentcall-1.0.zip` | 1,407,288 B（11 个条目） | `9f1612331e515ad79abfe853810b36c3d3c257840a459679913d10afd05cf566` |
 | `dist/agentcall-1.0.apk` | 2,274,772 B | `8fd9332de246baf31154f83ca5fc7bfe48e41e28d676023aeadd108e135e0dc6` |
 | `dist/SHA256SUMS` | 168 B | 与上面两行一致 |
 
@@ -161,7 +161,7 @@ manifest，打包与 `check_package.py` 都拿容器与 manifest 比对（名称
 | 范围 | 状态 |
 | --- | --- |
 | JVM 单测（core/bridge/app） | 最终本地矩阵（HEAD `438cbbd`）：126 / 360 / 359，合计 **845**，0 failures / 0 errors / 0 skipped |
-| WebUI node 测试、Python 打包测试、模块脚本语法 | 本地已验证：node 116/116（含 KernelSU source 安装回归）、Python 59/59、`sh -n` 通过 4 个模块脚本 |
+| WebUI node 测试、Python 打包测试、模块脚本语法 | 本地已验证：node 127/127（含 KernelSU source 安装回归）、Python 59/59、`sh -n` 通过 4 个模块脚本 |
 | `:app:lintDebug` | 本地已验证：SUCCESSFUL，0 errors、15 warnings（13 条既有告警 + 2 条 `UseKtx`） |
 | R8（release） | 启用：`packageScope = setOf("**")`，release mapping 约 99,205 行；release 未签名 APK 2.18 MB（debug 重签交付 2.27 MB） |
 | release APK、模块 ZIP、SHA256SUMS、打包检查 | 本地已验证：`make build` / `make package-check` PASS（appId `org.krvyft.agentcall`，版本 1.0 (1)，dex `classes.dex`，结构 module=1/scripts=3/bridge=2/bin=1/webroot=4）；产物与哈希见上表 |
