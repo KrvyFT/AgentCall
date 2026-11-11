@@ -29,3 +29,4 @@ __pycache__/
 
 # apksigner v4 签名旁文件（不属于发布物）
 *.idsig
+.idea/
