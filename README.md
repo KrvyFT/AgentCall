@@ -1,108 +1,221 @@
 # AgentCall
 
-AgentCall 在不替换 Google 电话（`com.google.android.dialer`）的前提下，为它加上远程 AI 接听能力：
-Xposed Hook 观察来电与通话状态，AgentCall APK 完成远程 ASR / LLM / TTS 语音回合，KernelSU 模块里的
-`app_process` 特权桥执行 Telecom 控制、音频注入、root 侧配置与中文 WebUI。
+**An AI call-answering bridge for Google Phone — without replacing your dialer.**
 
-> **状态：本地构建与验收矩阵通过，不等于可用。** 最终矩阵（代码 HEAD `647a52f`，
-> 225 个 Gradle 任务，`BUILD SUCCESSFUL`）JVM 单测 core 127 / bridge 429 / app 366
-> （合计 **922**，0 failures / 0 errors / 0 skipped），WebUI node 149/149、Python 打包 59/59、
-> `sh -n` 通过，lint 0 errors / 15 warnings；release APK、bridge 容器与模块 ZIP 都在该 HEAD
-> 上重新构建（大小与 SHA-256 见下），R8 mapping 仍约 99k 行。
-> 本轮是设备驱动修复（11P/11Q）：WebUI 在 `ksu.io` 没有文件接口时走**分块 exec+env 保存**
-> （`AGENTCALL_CFG_PAYLOAD_0..N`，每块 128 UTF-16 码元、代理对不切分、最多 64 块；探测用
-> `AGENTCALL_PROBE_0..2` 重组校验），HOOK 以固定方法 `hook.presence` 每 2 s 报告空闲存在性
-> （桥接按角色记录 5000 ms 窗口，`status.hookConnected` 不再依赖活动通话），默认拨号器探测
-> 增加 root shell `cmd role`/`cmd telecom` 兜底，框架版本与 SIM 运营商按设备实测修正
-> （`zygisk_vector` 的 `module.prop`、逗号列表取首段）。
-> 设备侧已由控制器通过 adb 在 XQ-DQ72/API 37 上取得**部分观测**：Vector v2.2 把 AgentCall
-> 注入 `com.google.android.dialer`（`installed 4 of 4 hook(s)`），拨号器日志出现真实
-> `state=RINGING`；当时 `status.hookConnected=false` 的原因是旧实现只按会话心跳，已由 11Q
-> 修复。**这不是完整设备验收**：新 ZIP/APK 尚未安装、未重启，空闲
-> `hookConnected=true`、`dialerDefaultRole=true`、校准环境字段与 chunked env 保存都待设备
-> 复测；音频、Telecom 与自动接听仍无证据。
-> **产品阻塞项不变（不是单纯的设备缺口）**：自动接听需要校准记录**且**需要设备
-> 验证过的、按通话身份定位的特权 Telecom 终止路径（`UnverifiedCallIdentityVerifier`
-> 保持 `blocksAutoAnswer=true`）；APK 只有 debug 签名、不可分发。生产就绪仍为
-> `NOT_READY`（`calibration_not_verified`），设备验收（spec §12）仍未完成，见「状态与边界」与
-> `docs/verification.md`。
->
-> 公开仓库：<https://github.com/KrvyFT/AgentCall>（分支 `master`）；仓库与文档中不含任何令牌或凭据。
+在不替换 Google 电话（`com.google.android.dialer`）的前提下，为它加上远程 AI 接听能力：
+Xposed Hook 观察来电与通话状态，AgentCall APK 负责远程 ASR / LLM / TTS 语音回合，
+KernelSU 模块里的 `app_process` 特权桥负责 Telecom 控制、通话音频中继、root 侧配置与中文 WebUI。
+
+![Android 17 / API 37](https://img.shields.io/badge/Android-17%20%2F%20API%2037-3DDC84?logo=android&logoColor=white)
+![Kotlin](https://img.shields.io/badge/language-Kotlin-7F52FF?logo=kotlin&logoColor=white)
+![Tests](https://img.shields.io/badge/tests-922%20JVM%20%C2%B7%20149%20node%20%C2%B7%2059%20Python-brightgreen)
+
+> [!IMPORTANT]
+> **自动接听目前有意关闭，不是“装上就能用”。** 它需要两道闸门同时成立：
+> ① 与当前设备环境绑定的校准证据（五项人工测试）；② 设备验证过的、按通话身份定位的
+> 特权 Telecom 终止路径。当前默认实现 `UnverifiedCallIdentityVerifier` 保持
+> `blocksAutoAnswer=true`，因此即使校准记录齐全，自动接听也不会开启。
+> 本仓库的本地构建、单元测试与部分设备观测**不等于**可用性结论；完整设备验收仍未完成，
+> 详见[状态矩阵](#状态矩阵)与 [docs/verification.md](docs/verification.md)。
+
+## 它是什么，为什么这样做
+
+- **保留 Google 电话**：不重签拨号器、不替换默认电话应用、不插入它的内部布局；
+  拨号、响铃、通话 UI、记录与人工控制仍由 Google 电话负责。
+- **Hook 而不是改包**：通过 Vector / LSPosed 加载传统 Xposed 模块，只作用于
+  `com.google.android.dialer`，不注入 `system_server`。
+- **root 只做特权动作**：KernelSU 模块用 `app_process` 运行 `BridgeMain`（控制面 + 监督）
+  与独立的 `AudioWorkerMain`（PCM / 麦克风隔离）；桥接不发起任何远程 API 请求。
+- **AI 在 APK 进程**：ASR、LLM、TTS 是可分别配置的 OpenAI-compatible HTTPS 端点，
+  语音回合、名单规则、会话状态机与人工接管界面都在普通应用进程。
+- **配置留在设备**：主副本在 root 私有目录 `/data/adb/agentcall`，中文 WebUI 只调用固定
+  CLI，密钥不进入 argv、URL 或日志。
 
 ## 架构
 
+```mermaid
+flowchart LR
+  subgraph D["Google 电话进程<br/>com.google.android.dialer"]
+    H["HookEntry<br/>观察来电 / 受限通话控制"]
+  end
+
+  subgraph K["KernelSU / root 特权侧<br/>app_process"]
+    B["BridgeMain<br/>控制面 + 监督 + 租约"]
+    AW["AudioWorkerMain<br/>PCM 中继 / 麦克风隔离"]
+    W["中文 WebUI<br/>静态资源"]
+    C["agentcallctl<br/>固定 CLI"]
+  end
+
+  subgraph A["AgentCall APK<br/>org.krvyft.agentcall"]
+    S["Service + SessionCoordinator<br/>会话状态机 / 人工接管"]
+    AI["ASR / LLM / TTS<br/>OpenAI-compatible HTTPS"]
+  end
+
+  CFG["/data/adb/agentcall<br/>config.json / pairing.json"]
+
+  H <-->|"control socket<br/>内核凭据 + 配对"| B
+  B <-->|"audio-role<br/>JSON 行"| AW
+  B <-->|"audio-pcm<br/>PCM lane"| AW
+  S <-->|"control + audio.channel<br/>内核凭据 + 配对"| B
+  S --> AI
+  W -->|"固定操作 6+1"| B
+  C -->|"root CLI"| B
+  B --- CFG
+```
+
 三个信任层、两个进程边界：
 
-```
-Google 电话进程 (com.google.android.dialer, Xposed/LSPosed/Vector 作用域)
-  └─ org.krvyft.agentcall.hook.HookEntry  只观察/受限控制，保留拨号器原行为
-        │ 本地抽象 socket，配对记录校验 uid + 签名 + 版本
-        ▼
-KernelSU 模块 / root 特权桥 (app_process，uid 0)
-  ├─ BridgeMain       控制面 + 监督（5000 ms 心跳、10000 ms 人工接管窗口、180000 ms 上限）
-  ├─ AgentCallCli     root 固定 CLI：status/config-get/config-set/calibrate/pair/diagnose/shutdown（calibrate 只供 root 操作员）
-  ├─ AudioWorkerMain  音频工作角色（独立 app_process，只持有 PCM 与麦克风隔离）
-  └─ WebUI            静态中文配置页，只调用固定 CLI，不经 shell 拼接、不发起远程请求
-        ▲
-        │ 本地 socket + 配对
-AgentCall APK (org.krvyft.agentcall, 普通应用 uid)
-  └─ 远程语音回合、会话状态机、校准/诊断界面与配对（WebUI/root CLI；校准证据经 root CLI 写入）
-```
+| 层 | 进程 / uid | 职责 | 明确不做 |
+| --- | --- | --- | --- |
+| Hook | Google 电话进程，拨号器 uid | 动态发现 `InCallService`，观察通话快照，执行受限接听/挂断 | 不跑 ASR/网络/音频编解码，不读 API Key |
+| 特权桥 | root `app_process`，uid 0 | 控制 socket、配对核验、监督/租约、配置 CAS、音频中继、校准 | 不发起远程 API 请求，不全局 `endCall` |
+| APK | 普通应用 uid | 会话协调、远程语音回合、通知/接管 UI、诊断 | 不持有 root、不改默认拨号器角色 |
 
-规则、时钟、会话状态机、协议与安全边界都在 `core`：它不依赖 Android，由 JVM 单测覆盖；
-`app` 只能通过 `core` 的 contracts 与 `bridge` 通信，依赖方向固定为 `app -> core <- bridge`。
+依赖方向固定为 `app -> core <- bridge`；`core` 不依赖 Android，规则、状态机、协议与鉴权都在
+JVM 上可测。更深的分层、帧格式与状态机见 [docs/architecture.md](docs/architecture.md)。
 
-## 目录
+## 已实现能力
+
+| 能力 | 实现要点 |
+| --- | --- |
+| 三种名单模式 | `BLACKLIST` / `WHITELIST` / `COMBINED`；完整号码精确匹配，libphonenumber 按地区规范化，默认 `CN`；空黑名单不接管，空白名单在白名单/组合模式下匹配所有可识别号码 |
+| 未知号码开关 | 未知/隐藏/不可解析号码由 `handleUnknownNumbers` 独立控制，默认**人工处理** |
+| 通话资格 | 只处理新的入站 `RINGING`；紧急、会议、非唯一一路、未启用的 PhoneAccount 一律保留原响铃；默认 PhoneAccount 列表为空 = 不自动接管 |
+| 随机会话身份 | `SessionId(processEpoch, callId)` 均为随机 UUID，绝不用电话号码；旧进程代次/别的 callId 的快照不会触发命令 |
+| 单次接听 | 每个会话最多下发一次 Answer；重复 RINGING、重复回调不会重置倒计时或第二次触碰 Telecom |
+| 人工交还 | 先停 AI、再串行撤销所有权、确认后才恢复音频；**不挂断**；撤销失败不会显示“交还成功” |
+| 音频隔离与故障终止 | 只使用通话下行提取/上行注入，不用环境麦克风替代；音频失败保持隔离并开 10 s 人工接管窗口，心跳 5 s 失联、默认 180 s 通话上限（可配 10–600 s）、音频进程 60 s 内最多 3 次重启；只终止自己租约下的精确通话 |
+| 三个独立端点 | ASR `audio/transcriptions`（multipart WAV）、LLM `chat/completions`（非流式）、TTS `audio/speech`（WAV）；各自 baseUrl / model / key，可指向不同供应商；只接受 HTTPS |
+| 回合引擎上限 | VAD 静音 800 ms、单段 15 s、连接超时 10 s、生成阶段 45 s、响应 8 MiB、上下文最多 8 轮、回复 300 字、429/5xx 在截止时间内最多重试一次；播放等待不计入 45 s |
+| 校准证据 | 五项人工测试 + 十个环境字段；仅 API 37；证据与环境逐字段绑定；只能由 root CLI `calibrate` 写入，APP/Hook 不能伪造 |
+| 配置与 WebUI | 版本化原子写入 + revision CAS；密钥 Keep/Replace/Clear 脱敏；WebUI 六条固定 CLI 操作 + 一条模块侧 `restart`；保存走 `ksu.io` 文件或 exec+env 分块，二者都不可用时只读 |
+| 可复现打包 | 确定性模块 ZIP、bridge DEX manifest、版本单一来源、`check_package.py` 检查结构/DEX/版本/签名/密钥泄漏/SHA-256 |
+
+## 快速开始
+
+> 以下是**未在设备上完整验收**的安装路径。自动接听在完成校准与身份终止验证前不会开启；
+> 详细命令、回退与证据要求见 [docs/install.md](docs/install.md)。
+
+1. **准备**：Xperia 1 V（目标设备 XQ-DQ72）、Android 17 / API 37、KernelSU、
+   Vector 或 LSPosed、官方 Google 电话 `com.google.android.dialer`。不需要也不应该卸载它。
+2. **安装模块**：KernelSU 管理器 → 模块 → 从本地安装 → 选择 `dist/agentcall-1.0.zip`，
+   然后重启手机。
+3. **安装 APK**：`adb install -r dist/agentcall-1.0.apk`（或文件管理器安装）。
+   当前 APK 为 **debug 签名**，不同签名不能覆盖安装；分发前必须用发布密钥重签。
+4. **启用作用域**：在 Vector/LSPosed 中启用 AgentCall，作用域**只勾选**
+   `com.google.android.dialer`；强制停止拨号器或重启，让 Hook 生效。
+5. **确认桥接**（root）：
+   `su -c /data/adb/modules/agentcall/bin/agentcallctl status`。
+   首次失败先看 `/data/adb/agentcall/logs/service.log` 的 `package_provider=` 行。
+6. **配对**（root，首次只能由 root 发起）：
+   `su -c /data/adb/modules/agentcall/bin/agentcallctl pair`。
+   配对绑定 uid + 签名 SHA-256 + `versionName`；APK 或拨号器升级后需要重新配对。
+7. **配置端点**：在 WebUI 的 AI 页填写 ASR/LLM/TTS 的 HTTPS baseUrl、model、key；
+   密钥只经受控通道写入，页面只显示 `CONFIGURED` / `MISSING`。
+8. **校准（root 操作员）**：按 [docs/install.md](docs/install.md) 第 7 节完成五项人工测试，
+   用 `agentcallctl calibrate` 从 stdin 写入；校准只绑定当前环境，任一环境字段变化即失效。
+9. **开启总开关**：默认关闭。只有同时满足“校准证据 + 按身份的独立终止能力”才会自动接听；
+   当前第二项仍不成立，所以自动接听保持关闭。可以先用规则试算、诊断和手动接管观察行为。
+
+## 状态矩阵
+
+状态只按证据分级：**本地已验证**（宿主构建/测试）、**设备已观察**（只读或日志观测）、
+**未验证/阻塞**（没有设备证据或产品闸门未解除）。三者不能互相替代。
+
+### 本地已验证（代码 HEAD `647a52f`）
+
+| 项目 | 结果 |
+| --- | --- |
+| JVM 单测 | `core 127 / bridge 429 / app 366`，合计 **922**，0 failures / 0 errors / 0 skipped |
+| WebUI node | **149 / 149** 通过（含分块 env、payload cap、密钥卫生、stop.lock 回归） |
+| Python 打包 | **59 / 59** 通过；`sh -n` 检查 4 个模块脚本 |
+| 最终 Gradle 矩阵 | 225 个任务，`BUILD SUCCESSFUL`（`--rerun-tasks`） |
+| Lint | `:app:lintDebug` 0 errors / 15 warnings（全部 warning） |
+| R8（release） | 启用，`packageScope = setOf("**")`，mapping 约 99k 行 |
+| 打包检查 | `make package-check` PASS：appId、版本 1.0 (1)、DEX manifest、签名类型、密钥泄漏、SHA-256 |
+
+### 设备已观察（XQ-DQ72 / API 37，部分观测）
+
+| 观测 | 证据 |
+| --- | --- |
+| Vector 注入成功 | Vector v2.2（legacy Xposed API 82）日志：`Loading legacy module org.krvyft.agentcall`、`Loading class ...HookEntry`、`installed 4 of 4 hook(s)` |
+| 真实来电 | 拨号器日志出现一次 `state=RINGING direction=INCOMING` |
+| 默认拨号器 | root shell `cmd role get-role-holders android.app.role.DIALER` / `cmd telecom get-default-dialer` 确认是 `com.google.android.dialer` |
+| 桥接启动落点 | 启动日志 `package_provider=appglobals` |
+
+这些观测**只覆盖上表四行**。当时新 ZIP/APK 尚未安装、未重启；空闲 `hookConnected=true`、
+`dialerDefaultRole=true` 的 boolean 形态、校准环境字段与 chunked env 保存都仍待复测。
+修复前一次 RINGING 时 `hookConnected=false`，原因是旧实现只按会话心跳；11Q 已改为空闲
+`hook.presence`，但这是修复动机，不是设备验收。
+
+### 未验证 / 阻塞
+
+| 范围 | 状态 |
+| --- | --- |
+| 完整接听/音频链路 | **未验证**：没有一次自动接听或音频归档 |
+| AudioRecord / AudioTrack / 播放头 / HAL / 麦克风隔离读回 | **未验证** |
+| Telecom 控制、按身份定位的特权终止 | **未验证且阻塞自动接听**；当前实现明确返回 `UNSUPPORTED`，绝不全局 `endCall` |
+| 锁屏 / Doze / 重启 / 通知 / FGS / 进程死亡 | **未验证** |
+| KernelSU 真机 WebUI、`ksu.io` 文件通道、exec+env 分块保存 | **未验证** |
+| 五项人工校准与设备环境读回 | **未验证**；设备上尚未执行校准记录 |
+| D01–D12 设备验收矩阵 | 全部**未验证**，见 [docs/device-validation.md](docs/device-validation.md) |
+| 发布签名 | APK 只有 debug 签名（`CN=Android Debug`），**不可分发** |
+| 双卡 / VoWiFi / 蓝牙 | **未验证**；未测组合不启用 |
+
+> **自动接听为什么现在是关闭的**：校准只解决“环境与人工测试证据”，不能替代“Hook 死亡时
+> 仍能按通话身份精确终止”的能力。默认 `UnverifiedCallIdentityVerifier` 永远报告不可用，
+> 因此 `EmergencyCallControl.blocksAutoAnswer() == true`。这是一个有意的 fail-closed
+> 产品闸门，不是可以通过改设置绕过的开关。
+
+## 安全与隐私
+
+- **不抢默认拨号器角色**：APK 不请求 `ROLE_DIALER`，不伪用只授予默认拨号器的前台服务资格；
+  Hook 只作用于 `com.google.android.dialer`。
+- **不注入系统进程**：不修改 `system_server`、不重签 Google 电话、不改 SELinux、不自动刷框架。
+- **compileOnly Xposed**：Xposed API 82 只在编译期存在，运行时由用户安装的 Vector/LSPosed 提供，
+  不打包进 APK。
+- **角色 + 内核凭据**：控制 socket 的对端身份来自内核凭据，不信任消息自述；CLI 必须是 uid 0；
+  APP/Hook 必须是已配对、签名与版本匹配的非 root 进程。配对记录绑定 uid + 签名 SHA-256 + 版本。
+- **密钥只 root 私有**：`/data/adb/agentcall` 0700，`config.json` 0600；密钥不进入 argv、URL、
+  日志或错误消息；WebUI 只看到 `CONFIGURED` / `MISSING`。
+- **WebUI 传输**：首选 `ksu.io` 受控文件 + stdin；没有文件接口时走固定命令 + `AGENTCALL_CFG_PAYLOAD_0..N`
+  分块 env；两者都不可用则只读拒绝保存，**绝不降级到 argv/base64**。
+- **debug 签名警告**：当前证书是 `CN=Android Debug`，不是发布密钥。它只用于本地安装验证，
+  不构成安全边界，也不能作为分发版本。
+
+完整威胁模型、攻击面与非目标见 [docs/security.md](docs/security.md)。
+
+## 仓库结构
 
 | 路径 | 内容 |
 | --- | --- |
-| `app/` | Xposed 入口、Hook 传输、远程 AI 客户端（语音回合、WAV、VAD） |
-| `core/` | 共享 contracts、协议/角色鉴权、名单规则、会话状态机、端口接口 |
-| `bridge/` | root 特权桥：IPC、配置 CAS、诊断、监督、音频、固定 CLI 入口 |
-| `module/` | KernelSU 模块：`module.prop`、`service.sh`、`customize.sh`、`uninstall.sh`、`bin/agentcallctl`、`webroot/` 中文 WebUI |
-| `tools/` | `package.py` 打包、`check_package.py` 产物检查、`tests/` 打包失败测试 |
-| `docs/` | 安装说明、配置 schema、验证记录、设备验证矩阵 |
+| `app/` | Xposed 入口、Hook 传输、会话协调、远程 AI 客户端、Views/通知/诊断 |
+| `core/` | 共享 contracts、角色/方法鉴权、名单规则、会话 reducer、租约、校准策略 |
+| `bridge/` | root 特权桥：IPC、监督、音频中继、配置 CAS、校准存储、固定 CLI |
+| `module/` | KernelSU 模块：`module.prop`、`service.sh`、`customize.sh`、`uninstall.sh`、`bin/agentcallctl`、`webroot/` |
+| `tools/` | `package.py`、`check_package.py` 与打包测试 |
+| `docs/` | 安装、配置、验证、设备矩阵、架构、安全、排障、路线图、FAQ |
 
 ## 构建与测试
 
-先决条件（本机已验证环境）：Gradle Wrapper 与 Launcher JVM 17，Daemon JVM 由
-`gradle-daemon-jvm.properties` 指定；Android SDK（compileSdk 37，platform `android-37.0`，build-tools 36.0.0）；Node 26.13.0；Python 3.14.9。
-不下载任何额外二进制：Android 工具只取本机 SDK `build-tools`，Gradle 依赖走现有仓库配置。
-
-Gradle 调用必须串行化，仓库约定：
+本机已验证环境：Gradle Wrapper 9.6.0、Launcher JVM 17、Daemon JVM 25、Android SDK
+compileSdk 37（platform `android-37.0`，build-tools 36.0.0）、Node 26.13.0、Python 3.14.9。
+不下载额外二进制；Gradle 调用按仓库约定串行化。
 
 ```sh
-flock /tmp/agentcall-gradle.lock ./gradlew :core:testDebugUnitTest :bridge:testDebugUnitTest :app:testDebugUnitTest
+# 单一 JVM 矩阵（串行化，避免并发争抢 daemon）
+flock /tmp/agentcall-gradle.lock ./gradlew \
+  :core:testDebugUnitTest :bridge:testDebugUnitTest :app:testDebugUnitTest \
+  :app:lintDebug :app:assembleRelease :bridge:packageRuntime --rerun-tasks
+
+# 统一入口
+make test            # JVM + WebUI node + Python + shell 语法
+make build           # release APK + bridge 运行时容器 + dist 打包
+make package-check   # 结构 / DEX / 版本 / 签名 / 密钥泄漏 / SHA-256
+make lint            # :app:lintDebug
 ```
 
-统一入口：
-
-| 命令 | 作用 |
-| --- | --- |
-| `make test` | JVM 单测（core/bridge/app）+ WebUI node 测试 + Python 打包测试 + 模块脚本 `sh -n` |
-| `make build` | `:app:assembleRelease`、`:bridge:packageRuntime`、`tools/package.py` 打包 |
-| `make package-check` | 校验 `dist/` 结构、DEX 容器与 manifest、applicationId、版本、签名、密钥泄漏与 SHA-256 |
-| `make lint` | `:app:lintDebug`（完整验收矩阵的一部分，不计入 `make test`） |
-
-## 打包与签名
-
-```sh
-flock /tmp/agentcall-gradle.lock ./gradlew :app:assembleRelease :bridge:packageRuntime
-python3 tools/package.py          # 签名 + 确定性模块 ZIP + SHA256SUMS
-python3 tools/check_package.py    # 失败即非零退出
-```
-
-产物（`dist/` 已在 `.gitignore` 中，不提交）：
-
-- `dist/agentcall-<version>.zip`：KernelSU 模块 ZIP，条目按名排序、固定时间戳、脚本 0755、数据文件 0644；
-  包含 `bridge/agentcall-bridge.jar`（bridge release APK 的全部 `classes*.dex`）、
-  `bridge/agentcall-bridge.dex-manifest.json`（每个 dex 的 name/SHA-256/size 与来源 APK 摘要）
-  与 `webroot/` 静态资源；不含 `webroot/tests/`、不含任何签名私钥。
-- `dist/agentcall-<version>.apk`：`app-release-unsigned.apk` 用本机 debug keystore 重签；
-  apksigner 的 v4 `.idsig` 旁文件不生成（不属于发布物）。
-- `dist/SHA256SUMS`：`sha256sum` 兼容格式。
-
-最终打包产物（在代码 HEAD `647a52f` 上重新构建；`dist/` 不提交）：
+最终产物（`dist/` 不提交，哈希绑定代码 HEAD `647a52f` 的这次构建）：
 
 | 文件 | 大小 | SHA-256 |
 | --- | --- | --- |
@@ -110,126 +223,77 @@ python3 tools/check_package.py    # 失败即非零退出
 | `dist/agentcall-1.0.apk` | 2,274,772 B | `58f0a83c2247ed23ccea54264fbd0bc90aac3b2075d757d5c5f8cb5cc46876ca` |
 | `dist/SHA256SUMS` | 168 B | 与上面两行一致 |
 
-**哈希绑定这次构建**：APK 内嵌构建元数据，打包过程也不是逐字节可复现的，所以上表只对应
-`647a52f` 的这次构建。在任何更晚的提交（包括本次 docs 提交之后）重建都会改变 APK/ZIP
-字节，必须重新生成 `SHA256SUMS` 并以新文件为准；`dist/` 不进仓库，`sha256sum -c` 通过。
+```sh
+cd dist && sha256sum -c SHA256SUMS
+```
 
-APK 由本机 debug keystore 签名（`CN=Android Debug`，证书 SHA-256
-`3974a6d9dc587fe200107ff1c90b5ff20b0bcf4edcfb61dc030e9c6d2cd81085`），**不可分发**；
-正式分发前必须用发布密钥重签，并重新生成 `SHA256SUMS`，步骤见 `docs/install.md` 第 1 节。
+**哈希只对这次构建成立**：APK 内嵌构建元数据，打包不是逐字节可复现；在任何更晚的提交
+（包括 docs-only 提交之后）重建都会改变字节，必须重新生成 `SHA256SUMS`。重签 APK 同样会
+改变摘要。ZIP 共 11 个条目，含 bridge DEX manifest，不含 `webroot/tests/`、私钥或令牌。
 
-**DEX 覆盖只用容器 manifest**：`:bridge:packageRuntime` 从 bridge release APK 收集 dex 并写出
-manifest，打包与 `check_package.py` 都拿容器与 manifest 比对（名称 + SHA-256 + size），
-存在 bridge APK 时再交叉核对一次；**不使用 app APK**——app APK 是另一个产物，
-单 dex 时比对无意义、多 dex 时会误报。
+## 排障入口
 
-**版本单一来源**是构建出的 APK 的 `versionName/versionCode`：ZIP 里的 `module.prop` 由它渲染，
-源 `module/module.prop` 与之不一致时打包直接失败，文件命名也来自同一个版本号。
+| 症状 | 先看什么 | 入口 |
+| --- | --- | --- |
+| 桥接没起来 | `service.log` 的 `package_provider=` / `package_manager_unavailable` | [docs/troubleshooting.md](docs/troubleshooting.md) 第 1 节 |
+| `hookConnected=false` | `logcat` 的 `hook_transport` 机器码、作用域 | [docs/troubleshooting.md](docs/troubleshooting.md) 第 3 节 |
+| WebUI 保存只读 | 诊断页 `ioMode` / `envProbe`；`transport=env bytes chunks` | [docs/troubleshooting.md](docs/troubleshooting.md) 第 6 节 |
+| WebUI `transport_failed` | `agentcallctl status`、控制 socket、服务是否存活 | [docs/troubleshooting.md](docs/troubleshooting.md) 第 2 节 |
+| 默认拨号器 `unknown` | `cmd role` / `cmd telecom` 两条 root 命令 | [docs/troubleshooting.md](docs/troubleshooting.md) 第 4 节 |
+| 升级后连不上 | `peer_version_mismatch` / `peer_uid_mismatch` | [docs/troubleshooting.md](docs/troubleshooting.md) 第 9 节 |
+| `stop.lock` 超时 / 卸载残留 | `service.log` 的 `stop_lock_*`、隔离读回 | [docs/troubleshooting.md](docs/troubleshooting.md) 第 7–8 节 |
 
-**签名类型**：默认只使用本机 Android debug keystore（`$HOME/.android/debug.keystore`），
-产物是 **debug 签名**，不是发布密钥，不能作为正式分发版本。检查器只如实报告签名者
-（debug / custom signer / unsigned / unverified），不猜测某个非 debug 证书“是不是发布密钥”；
-正式分发请用你自己的发布密钥重签并用 `--expected-signer 'CN=...'` 强制校验，
-步骤见 `docs/install.md` 第 1 节（重签会改变 APK 摘要，必须重生成 `SHA256SUMS`）。
-仓库不包含任何私钥；检查器会拒绝打包任何 `*.keystore/*.jks/*.p12/*.pepk` 或私钥/令牌材料。
+## 文档索引
 
-## 固定操作与关闭语义
-
-- **WebUI 可调用的操作是七条**：`status`、`config-get`、`config-set`（JSON 只从 stdin 进入）、
-  `pair`、`diagnose`、`shutdown`、`restart`。WebUI 不发任意 RPC、不拼 shell、不加载在线资源。
-  `restart` 是模块侧控制动作：先写重启标记，再执行固定 CLI `shutdown`；只有裁决为
-  `clean=true` + `shutdownCode=null` + `microphoneIsolated=false` 才继续，否则收回标记并返回
-  `restart_refused`（消息带机器码与隔离读回），不会盲目重启。
-- **`calibrate` 不是 WebUI 操作**：它是 root 操作员的固定 CLI 命令——零参数，JSON 只从 stdin
-  进入（argv 携带负载在启动 CLI 前以 `usage_invalid` 拒绝）。载荷是五项人工测试步骤 +
-  可选 `expectedEnvironment` + 可选 `operatorAttestation`（必填 `transport`/`route`/
-  `manualTestCompleted`，可选 `frameworkVersion`/`simCarrier`）；WebUI 不写校准证据，也不伪造证据。
-- **优雅关闭**：`shutdown` 先下发终止/交还命令，然后在 5 s 期限
-  （`SHUTDOWN_TERMINATION_DEADLINE_MS` = 5000 ms）内只等待“已断开/已不归 AI”的事实
-  （`awaitConfirmedDisconnect`）。该 5 s **只约束这个等待**：终止命令先于期限下发，其自身
-  等待另有预算，所以 5 s 不是“终止 + 确认”的总时长。确认后在单一 6 s 预算
-  （`SHUTDOWN_RESTORE_BUDGET_MS`）内恢复麦克风并读回验证。`clean=true` 只在隔离被确认解除时
-  成立；否则 `clean=false` 并带 `shutdown_microphone_still_isolated` /
-  `shutdown_microphone_restore_failed` / `shutdown_call_unresolved`。CLI 只对 `shutdown`
-  把 socket 超时放宽到 20 s。崩溃/SIGKILL 不走该路径，可能留下麦克风隔离。
-- **停止顺序**：模块停止时先请求桥接优雅关闭，再停音频工作进程（先杀音频会让恢复请求
-  不可达）；`service.sh` / `uninstall.sh` 用跨脚本 `flock` 停止锁串行化（最多等 40 s，
-  CLI 25 s、桥接退出 10 s、最终探测 5 s）。桥接退出后 `service.sh` 读回
-  `DATA_ROOT/supervisor-state.json`（schema ≥ 3）：`shutdownCode` 非 null 或
-  `microphoneIsolated=true` 时打印 `! microphone_still_isolated ...` /
-  `! shutdown_unresolved ...` 与 `bridge_stop_unclean`，**绝不打印 `bridge_exit_clean`**。
-  这里的非零退出只属于桥接退出容器路径（`bridge_container_supervisor` 的返回值成为
-  `service.sh` 退出码）；信号触发的 `on_stop` 只记录同样的警告并 `exit 0`。持久裁决
-  缺失/损坏/schema<3 时回退到退出码证据（`bridge_exit_clean_verdict`）；`agentcallctl
-  restart` 更严格，必须读到关闭响应裁决，缺失即 `restart_refused`（`verdict_missing`）。
-  `agentcallctl restart` 也只在关闭裁决为 `clean=true` + `shutdownCode=null` +
-  `microphoneIsolated=false` 时继续，否则返回 `restart_refused`。
-
-## 状态与边界
-
-| 范围 | 状态 |
+| 文档 | 内容 |
 | --- | --- |
-| JVM 单测（core/bridge/app） | 最终本地矩阵（代码 HEAD `647a52f`，225 个 Gradle 任务，`BUILD SUCCESSFUL`）：127 / 429 / 366，合计 **922**，0 failures / 0 errors / 0 skipped |
-| WebUI node 测试、Python 打包测试、模块脚本语法 | 本地已验证：node 149/149（含 chunked env 分块/截断/cap、env 探测、密钥卫生与 KernelSU source 安装回归）、Python 59/59、`sh -n` 通过 4 个模块脚本 |
-| `:app:lintDebug` | 本地已验证：SUCCESSFUL，0 errors、15 warnings（13 条既有告警 + 2 条 `UseKtx`） |
-| R8（release） | 启用：`packageScope = setOf("**")`，release mapping 仍约 99k 行；release 未签名 APK 约 2.18 MB（debug 重签交付 2,274,772 B） |
-| release APK、模块 ZIP、SHA256SUMS、打包检查 | 本地已验证：`make build` / `make package-check` PASS（appId `org.krvyft.agentcall`，版本 1.0 (1)，dex `classes.dex`，结构 module=1/scripts=3/bridge=2/bin=1/webroot=4）；产物与哈希见上表 |
-| 桥接分层 PackageManager 获取（11N） | 本地 JVM 已验证 provider 顺序/缓存/日志码、shell 解析与 fail closed；设备上桥接已启动并记录 `package_provider=appglobals`（控制器 adb 只读观测）。其余 provider 分支、失败回落与真实权限仍未验证 |
-| WebUI 保存通道（11O/11P） | 本地 node 已验证 file / exec+env / readonly 三态、chunked env（128 码元/块、最多 64 块、代理对安全、`payload_too_large`）、env 探测与密钥卫生；**真机 KernelSU WebView 未验证**（设备管理器只有函数形式 `ksu.io`、没有 `File`/`FileOutputStream`），chunked 保存待复测 |
-| HOOK 空闲存在性与传输诊断（11Q） | 本地 JVM 已验证 `hook.presence` 驱动 `status.hookConnected`（5000 ms 窗口、空闲也发）与 `hook_transport` 限流机器码；**设备上待重启复测**（修复前 RINGING 时 `hookConnected=false`） |
-| 默认拨号器/框架版本/SIM 运营商探针（11Q-b） | 本地 JVM 已验证 RoleManager → root `cmd role`/`cmd telecom` → `ACTION_DIAL` 顺序、2 s/8 KiB/30 s 缓存、精确单一包名解析与逗号首段；**设备上待复测**预期 `dialerDefaultRole=true`、frameworkVersion `v2.2 (...)`、simCarrier `China Unicom` |
-| `service.sh` 停止锁（11N） | 本地宿主已验证（真实 flock + 替身）：`app_process` 子进程不继承 fd 9、桥接退出后非阻塞清理、桥接存活时仍串行化；**真机未验证** |
-| `app_process` 容器入口（BridgeMain/AgentCallCli/AudioWorkerMain）与 Kotlin/coroutines/Gson/core 运行库 | 结构级已验证（自研 DEX 解析：只校验类描述符与方法名存在，不校验方法原型/字节码语义） |
-| Vector/Xposed 注入与 Hook 安装 | **设备部分验证**：Vector v2.2（legacy API 82）日志 `Loading legacy module org.krvyft.agentcall`、`installed 4 of 4 hook(s)`，并观测到一次真实 `RINGING`；完整接听/音频链路未验证 |
-| 真机 Google 电话原功能、≥3 轮双向对话 | **未验证**：仅有一次 RINGING 观测，未归档完整通话 |
-| 音频 downlink/uplink、麦克风隔离 | **未验证**（无设备证据，不宣称可用） |
-| 人工接管、故障终止、锁屏/重启握手 | **未验证** |
-| KernelSU 真机安装、WebView WebUI、`ksu.io` 路径 | **未验证**（本轮新 ZIP/APK 尚未安装；WebView 未打开） |
-| 配对（WebUI/root CLI）与 APK 校准/诊断界面 | 已实现；root CLI `calibrate` 经 `calibration.record` 写入五项人工证据。十个环境字段中六个（apiLevel、romFingerprint、kernelVersion、dialerPackageVersion、bridgeVersion、audioPolicyDigest）由桥接观测；四个可背书字段里 frameworkVersion/simCarrier 有真实观测源、只在观测不到时才由 root 背书，transport/route 则从不观测、始终为 UNKNOWN、只能在 calibrate 时由 root 背书。APP 就绪要求 `calibration.read` 的 available && supportedApiLevel==37 && verified && environmentComplete && environmentMatchesEvidence，再叠加本机 `CalibrationPolicy`；`supportedApiLevel` 是策略常量 `CalibrationPolicy.SUPPORTED_API_LEVEL`（37），不是设备 API 等级——API 36 会因 `verified=false` 且 blockers 含 `API_LEVEL_UNSUPPORTED` 保持阻断。读取失败/未知一律 false（`calibration_unavailable`），不缓存旧 true。校准证据的设备复测（frameworkVersion=`v2.2 (...)`、simCarrier=`China Unicom`）尚未完成，自动接听保持关闭（`calibration_not_verified`） |
-| 双卡、VoWiFi、蓝牙 | **未验证**，未测组合不启用 |
-| **产品阻塞项**：按通话身份定位的特权 Telecom 终止 | **不存在**：`UnverifiedCallIdentityVerifier` 保持 `blocksAutoAnswer=true`；即使校准记录齐全，自动接听也不会开启 |
-| **产品阻塞项**：APK 签名 | 仅 debug 签名（`CN=Android Debug`），不可分发；必须用发布密钥重签并重生成 `SHA256SUMS` |
+| [docs/install.md](docs/install.md) | 产物、安装、配对、配置、校准、升级/回退/卸载、常见错误 |
+| [docs/config-schema.md](docs/config-schema.md) | 配置磁盘格式、CAS、密钥生命周期、错误码、固定 CLI、WebUI 传输 |
+| [docs/verification.md](docs/verification.md) | 最终本地矩阵、lint/R8、产物哈希、设备部分观测与未运行清单 |
+| [docs/device-validation.md](docs/device-validation.md) | D01–D12 真机矩阵、翻绿规则、证据命令 |
+| [docs/architecture.md](docs/architecture.md) | 进程/线程、IPC 帧、角色表、状态机、租约、音频、校准、关闭语义 |
+| [docs/security.md](docs/security.md) | 威胁模型、信任边界、配对、密钥、WebUI 传输、攻击面与非目标 |
+| [docs/troubleshooting.md](docs/troubleshooting.md) | 症状 → 证据 → 修复，含 adb/root 命令 |
+| [docs/roadmap.md](docs/roadmap.md) | 已完成 / 未完成 / 明确不做，以及阻塞自动接听的两道闸门 |
+| [docs/faq.md](docs/faq.md) | 是否替换拨号器、是否需要 root、会不会上传录音等短问答 |
+| [docs/superpowers/specs/2026-11-10-agentcall-design.md](docs/superpowers/specs/2026-11-10-agentcall-design.md) | 设计规格（权威约束与边界） |
 
-### 排障入口
+## 路线图与阻塞
 
-真机上先分清“桥接没起来”“保存通道只读”“停止锁没串行化”三类问题（完整命令与期望见
-`docs/install.md` 2.1）：
+- **已完成**：Hook + root 特权桥 + 独立音频工作进程 + APK 的实现、922 JVM / 149 node / 59 Python 本地矩阵、lint、R8、确定性模块 ZIP 打包、
+  设备上的 Vector 注入与一次 RINGING 观测。
+- **P0 阻塞**：设备校准证据（五项人工测试 + 环境读回）；按通话身份定位的特权 Telecom 终止；
+  D01–D12 完整验收；发布签名。
+- **P1 待验证**：音频/HAL/隔离、锁屏/重启/FGS、KernelSU WebView 与 chunked env、双卡/VoWiFi/蓝牙。
+- **明确不做**：替换 Google 电话、处理微信等应用通话、完整双工打断、多通电话同时由 AI 处理、
+  注入 `system_server`、改 SELinux。
 
-- **桥接启动**：`/data/adb/agentcall/logs/service.log` 应有一行
-  `package_provider=<context|appglobals|binder|shell>`，每次失败各有一行
-  `package_provider_attempt=<code> result=unavailable`。出现
-  `package_provider_unavailable`（四层都失败）或 `package_manager_unavailable`
-  （桥接退出码 1）说明包事实拿不到，属于 fail closed，不是可忽略的告警。
-- **保存通道**：WebUI 诊断页给出 `ioForm`/`ioSupport`/`ioVersion`/`hasFile`/
-  `hasFileOutputStream`/`ioMode`。`ioMode=env` 表示走固定命令 + `AGENTCALL_CFG_PAYLOAD_0..N`
-  分块 env（每块 128 码元、最多 64 块）；失败消息带 `transport=env bytes=<n> chunks=<k>`，
-  超过 64 块是 `payload_too_large`。`ioMode=none` + `env_unavailable` 表示只读，保存被拒绝。
-- **Hook 连通性**：`status.hookConnected` 由**空闲 presence** 驱动——HOOK 每 2 s 发一条无会话的
-  固定方法 `hook.presence`，桥接按角色记录 5000 ms 窗口，不再要求有活动通话。logcat 侧失败
-  只出现限流机器码
-  `hook_transport connect_failed|server_untrusted|protocol_violation failures=<n>`
-  （约 5 s 一条，不含负载/会话号/号码）。
-- **默认拨号器**：`dialerDefaultRole` 依次看 RoleManager 持有者 → 读不到时用 root 固定命令
-  `cmd role get-role-holders android.app.role.DIALER` / `cmd telecom get-default-dialer`
-  （2 s 超时、8 KiB 上限）→ `ACTION_DIAL` 负证据；解析只接受恰好一个合法包名，任何歧义
-  都是 `"unknown"`，结果缓存 30 s。
-- **停止锁**：桥接已退出后的清理只允许 `stop_lock_acquired ... nonblocking=1` 或
-  `! stop_lock_busy ... nonblocking=1`；不应再出现 `! stop_lock_timeout waited=40s`。
-  桥接仍存活时才是有界等待的 `stop_lock_wait` → `stop_lock_acquired`。
+详情与验收路径见 [docs/roadmap.md](docs/roadmap.md)。
 
-多 DEX 说明：`app_process` 的 `PathClassLoader` 只从 classpath JAR 根部的 `classes.dex` 加载类。
-打包任务会收进 **bridge release APK** 的**所有** `classes*.dex` 并写入 manifest，但检查器要求
-全部必需入口/运行类必须在 `classes.dex` 内，否则打包失败——当前 bridge release 恰好只有一个
-`classes.dex`。
-未来若必须拆 dex，需要重新设计容器加载方式，而不是默认多 dex 可用。
+## 参与贡献
 
-更细的本地/真机证据见 `docs/verification.md`、`docs/device-validation.md`；安装与回退步骤见
-`docs/install.md`；配置 schema 与固定 CLI 见 `docs/config-schema.md`。
+- Bug / 功能建议请开 issue；提交 PR 前先说明设备、ROM、KernelSU/Vector 版本与复现步骤。
+- **不要提交任何密钥、令牌、keystore、真实电话号码、联系人、未脱敏日志或通话录音。**
+- 代码改动必须带测试；设备结论必须附带证据路径/哈希，不能把 JVM 测试写成真机通过。
+- 文档中的“未验证”是刻意的状态，不要为了好看改成“已支持”。
 
-## 安全与隐私
+## 免责声明
 
-- 总开关默认关闭；未配对、未校准或无法保持 READY 时不自动接听。
-- 语音/文本会发送给用户配置的远程供应商；默认不保存原始录音或完整转写。
-- 密钥最终只进入 CLI 的 stdin（ksu.io 文件重定向，或固定命令的分块 env 拼接到 stdin），不进入 argv、URL、日志或导出；WebUI 不读取密钥。
-- 模块与 APK 都依赖用户自行安装的 Xposed 框架与 KernelSU；不重签 Google 电话、不注入
-  `system_server`、不改 SELinux、不自动刷框架或重启。
+- 需要 root（KernelSU）与 Xposed 框架，**有变砖、掉数据、系统不稳定和保修失效的风险**；
+  请自行备份并确认设备可恢复。
+- 行为高度依赖 ROM、厂商音频 HAL、Google 电话版本与框架实现；不同设备/版本可能不支持。
+- **不要用于紧急呼叫**。紧急/会议/多路通话会被明确排除，但任何自动化都不能替代人工判断。
+- 语音与文本会发送给你配置的第三方供应商，可能产生费用；请自行评估隐私与合规。
+- 当前产物是开发构建、debug 签名，**不构成可分发或生产可用的电话助理**。
+
+## 致谢
+
+- [KernelSU](https://github.com/tiann/KernelSU)：模块与 root 运行环境。
+- [Vector](https://github.com/JingMatrix/Vector) / [LSPosed](https://github.com/LSPosed/LSPosed)：Xposed 兼容层。
+- [libphonenumber](https://github.com/google/libphonenumber)：号码规范化。
+- [OkHttp](https://square.github.io/okhttp/)：HTTPS 传输。
+
+## 许可证
+
+仓库当前**没有 `LICENSE` 文件**，因此不声明任何开源许可证；在补充许可证之前，默认保留所有权利。
+如果你需要分发或复用，请先与仓库维护者确认。

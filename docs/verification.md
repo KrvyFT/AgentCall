@@ -21,7 +21,9 @@
 - 远程仓库：`https://github.com/KrvyFT/AgentCall`（public，默认分支 `master`）；文档中不含任何令牌或凭据。
 - 验收执行者：控制器（controller）；本文件在最终 docs 同步时重新读取 JUnit XML 与产物
   哈希，重跑 WebUI node / Python 测试与 `make package-check`，并核对签名与工具链版本。
-- 相关文档：安装与回退见 `docs/install.md`，真机矩阵见 `docs/device-validation.md`。
+- 相关文档：安装与回退见 `docs/install.md`，真机矩阵见 `docs/device-validation.md`；
+  架构、安全、排障与路线图见 `docs/architecture.md`、`docs/security.md`、
+  `docs/troubleshooting.md`、`docs/roadmap.md`、`docs/faq.md`。
 
 ## 1. 工具链事实
 

@@ -8,7 +8,9 @@ JVM 单测 **922**（core 127 / bridge 429 / app 366，0 failures / 0 errors / 0
 WebUI node 149/149、Python 59/59、`sh -n` 通过；release APK、bridge 容器与模块 ZIP
 都在该 HEAD 上重新构建（大小与 SHA-256 见第 1 节）。产物哈希绑定 `647a52f` 的这次构建
 （APK 内嵌构建元数据、重建会改变字节），更晚提交重建必须重生成 `SHA256SUMS`。
-标注「未验证」的条目仍不能当作已可用。
+标注「未验证」的条目仍不能当作已可用。排障命令与错误码见
+`docs/troubleshooting.md`；架构/安全/路线图见 `docs/architecture.md`、`docs/security.md`、
+`docs/roadmap.md`、`docs/faq.md`。
 
 ## 1. 产物与前提
 

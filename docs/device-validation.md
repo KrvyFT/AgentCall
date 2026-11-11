@@ -8,6 +8,8 @@
   控制器通过 adb 取得的部分观测（Vector 注入 4/4 Hook、一次真实 RINGING、
   `package_provider=appglobals`、root shell 确认默认拨号器）；本轮新 ZIP/APK 未安装、未重启。
 - JVM 单元测试（`:core:testDebugUnitTest`、`:bridge:testDebugUnitTest`）只证明无设备可测的逻辑；它们不是、也不能代替任何一行真机结论。
+- 相关文档：架构/安全/排障/路线图/FAQ 见 `docs/architecture.md`、`docs/security.md`、
+  `docs/troubleshooting.md`、`docs/roadmap.md`、`docs/faq.md`。
 
 ## 当前状态（代码 HEAD `647a52f`，2026-11-11）
 

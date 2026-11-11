@@ -11,7 +11,8 @@
 
 **证据边界**：本文描述的是代码与本地测试所实现的行为。真实 KernelSU 管理器 WebView
 中的桥接/写入路径尚未在设备上验证（本开发环境无设备、无浏览器），
-详见文末“未验证与已知限制”。
+详见文末“未验证与已知限制”。架构与安全边界见 `docs/architecture.md`、
+`docs/security.md`；设备排障见 `docs/troubleshooting.md`。
 
 ---
 
